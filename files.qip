@@ -1,5 +1,15 @@
-set_global_assignment -name VERILOG_FILE rtl/lfsr.v
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cos.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/mycore.v
-set_global_assignment -name SDC_FILE Template.sdc
-set_global_assignment -name SYSTEMVERILOG_FILE Template.sv
+set_global_assignment -name VHDL_FILE rtl/T80/T80_Pack.vhd
+set_global_assignment -name VHDL_FILE rtl/T80/T80_Reg.vhd
+set_global_assignment -name VHDL_FILE rtl/T80/T80_ALU.vhd
+set_global_assignment -name VHDL_FILE rtl/T80/T80_MCode.vhd
+set_global_assignment -name VHDL_FILE rtl/T80/T80.vhd
+set_global_assignment -name VHDL_FILE rtl/T80/T80s.vhd
+
+set_global_assignment -name VERILOG_FILE rtl/cpu_z80.v
+set_global_assignment -name VERILOG_FILE rtl/rom_download.v
+set_global_assignment -name VERILOG_FILE rtl/video/video_timing.v
+set_global_assignment -name VERILOG_FILE rtl/video/fg_tilemap.v
+set_global_assignment -name VERILOG_FILE rtl/z80_3d.v
+
+set_global_assignment -name SDC_FILE Arcade-Z80-3D.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE Arcade-Z80-3D.sv
