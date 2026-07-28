@@ -117,7 +117,14 @@ pll pll
 	.locked(pll_locked)
 );
 
-wire reset = RESET | status[0] | buttons[1] | ~pll_locked;
+// NOTE: pll_locked is intentionally NOT gating reset. It was wired in during
+// the hardening pass but never validated on real hardware, and the very
+// first on-hardware test came back showing exactly the symptom a
+// permanently-unlocked PLL would produce (core stuck in reset forever: ROM
+// download over HPS still works since it's independent of core reset, but
+// the CPU never executes) -- see docs/PLAN.md. Isolating the variable here
+// until that's confirmed one way or the other.
+wire reset = RESET | status[0] | buttons[1];
 
 wire HBlank;
 wire HSync;
