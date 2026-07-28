@@ -19,6 +19,7 @@ SOURCES = \
 	$(RTL_DIR)/rom_download.v \
 	$(RTL_DIR)/video/video_timing.v \
 	$(RTL_DIR)/video/fg_tilemap.v \
+	$(RTL_DIR)/video/sprite_engine.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80s.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_core.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_alu.v \

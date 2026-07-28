@@ -1,0 +1,110 @@
+Theory of Operation
+BUCK ROGERS
+TM
+is a "state-of-the-art" electronic microprocessor based,
+video game. The result of hundreds of hours of work, design, research,
+experiment and more work. However, as with any electronic device, component
+failure or other problems can result in a game that doesn't function properly,
+or doesn't function at all. In either case, your game is "down", and so
+critically, are your profits.
+Your objective is to fix it as quickly as possible, and logical trouble
+shooting goes a long way toward that repair. Although many troubleshooting
+methods may be familiar to you, procedural logic is common among them, and
+might be stated in this order: visual inspection, symptom recognition, symptom
+isolation, function isolation, component isolation and repair. Familiarity
+with the equipment in question will allow you to bypass one or more of these
+steps, as any particular problem may be obvious to you, or may have happened
+before. In general though, these 6 steps form a good premise upon which to
+approach your "down" game.
+An extremely important item in our procedure is the first mentioned, giving
+the gear the "once over". A large percentage of failures found in electronics,
+show themselves visually and often a great deal of time can be saved by
+inspecting for burnt or blown components, loose or disconnected wiring or
+connectors, or PCB traces burnt or pulled up. Thorough visual inspections
+become increasingly important the closer you get to the faulty item, and should
+be repeated each time another portion of the game is eliminated. Symptom
+recognition (as with all electronic troubleshooting) in your BUCK ROGERS
+depends first, on knowing what a proper display is, and second, knowing how
+your display differs from a normal one. Symptom isolation follows naturally;
+(i.e., "I have no picture", "I have no sound", "I have no control over the
+ship", "the picture is scrambled"), ergo, a video, audio, input or logic
+problem. Function isolation, such as a sync problem with the video, requires
+that you consider those functions that go to make up video sync. Is it a
+monitor problem, or an "on-the-board" problem? A monitor input check to
+verify the signal will tell you. Does the board have the voltage (from the
+power supply) that it needs? Yes? We must have a board failure, as we've
+just isolated down to function. Taking our sync problem further, before we
+begin our search for an individual component, let's reapply that first item in
+our "Logical Troubleshooting Procedure". Look at the board. Open resistors,
+diodes, and capacitors often give themselves away.
+Noticing a trace literally burned open can save you serious "down-time".
+The board looks OK, so on we go. Specific component isolation relates to the
+specific nature of the failure, component commonality, proper inputting (both
+signal and power) and proper outputting (as in the case of an output held high,
+low, or floating by input port failure in the succeeding state). More general
+problems (such as a total loss of video sync) requires the more involved
+procedure of systematic elimination of possibilities. This operation can be
+expedited however, by dividing the circuit in half, establishing a "go-no/go"
+at that point, and again dividing the suspect circuit portion in half. The
+largest possible areas can be eliminated in this manner, dividing and sub
+dividing until the individual component failure is found.
+TM
+BUCK ROGERS
+is a microprocessor based, digital-integrated circuit
+computer video game. The heart of the computer is the CPU (IC13, Zone8-D,
+Sht. 1, CPU Bd., 834-5120), a Z80A (P/N 315-0041). The Alpha type device MUST
+ALWAYS be used, as the Z80 is not fast enough to run the programs.
+Master timing is crystal-driven at 20.00 MHz (XI, Zone 8-A, Sht. 1, CPU
+Bd., 834-5120) through IC34, 28, and 35. CPU timing is taken from IC34 p-7,
+applied to IC35 p-2 (Zone 8-B, Sht. 1, CPU Bd., 834-5120) clocked out of IC35
+at p-13, inverted by IC28 (Zone 8-C, Sht. 1, CPU Bd., 834-5120) and finally
+applied to pin-6 of the CPU (IC13). Additionally, IC13 provides 5 MHz and 10
+MHz for video timing and character generation, as well as processed interrupts
+and timing for the Select Address processor IC50 (Zone 8-D, Sht. 5, CPU Bd.,
+834-5120).
+Manual system reset (Power-On) appears as a LO at IC16 p-4 (Zone 8-D, Sht.
+1, CPU Bd., 834-5120) and is then felt at pin-26 of the CPU (IC13, Sht. 1,
+Zone 8-D, CPU Bd., 834-2150). Normal program interrupts (INT) are felt at
+pin-16 of the Z80A (an edge-triggered LO), and are the result of Input/Output
+activity timing with vertical blanking (an approx. 2 msec, instruction
+interrupt). The WAIT signal is used to synchronize that I/O activity during
+an interrupt to the CPU. ICl and 2 (Zone 6-D, Sht. 1, CPU Bd., 834-5120) are
+address bus drivers. Two of the sixteen address lines pass through IC30 (Zone
+6-D, Sht. 1, CPU Bd., 834-5120) and subsequently drive the Chip Enable inputs
+of EPROM IC's 3, 4, 15 and RAM IC 14 (Sht. 1, CPU Bd., 834-5120). IC's 113,
+114, 121 and 122 (Sht. 4, CPU Bd., 834-5120) are input ports on the data bus.
+The 44-pin flat connector supplies player input information, service switch.
+game start and coinage to the input ports. IC119 and 121 input Coin B, and
+IC120 and 121 input Coin A, together with Game Start, Self-Test, Up/Down and
+Acceleration to I/O processor IC106 (Zone 4-D, Sht. 4, CPU Bd., 834-5120),
+ICni, 112 and 114 accesses/buffers Player Left/Right data, IClll and 113
+interfaces Fire data, and Option Selection is shared by all 4 74LS244's.
+Located in the Volume Control Block is the Self-Test switch. When closed, it
+applies a LO to IC119 p-6 (Zone 7-C, Sht. 4, CPU Bd., 834-5120) initiating a
+systems/function verification outlined on the following page
+
+Due to the striking graphics employed in BUCK ROGERS , 
+memory
+requirements for background generation are significant. On the EPROM Bd.
+(834-5121) there are sixteen (16) 27128-3 16K X 8 EPROMs that hold video
+character, positioning, color and timing information. Background generation
+accessable memory (RAM) is provided by TTL IC14 and IC84 (Zone 2-D and 4-B
+respectively, Sht. 1, on the CPU Bd., 834-5120), in addition to IC's 6-9 on
+Sht. 3 of the CPU (834-5120). Back on the EPROM Board, program storage is
+organized into eight (8) levels of multiplexed data for troubleshooting
+efficiency (Sheets 3 through 10, EPROM Bd., 823-5121), with final pre-CPU
+input "mux" occurring on Sht. 2, EPROM Bd., 834-5121. Armed with program data
+and input port data, the CPU can then integrate timing and sync (Sht. 2, CPU
+Bd., 834-5120) with color requirements (Sht. 6, CPU Bd., 834-5120) to produce
+complete color video at the Output Ports consisting of IC's 97, 98, 109 and
+110 (Sht. 5. CPU Bd., 834-5120).
+Just as the microprocessor Z80A is the heart of the game computer, so too
+is the 8255A-5 (IC113, Zone 2-D, Sht. 4, CPU Bd., 834-5120) the center of
+activity for Sound. Called a Sound Generator, IC113 interfaces data and
+address bus, as well as the noise generators on the Sound Bd. (834-5122),
+through the 20 pin flat cable, enabling specific sounds processing circuits.
+These circuits consist of individual sounds for Player ship flying sounds,
+rebound, explosion, laser and alarm. Those complete sounds not originating
+within the 8255A-5 are enabled by the Sound Generator through the noise
+generators on the Sound Bd. IC28 and VRl (Volume Control, Sht. 1, Zone 6-A,
+Sound Bd.) set input biasing for the Audio Amplifier LA446 at an 8 ohm load

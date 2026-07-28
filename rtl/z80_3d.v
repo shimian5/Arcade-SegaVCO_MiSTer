@@ -217,9 +217,11 @@ module z80_3d
 
     wire sel_rom     = (cpu_a < 16'h8000);
     wire sel_vram    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
+    wire sel_sprpos  = (cpu_a >= 16'hE000) && (cpu_a < 16'hE400);
+    wire sel_sprram  = (cpu_a >= 16'hE400) && (cpu_a < 16'hE800);
     wire sel_workram = (cpu_a >= 16'hF800);
-    // Everything else (PPI0/PPI1/i8279/sprite RAM/sprite-pos RAM/IN0/IN1/DSW)
-    // is stubbed: reads return FF, writes are dropped.
+    // Everything else (PPI0/PPI1/i8279/IN0/IN1/DSW) is stubbed: reads
+    // return FF, writes are dropped.
 
     wire [7:0] vram_rdata;
     fg_tilemap u_fg
@@ -240,8 +242,61 @@ module z80_3d
         .foreraw      (foreraw)
     );
 
+    // pr-5196 (Y-scale, 512B @ proms offset 0x100) and pr-5199 (sprite
+    // color table, 1024B @ proms offset 0x700) forwarded from the shared
+    // PROMS blob, same pattern as xshift_we/color_table above. Full-width
+    // subtraction before slicing (not truncation) -- see rom_download.v's
+    // header comment on why that matters for non-zero-based windows.
+    wire        yscale_we_fwd = proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h300);
+    wire [12:0] yscale_off    = proms_wraddr - 13'h100;
+
+    wire        sprcolor_we_fwd = proms_we && (proms_wraddr >= 13'h700) && (proms_wraddr < 13'hB00);
+    wire [12:0] sprcolor_off    = proms_wraddr - 13'h700;
+
+    reg [7:0] sprcolor_table[0:1023]; // pr-5199
+    always @(posedge clk) if (sprcolor_we_fwd) sprcolor_table[sprcolor_off[9:0]] <= rom_dout;
+
+    wire [7:0]  sprram_rdata, sprpos_rdata;
+    wire [31:0] sprbits;
+    wire [7:0]  spr_plb;
+    sprite_engine u_sprites
+    (
+        .clk              (clk),
+        .reset            (reset),
+
+        .cpu_sprram_we    (sel_sprram && cpu_write),
+        .cpu_sprram_addr  (cpu_a[9:0]),
+        .cpu_sprram_wdata (cpu_do),
+        .cpu_sprram_rdata (sprram_rdata),
+
+        .cpu_sprpos_we    (sel_sprpos && cpu_write),
+        .cpu_sprpos_addr  (cpu_a[9:0]),
+        .cpu_sprpos_wdata (cpu_do),
+        .cpu_sprpos_rdata (sprpos_rdata),
+
+        .sproms_we        (sprites_we),
+        .sproms_addr      (sprites_wraddr),
+        .sproms_wdata     (rom_dout),
+
+        .yscale_we        (yscale_we_fwd),
+        .yscale_addr      (yscale_off[8:0]),
+        .yscale_wdata     (rom_dout),
+
+        .ce_pix           (ce_pix_int),
+        .hblank           (hblank_raw),
+        .hpos             (hpos),
+        .vpos             (vpos),
+
+        .obch             (3'b000), // PPI1 port C bits 0-2, not wired yet (phase 1c)
+
+        .sprbits          (sprbits),
+        .plb              (spr_plb)
+    );
+
     assign cpu_di = sel_rom     ? maincpu_dout  :
                      sel_vram   ? vram_rdata    :
+                     sel_sprram ? sprram_rdata  :
+                     sel_sprpos ? sprpos_rdata  :
                      sel_workram? work_ram_dout :
                                   8'hFF;
 
@@ -253,11 +308,12 @@ module z80_3d
     wire [7:0] foreraw;
 
     // ------------------------------------------------------------------
-    // Phase-1a mixer stub: fg tier-1 path only (docs/PLAN.md mixer_buckrog.v)
-    // fchg (PPI0 port C bits 0-2) is tied to 0 until PPI0 is wired up.
-    // color_table and palette_rom reads are each registered (+1 clk each),
-    // on top of fg_tilemap's own FG_TILEMAP_LATENCY=4 -- see
-    // VIDEO_PIPE_LATENCY below.
+    // Phase-1b mixer: fg tier-1 + sprite branch (docs/PLAN.md
+    // mixer_buckrog.v). fchg/obch (PPI0/PPI1 port C) are tied to 0 until
+    // the PPIs are wired up (phase 1c). fg-tier-2/star/bgcolor branches
+    // aren't implemented yet (phase 1c: sub CPU + bitmap + bgcolor) --
+    // they fall back to the fg-tier-1 repack, same as the phase-1a stub
+    // did unconditionally.
     // ------------------------------------------------------------------
     wire [1:0] fchg = 2'b00;
     wire [8:0] color_addr = ({7'b0, foreraw[1:0]}) |
@@ -266,7 +322,68 @@ module z80_3d
     reg [7:0] forebits_reg;
     always @(posedge clk) forebits_reg <= color_table[color_addr];
 
-    wire [7:0] palbits = ((forebits_reg & 8'h3c) << 2) | ((forebits_reg & 8'h06) << 1) | (forebits_reg & 8'h01);
+    // sprbits/plb are real-time (0-latency vs. hpos/vpos, see
+    // sprite_engine.v's header) -- delay by 5 clk to land on the same
+    // pipeline stage as forebits_reg (fg_tilemap's 4 + this module's
+    // color_table stage = 5).
+    localparam SPR_TO_MIX_DELAY = 5;
+    reg [39:0] spr_pipe [0:SPR_TO_MIX_DELAY-1];
+    integer si;
+    always @(posedge clk) begin
+        spr_pipe[0] <= {sprbits, spr_plb};
+        for (si = 1; si < SPR_TO_MIX_DELAY; si = si + 1) spr_pipe[si] <= spr_pipe[si-1];
+    end
+    wire [31:0] sprbits_d5 = spr_pipe[SPR_TO_MIX_DELAY-1][39:8];
+    wire [7:0]  plb_d5     = spr_pipe[SPR_TO_MIX_DELAY-1][7:0];
+
+    // LS148 priority encoder: index of the lowest-numbered set bit in plb
+    // (0-7), or 4'hf if plb==0 -- equivalent to MAME's
+    // countl_zero(bitswap<8>(plb,0,1,2,3,4,5,6,7)) with the mux==8 clamp
+    // folded in.
+    function [3:0] find_lsb;
+        input [7:0] p;
+        begin
+            casez (p)
+                8'b???????1: find_lsb = 4'd0;
+                8'b??????10: find_lsb = 4'd1;
+                8'b?????100: find_lsb = 4'd2;
+                8'b????1000: find_lsb = 4'd3;
+                8'b???10000: find_lsb = 4'd4;
+                8'b??100000: find_lsb = 4'd5;
+                8'b?1000000: find_lsb = 4'd6;
+                8'b10000000: find_lsb = 4'd7;
+                default:     find_lsb = 4'hf;
+            endcase
+        end
+    endfunction
+
+    wire [3:0]  mux             = find_lsb(plb_d5);
+    wire [31:0] sprbits_shifted = sprbits_d5 >> mux[2:0];
+    wire [3:0]  cd              = {sprbits_shifted[24], sprbits_shifted[16], sprbits_shifted[8], sprbits_shifted[0]};
+    wire [2:0]  obch            = 3'b000; // PPI1 port C bits 0-2, not wired yet (phase 1c)
+
+    reg [7:0] sprcolor_dout;
+    always @(posedge clk) sprcolor_dout <= sprcolor_table[{obch, mux[2:0], cd}];
+
+    // One more register stage on the fg-tier-1 path + mux so both operands
+    // of the final select land on sprcolor_dout's cycle (+6: the +5 above,
+    // plus this module's own sprcolor_table read).
+    reg [7:0] forebits_reg2;
+    reg [3:0] mux_reg;
+    always @(posedge clk) begin
+        forebits_reg2 <= forebits_reg;
+        mux_reg       <= mux;
+    end
+
+    function [7:0] repack;
+        input [7:0] f;
+        repack = ((f & 8'h3c) << 2) | ((f & 8'h06) << 1) | (f & 8'h01);
+    endfunction
+
+    wire [7:0] palbits_fg1 = repack(forebits_reg2);
+    wire [7:0] palbits = (!forebits_reg2[7]) ? palbits_fg1 :          // fg tier 1
+                          (!mux_reg[3])       ? sprcolor_dout :       // sprite
+                                                 palbits_fg1;          // stand-in for fg-tier2/star/bgcolor (phase 1c)
 
     reg [23:0] palette_rom[0:1023];
     initial $readmemh("roms/palette_buckrog.hex", palette_rom);
@@ -281,10 +398,11 @@ module z80_3d
     // ------------------------------------------------------------------
     // Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with
     // the pipeline latency above (fg_tilemap's 4 + color_table's 1 +
-    // palette_rom's 1 = 6), so the sync signals output alongside rgb_reg
-    // describe the same original hpos/vpos that produced it.
+    // sprcolor_table's 1 + palette_rom's 1 = 7), so the sync signals output
+    // alongside rgb_reg describe the same original hpos/vpos that produced
+    // it.
     // ------------------------------------------------------------------
-    localparam VIDEO_PIPE_LATENCY = 6;
+    localparam VIDEO_PIPE_LATENCY = 7;
 
     reg [VIDEO_PIPE_LATENCY-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
     always @(posedge clk) begin

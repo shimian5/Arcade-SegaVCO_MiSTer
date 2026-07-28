@@ -15,6 +15,34 @@ merged.
 **First on-hardware test found a real bug the sim harness structurally could
 not catch** (see "MRA ROM-download gap bug" below) — fixed. Awaiting retest.
 
+**Phase 1b done in simulation** (sprite engine): `rtl/video/sprite_engine.v`
+implements the 16-entry/8-level sprite RAM, the per-scanline
+`prepare_sprites` carry-ALU + Y-scale-PROM FSM, and the per-pixel
+`get_sprite_bits` X-scale-accumulator/ROM-fetch/self-termination path, wired
+into `rtl/z80_3d.v` (sprite RAM `e400-e7ff`, sprite-position RAM `e000-e3ff`,
+8×32KB sprite-ROM banks off the existing `sprites_we`/`sprites_wraddr`,
+PR-5196 Y-scale PROM forwarded from the shared PROMS blob) and composited
+through an extended mixer (PR-5199 sprite-color-table branch, real
+mux/cd priority logic) that now sits ahead of the fg-tier-1 fallback. Verified
+in `sim/`: an attract-mode explosion sprite renders, visibly grows across
+frames (X/Y-scale zoom working), and is correctly composited over the road
+— confirmed by inspecting rendered frames together with the user. Not yet
+verified bit-exact against MAME (no frame-diff tooling exists yet — see
+"Next step"), not yet synthesized in Quartus. PR-5195 ("sprite state
+machine" per its ROM label) has no consumer in MAME's own emulation of this
+board — it drives a physical sequencer chip that MAME (and this module)
+replicate directly as boolean logic instead of a table lookup — so it's
+downloaded as part of the PROMS blob but intentionally unused; see
+`sprite_engine.v`'s header comment.
+
+**Background/starfield is still missing on purpose** — Buck Rogers'
+`bitmap_ram` "star" layer and `bgcolorrom` lookup (the last two branches of
+`mixer_buckrog.v`'s priority chain) are driven by the **sub CPU**
+(`bitmap_w`), which isn't implemented yet. That's phase 1c scope (sub CPU +
+bitmap + bgcolor + full priority chain), not phase 1b. The current mixer's
+fallback branch (where star/bgcolor will go) just repacks the fg-tier-1
+color for now.
+
 | Item | State |
 |---|---|
 | `tools/gen_tables.py` | done — X-scale + palette tables, self-checks, MAME golden diff |
@@ -23,6 +51,7 @@ not catch** (see "MRA ROM-download gap bug" below) — fixed. Awaiting retest.
 | `tools/render_sheets.py` | done — renders schematic PDF pages to PNG |
 | `tools/mame/dump_palette.lua` | done — headless palette dump for the golden diff |
 | `docs/hardware-audio.md` | done — full sound board trace |
+| `docs/reference/Buck_theory.txt` | added — official theory-of-operation text; confirms the 8-level/EPROM-board sprite architecture, no new pinout-level detail |
 | `docs/schematics/` | sound sheets 1-3 + assembly drawing rendered at 400 dpi |
 | `mra/{buckrogn,buckrog,turbo}.mra` | done — `tools/gen_mra.py`, all CRCs verified byte-for-byte against the real MAME zips |
 | MiSTer template scaffolding (`sys/`, `Arcade-Z80-3D.{sv,qpf,qsf,sdc,srf}`, `files.qip`) | done — pulled as-is from `C:\MiSTerDev\Template_MiSTer`; `sys/` untouched |
@@ -30,8 +59,9 @@ not catch** (see "MRA ROM-download gap bug" below) — fixed. Awaiting retest.
 | `rtl/tv80/` | done — hutch31/tv80 (pure Verilog Z80), vendored from `SuperOffRoad_MiSTer`, **simulation only** |
 | `rtl/cpu_z80.v` | done — wraps T80 (synthesis) / TV80 (Verilator sim) behind one interface |
 | `rtl/rom_download.v`, `rtl/video/video_timing.v`, `rtl/video/fg_tilemap.v`, `rtl/z80_3d.v` | done — phase 1a scope (see below) |
-| `sim/` Verilator harness | done — see "Sim harness" below |
-| Phase 1b (sprite engine), 1c (sub CPU/bitmap/full mixer), 1d (decryption), phase 3 (Turbo) | not started |
+| `rtl/video/sprite_engine.v` | done in sim (phase 1b) — see above; not synthesized yet |
+| `sim/` Verilator harness | done — see "Sim harness" below; now also builds `rtl/video/sprite_engine.v` |
+| Phase 1c (sub CPU/bitmap/full mixer), 1d (decryption), phase 3 (Turbo) | not started |
 
 **Phase 1a scope, what's real vs. stubbed:**
 
@@ -201,8 +231,12 @@ to leave in, off by default.
   red/green have 3, and MAME's autoscale uses one global factor from the largest net.
   Confirmed correct against MAME. Do not "fix" this.
 
-**Next step:** phase 1b — sprite engine, pipelined (BRAM-correct) fg tilemap
-reads, TV80 cen/clocking fix, and the first real MAME frame-diff.
+**Next step:** phase 1c (sub CPU + bitmap/starfield + bgcolor + full mixer
+priority chain), the TV80 cen/clocking fix, and the first real MAME
+frame-diff (needed to confirm the phase 1b sprite engine bit-exact, not just
+visually plausible) — then a Quartus synthesis-only pass on the sprite
+engine to check the 8 sprite-ROM banks infer as separate M10K blocks before
+committing to a full compile.
 
 ## Context
 
