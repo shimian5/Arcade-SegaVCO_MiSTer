@@ -2,7 +2,9 @@
 
 ## Status — 2026-07-28
 
-**Phase 0 in progress.** Done so far:
+**Phase 0 done. Phase 1a done** (Buck Rogers `buckrogn` attract-mode text +
+background dressing render correctly in simulation). Working tree is
+`.claude/worktrees/phase0-1a`, branch `worktree-phase0-1a` — not yet merged.
 
 | Item | State |
 |---|---|
@@ -13,7 +15,71 @@
 | `tools/mame/dump_palette.lua` | done — headless palette dump for the golden diff |
 | `docs/hardware-audio.md` | done — full sound board trace |
 | `docs/schematics/` | sound sheets 1-3 + assembly drawing rendered at 400 dpi |
-| MiSTer scaffolding, `sim/`, MRA files, all RTL | **not started** |
+| `mra/{buckrogn,buckrog,turbo}.mra` | done — `tools/gen_mra.py`, all CRCs verified byte-for-byte against the real MAME zips |
+| MiSTer template scaffolding (`sys/`, `Arcade-Z80-3D.{sv,qpf,qsf,sdc,srf}`, `files.qip`) | done — pulled as-is from `C:\MiSTerDev\Template_MiSTer`; `sys/` untouched |
+| `rtl/T80/` | done — Sorgelig's T80 v350, vendored (plain files, not a submodule) from `Arcade-DonkeyKong_MiSTer`, for real synthesis |
+| `rtl/tv80/` | done — hutch31/tv80 (pure Verilog Z80), vendored from `SuperOffRoad_MiSTer`, **simulation only** |
+| `rtl/cpu_z80.v` | done — wraps T80 (synthesis) / TV80 (Verilator sim) behind one interface |
+| `rtl/rom_download.v`, `rtl/video/video_timing.v`, `rtl/video/fg_tilemap.v`, `rtl/z80_3d.v` | done — phase 1a scope (see below) |
+| `sim/` Verilator harness | done — see "Sim harness" below |
+| Phase 1b (sprite engine), 1c (sub CPU/bitmap/full mixer), 1d (decryption), phase 3 (Turbo) | not started |
+
+**Phase 1a scope, what's real vs. stubbed:**
+
+Main CPU (T80/TV80) executes the real `buckrogn` program ROM, decodes the
+`main_prg_map` (ROM, video RAM, work RAM), and drives the fg tilemap
+(`fg_tilemap.v`, PR-5194 X-shift PROM included) through a phase-1a-only inline
+version of `mixer_buckrog.v`'s fg-tier-1 path (PR-5198 char color table +
+`repack()` + the real 1024-entry palette ROM). PPI0/PPI1/i8279/sprite
+RAM/sprite-position RAM/IN0/IN1/DSW are **stubbed** (reads return `8'hFF`,
+writes dropped) — sub CPU, bitmap, bgcolor, sprite engine, and the full
+5-level mixer priority chain are not implemented yet (phases 1b/1c). Despite
+the stubs, the real CPU reaches and renders the attract screen: verified
+visually in `sim/out/` — the "SEGA" copyright text is legible, along with the
+road/tunnel dressing and ship-lives icons (all fg-tilemap content).
+
+**Known simplifications to fix before phase 1b's bit-exact MAME frame-diff:**
+
+1. `fg_tilemap.v`'s VRAM/tile-ROM/PROM reads are combinational array reads,
+   not registered BRAM ports — fine for sim, not synthesizable as single-cycle
+   BRAM. Pipeline this (mirroring the sprite engine's per-pixel fetch design)
+   before phase 1b.
+2. `cpu_z80.v`'s TV80 path runs the CPU at the **full core clock**, undivided
+   — TV80's `tv80s.v` wrapper ties its internal `cen` permanently to 1 (no
+   usable clock-enable input; confirmed against the tv80 repo's own
+   reference testbench, which does the same). So in simulation the CPU
+   currently runs ~8x faster relative to video than real hardware. Fine for
+   "does the attract screen render" but wrong for cycle-accurate frame
+   diffing. Fix by driving `tv80_core` directly (it does expose a `cen`
+   port) with a real per-T-state enable, or by giving the CPU its own
+   free-running clock domain. T80 (real synthesis target) is unaffected —
+   it takes a genuine `CEN` clock-enable and needs no workaround.
+3. `pll.v` is still the Template's default PLL — not yet reconfigured for
+   the 39.936 MHz core clock the plan's clocking table calls for.
+4. ROM download map's PROMS slot was bumped from the original draft's 4 KB to
+   8 KB (Turbo's `proms` ROM_REGION is 4128 bytes, just over 4 KB) — see the
+   updated "ROM loading" table below. `tools/gen_mra.py`'s `REGIONS` dict is
+   the source of truth; keep `rom_download.v` in sync with it by hand.
+
+**Sim harness (`sim/`):**
+
+Verilator (5.050) is **not available natively on Windows** in this
+environment, and cannot compile T80's VHDL regardless. It **is** installed in
+the `archlinux` WSL2 distro, so the harness is designed to run there:
+`wsl -d archlinux -e make -C sim run` (from the repo root; see `sim/Makefile`
+for exact paths, since `cd` and `wsl` invocations here go through PowerShell,
+not the WSL shell directly). `sim/build_rom.py` builds the flat ioctl-download
+ROM blob straight from the real MAME zips (matched by CRC32, since MAME's zip
+entry filenames don't match the ROM_LOAD part names), reusing
+`tools/gen_mra.py`'s region tables so both stay in sync automatically.
+`sim/tb_z80_3d.cpp` drives `rtl/z80_3d.v` directly (not the full
+`Arcade-Z80-3D.sv`/`sys/` framework top, which needs real PLL/HPS hardware
+this environment can't simulate), streams the ROM blob in over `ioctl_*`,
+and dumps one 512x224 PPM per frame — ready for `sim/out/*.ppm` vs.
+`mame buckrogn -snapshot` diffing once phase 1b needs bit-exactness.
+`z80_3d.v` has an opt-in `` `ifdef SIM_DEBUG_TRACE `` block (instruction-fetch
+and VRAM-write tracing) used to debug the TV80 clock-gating bug above; harmless
+to leave in, off by default.
 
 **Environment, verified working:**
 
@@ -24,6 +90,11 @@
   `mame.exe buckrogn -video none -sound none -autoboot_script <lua> -str 5`
 - Python has `pypdfium2` + `Pillow`. Poppler/`pdftoppm` is **not** installed, so the
   Read tool cannot rasterize PDFs — use `tools/render_sheets.py`.
+- Verilator 5.050 is available in the `archlinux` WSL2 distro (`wsl -d archlinux`),
+  not natively on Windows. GHDL/Icarus are not installed anywhere.
+- ModelSim (Altera Starter Edition, via the Quartus 17.0 install) is also available
+  and is what `SuperOffRoad_MiSTer/sim/` actually uses for VHDL+Verilog cosimulation
+  — a fallback path if the Verilator+TV80 approach above ever becomes a bottleneck.
 
 **Findings that changed the plan:**
 
@@ -36,7 +107,8 @@
   red/green have 3, and MAME's autoscale uses one global factor from the largest net.
   Confirmed correct against MAME. Do not "fix" this.
 
-**Next step:** MRA files and the MiSTer scaffolding, then phase 1a.
+**Next step:** phase 1b — sprite engine, pipelined (BRAM-correct) fg tilemap
+reads, TV80 cen/clocking fix, and the first real MAME frame-diff.
 
 ## Context
 
@@ -249,16 +321,20 @@ headless, and dumps one PPM per frame. Compare against MAME snapshots
 plumbing, a frame-diff loop is the difference between a week and a month on each mixer.
 
 **ROM loading**: MRA files concatenate the MAME ROM set into one blob; `rom_download.v`
-decodes `ioctl_addr` into regions. Fixed download map (pad each region):
+decodes `ioctl_addr` into regions. Fixed download map (pad each region), as
+implemented in `tools/gen_mra.py`'s `REGIONS` dict and `rtl/rom_download.v`
+(source of truth — update both together if this ever changes):
 
 | Offset | Region |
 |---|---|
 | `0x000000` | maincpu (32 KB) |
 | `0x008000` | subcpu (8 KB) |
 | `0x00A000` | fgtiles (4 KB) |
-| `0x00C000` | proms (4 KB) |
-| `0x010000` | road / bgcolor (32 KB) |
-| `0x040000` | sprites (256 KB, 8 × 32 KB) |
+| `0x00C000` | proms (8 KB — bumped from an earlier 4 KB draft; Turbo's proms ROM_REGION is 4128 bytes) |
+| `0x00E000` | road / bgcolor (32 KB) |
+| `0x016000` | sprites (256 KB, 8 × 32 KB) |
+
+Total blob size: `0x056000` (344 KB).
 
 ---
 

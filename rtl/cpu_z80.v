@@ -1,15 +1,25 @@
-// Z80 CPU wrapper: T80 (VHDL) for real synthesis, TV80 (Verilog) for
-// Verilator simulation, since Verilator cannot compile VHDL.
+// Z80 CPU wrapper: T80 (VHDL) for real synthesis, TV80 (plain Verilog) for
+// simulation with the open-source Verilator tool, which cannot compile VHDL.
 //
-// TV80 has no CEN pin (tv80s.v ties its internal `cen` to 1 permanently), so
-// under VERILATOR_SIM this wrapper derives its own divided clock and drives
-// tv80s.clk directly instead. Real hardware doesn't need that: T80s takes a
-// genuine clock-enable on CEN, which is the correct MiSTer-style approach and
-// is what actually gets synthesized.
+// KNOWN PHASE 1a SIMPLIFICATION: TV80's tv80s.v wrapper ties its internal
+// `cen` permanently to 1 (confirmed against the tv80 repo's own tb_top.v,
+// which drives tv80s from a single free-running clock with no gating at
+// all) -- it has no usable clock-enable input. So under VERILATOR_SIM this
+// wrapper just runs tv80s at the full core clock rate, undivided. That means
+// in simulation the CPU currently executes ~8x faster relative to video
+// than real hardware (core_clk vs. core_clk/8) -- fine for confirming
+// attract-mode VRAM writes happen at all, but wrong for phase 1b/1c's
+// cycle-accurate MAME frame-diffing. Fix before then, either by driving
+// tv80_core (not tv80s) directly with a real per-T-state `cen` pulse train
+// (tv80_core does expose a cen port), or by giving the CPU its own
+// free-running clock domain instead of a clk_sys-derived enable.
+//
+// T80s (real synthesis target) is unaffected: it takes a genuine
+// clock-enable on CEN and needs no such workaround.
 module cpu_z80
 (
     input  wire        clk,       // core clock (39.936 MHz)
-    input  wire        cen,       // Z80 clock enable (4.992 MHz strobe on clk)
+    input  wire        cen,       // Z80 clock enable (4.992 MHz strobe on clk) -- T80s only, see above
     input  wire        reset_n,
     input  wire        wait_n,
     input  wire        int_n,
@@ -30,16 +40,10 @@ module cpu_z80
 
 `ifdef VERILATOR_SIM
 
-    reg clk_z80;
-    always @(posedge clk or negedge reset_n) begin
-        if (!reset_n) clk_z80 <= 1'b0;
-        else if (cen) clk_z80 <= ~clk_z80;
-    end
-
     tv80s cpu
     (
         .reset_n (reset_n),
-        .clk     (clk_z80),
+        .clk     (clk),
         .wait_n  (wait_n),
         .int_n   (int_n),
         .nmi_n   (nmi_n),

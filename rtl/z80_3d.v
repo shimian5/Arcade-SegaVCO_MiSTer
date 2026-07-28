@@ -177,6 +177,18 @@ module z80_3d
     end
     assign int_n = ~irq_pending;
 
+`ifdef SIM_DEBUG_TRACE
+    integer trace_count = 0;
+    always @(posedge clk) begin
+        if (!reset && trace_count < 400) begin
+            $display("[%0t] a=%04x m1_n=%b mreq_n=%b rd_n=%b wr_n=%b di=%02x do=%02x cen=%b",
+                      $time, cpu_a, cpu_m1_n, cpu_mreq_n, cpu_rd_n, cpu_wr_n, cpu_di, cpu_do, ce_z80);
+            trace_count = trace_count + 1;
+        end
+        if (sel_vram && cpu_write) $display("[%0t] VRAM write addr=%04x data=%02x", $time, cpu_a, cpu_do);
+    end
+`endif
+
     // ------------------------------------------------------------------
     // Memory decode (main_prg_map, docs/PLAN.md phase 1)
     // ------------------------------------------------------------------
