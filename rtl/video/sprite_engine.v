@@ -236,6 +236,22 @@ module sprite_engine
     reg fire_pending[0:7];
     reg nibble_sel_pending[0:7];
 
+    // offset_reg/step_reg/frac_reg/latched_reg/plb_bit_reg are each written
+    // from exactly ONE place: the per-level always block in the generate
+    // loop below (get_sprite_bits' real-time path). The prepare_sprites FSM
+    // does NOT write them directly -- Quartus can't prove a runtime-indexed
+    // write (offset_reg[idx[2:0]] from the FSM) and a genvar-indexed write
+    // (offset_reg[lvl] from the generate block) are mutually exclusive, and
+    // flags it as multiple constant drivers even though they never
+    // actually race (FSM only commits during HBLANK; the per-pixel path
+    // only runs during active video). Instead the FSM raises a one-cycle
+    // broadcast pulse (commit_pulse/commit_level/commit_offset/
+    // commit_step) that the target level's own always block consumes.
+    reg                     commit_pulse;
+    reg [2:0]               commit_level;
+    reg [OFFSET_WIDTH-1:0]  commit_offset;
+    reg [31:0]              commit_step;
+
     // ------------------------------------------------------------------
     // prepare_sprites: per-scanline FSM, runs on the raw core clock
     // during HBLANK (see module header for budget analysis).
@@ -291,13 +307,13 @@ module sprite_engine
 
     always @(posedge clk) begin
         eng_sprram_we <= 1'b0;
+        commit_pulse  <= 1'b0;
 
         case (st)
             ST_IDLE: begin
                 if (hblank_rise) begin
                     idx        <= 4'd0;
                     y_target   <= y_target_next;
-                    lst_active <= 8'h00;
                     st         <= ST_ISSUE_Y0;
                 end
             end
@@ -356,12 +372,11 @@ module sprite_engine
             end
             ST_COMMIT: begin
                 if (ve_bit_reg) begin
-                    offset_reg[idx[2:0]]  <= OFFSET_PRESHIFT ? {new_offset, 1'b0} : new_offset;
-                    step_reg[idx[2:0]]    <= xscale_dout;
-                    frac_reg[idx[2:0]]    <= 32'd0;
-                    latched_reg[idx[2:0]] <= 32'd0;
-                    plb_bit_reg[idx[2:0]] <= 1'b0;
-                    ve_reg[idx]           <= 1'b1;
+                    commit_pulse  <= 1'b1;
+                    commit_level  <= idx[2:0];
+                    commit_offset <= OFFSET_PRESHIFT ? {new_offset, 1'b0} : new_offset;
+                    commit_step   <= xscale_dout;
+                    ve_reg[idx]   <= 1'b1;
 
                     eng_sprram_we    <= 1'b1;
                     eng_sprram_addr  <= {idx, 3'd6};
@@ -426,8 +441,22 @@ module sprite_engine
             wire [1:0] plb_end_v = PLB_END[pixdata*2 +: 2];
             assign clear_lvl_vec[lvl] = fire_pending[lvl] && plb_end_v[1];
 
+            // Sole driver of offset_reg[lvl]/step_reg[lvl]/frac_reg[lvl]/
+            // latched_reg[lvl]/plb_bit_reg[lvl] -- both the prepare_sprites
+            // commit (broadcast in, see commit_pulse above) and the
+            // real-time per-pixel advance are handled in this one process
+            // so Quartus sees a single driver per register.
+            wire commit_now = commit_pulse && (commit_level == lvl[2:0]);
+
             always @(posedge clk) begin
-                if (active_pix) begin
+                if (commit_now) begin
+                    offset_reg[lvl]  <= commit_offset;
+                    step_reg[lvl]    <= commit_step;
+                    frac_reg[lvl]    <= 32'd0;
+                    latched_reg[lvl] <= 32'd0;
+                    plb_bit_reg[lvl] <= 1'b0;
+                    fire_pending[lvl] <= 1'b0;
+                end else if (active_pix) begin
                     if (live) begin
                         frac_reg[lvl] <= fire ? (frac_sum[31:0] - XSCALE_THRESHOLD) : frac_sum[31:0];
                         if (fire) begin
@@ -455,9 +484,15 @@ module sprite_engine
         end
     endgenerate
 
-    // lst_active update: OR in newly-enabled levels (he_or_mask, at ix0),
-    // AND out levels whose fetch this cycle signalled END (clear_lvl_vec).
-    always @(posedge clk) if (active_pix) lst_active <= lst_eff & ~clear_lvl_vec;
+    // lst_active update: cleared once per scanline at HBLANK start (matches
+    // prepare_sprites' "lst=0"), then OR in newly-enabled levels
+    // (he_or_mask, at ix0) and AND out levels whose fetch this cycle
+    // signalled END (clear_lvl_vec). Single process/driver, same reasoning
+    // as commit_now above.
+    always @(posedge clk) begin
+        if (hblank_rise)       lst_active <= 8'h00;
+        else if (active_pix)   lst_active <= lst_eff & ~clear_lvl_vec;
+    end
 
     assign sprbits = latched_masked[0] | latched_masked[1] | latched_masked[2] | latched_masked[3] |
                       latched_masked[4] | latched_masked[5] | latched_masked[6] | latched_masked[7];

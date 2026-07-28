@@ -9,6 +9,7 @@ set_global_assignment -name VERILOG_FILE rtl/cpu_z80.v
 set_global_assignment -name VERILOG_FILE rtl/rom_download.v
 set_global_assignment -name VERILOG_FILE rtl/video/video_timing.v
 set_global_assignment -name VERILOG_FILE rtl/video/fg_tilemap.v
+set_global_assignment -name VERILOG_FILE rtl/video/sprite_engine.v
 set_global_assignment -name VERILOG_FILE rtl/z80_3d.v
 
 set_global_assignment -name SDC_FILE Arcade-Z80-3D.sdc
