@@ -1,7 +1,10 @@
 // Decodes the ioctl_download address stream (MRA-concatenated ROM blob) into
 // per-region write strobes + region-relative addresses. See docs/PLAN.md,
 // "ROM loading" table, for the fixed offset map (kept in sync with
-// tools/gen_mra.py's REGIONS dict -- update both together).
+// tools/gen_mra.py's REGIONS dict -- update both together). The base offsets
+// MUST be perfectly contiguous (each BASE == previous BASE+SIZE): the MRA is
+// a sequential byte stream with no inter-region padding, so any gap here
+// means everything from that region onward is silently misrouted.
 module rom_download
 (
     input  wire        clk,
@@ -29,9 +32,9 @@ module rom_download
     localparam MAINCPU_BASE  = 25'h000000, MAINCPU_SIZE  = 25'h008000;
     localparam SUBCPU_BASE   = 25'h008000, SUBCPU_SIZE   = 25'h002000;
     localparam FGTILES_BASE  = 25'h00A000, FGTILES_SIZE  = 25'h001000;
-    localparam PROMS_BASE    = 25'h00C000, PROMS_SIZE    = 25'h002000;
-    localparam ROAD_BASE     = 25'h00E000, ROAD_SIZE     = 25'h008000;
-    localparam SPRITES_BASE  = 25'h016000, SPRITES_SIZE  = 25'h040000;
+    localparam PROMS_BASE    = 25'h00B000, PROMS_SIZE    = 25'h002000;
+    localparam ROAD_BASE     = 25'h00D000, ROAD_SIZE     = 25'h008000;
+    localparam SPRITES_BASE  = 25'h015000, SPRITES_SIZE  = 25'h040000;
 
     wire wr = ioctl_download && ioctl_wr;
 
@@ -49,12 +52,22 @@ module rom_download
     assign road_we     = wr && in_road;
     assign sprites_we  = wr && in_sprites;
 
-    assign maincpu_addr  = ioctl_addr[14:0]  - MAINCPU_BASE[14:0];
-    assign subcpu_addr   = ioctl_addr[12:0]  - SUBCPU_BASE[12:0];
-    assign fgtiles_addr  = ioctl_addr[11:0]  - FGTILES_BASE[11:0];
-    assign proms_addr    = ioctl_addr[12:0]  - PROMS_BASE[12:0];
-    assign road_addr     = ioctl_addr[14:0]  - ROAD_BASE[14:0];
-    assign sprites_addr  = ioctl_addr[17:0]  - SPRITES_BASE[17:0];
+    // Full-width subtraction first, then slice the result -- unlike slicing
+    // the operands before subtracting, this is correct regardless of
+    // whether BASE happens to be a round number in the target field's width.
+    wire [24:0] maincpu_offs  = ioctl_addr - MAINCPU_BASE;
+    wire [24:0] subcpu_offs   = ioctl_addr - SUBCPU_BASE;
+    wire [24:0] fgtiles_offs  = ioctl_addr - FGTILES_BASE;
+    wire [24:0] proms_offs    = ioctl_addr - PROMS_BASE;
+    wire [24:0] road_offs     = ioctl_addr - ROAD_BASE;
+    wire [24:0] sprites_offs  = ioctl_addr - SPRITES_BASE;
+
+    assign maincpu_addr  = maincpu_offs[14:0];
+    assign subcpu_addr   = subcpu_offs[12:0];
+    assign fgtiles_addr  = fgtiles_offs[11:0];
+    assign proms_addr    = proms_offs[12:0];
+    assign road_addr     = road_offs[14:0];
+    assign sprites_addr  = sprites_offs[17:0];
 
     assign dout = ioctl_dout;
 

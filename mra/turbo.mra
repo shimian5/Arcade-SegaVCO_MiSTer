@@ -14,7 +14,7 @@
     <!-- fgtiles @ 0x00a000, 0x1000 bytes -->
     <part name="epr-1244.cpu-ic111" crc="17f67424"/>
     <part name="epr-1245.cpu-ic122" crc="2ba0b46b"/>
-    <!-- proms @ 0x00c000, 0x2000 bytes -->
+    <!-- proms @ 0x00b000, 0x2000 bytes -->
     <part name="pr-1114.prom-ic13" crc="78aded46"/>
     <part name="pr-1115.prom-ic18" crc="5394092c"/>
     <part name="pr-1116.prom-ic20" crc="3956767d"/>
@@ -28,7 +28,7 @@
     <part name="pr-1123.prom-ic12" crc="02d2cb52"/>
     <part name="pr-1279.sound-ic40" crc="b369a6ae"/>
     <part repeat="4064">FF</part>
-    <!-- road @ 0x00e000, 0x8000 bytes -->
+    <!-- road @ 0x00d000, 0x8000 bytes -->
     <part name="epr-1125.cpu-ic1" crc="65b5d44b"/>
     <part name="epr-1126.cpu-ic2" crc="685ace1b"/>
     <part name="epr-1127.cpu-ic13" crc="9233c9ca"/>
@@ -39,8 +39,7 @@
     <part name="epr-1242.cpu-ic42" crc="04866769"/>
     <part name="epr-1243.cpu-ic74" crc="29854c48"/>
     <part repeat="14336">FF</part>
-    <part repeat="32768">FF</part> <!-- bgcolor (unused) -->
-    <!-- sprites @ 0x016000, 0x40000 bytes -->
+    <!-- sprites @ 0x015000, 0x40000 bytes -->
     <part name="epr-1246.prom-ic84" crc="555bfe9a"/>
     <part repeat="8192">FF</part>
     <part name="epr-1247.prom-ic86" crc="c8c5e4d5"/>

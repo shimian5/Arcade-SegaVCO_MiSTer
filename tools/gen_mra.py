@@ -13,18 +13,29 @@ Writes mra/<game>.mra for every entry in GAMES.
 import os
 
 # Fixed region offsets/sizes in the combined ROM blob, shared by every game.
-# (PROMS bumped to 0x2000 vs the original 0x1000 plan draft: Turbo's proms
-# region is 0x1020 bytes, just over 4KB, so the slot needs headroom.)
+# MUST be perfectly contiguous (each BASE == previous BASE+SIZE): the MRA
+# generator below emits <part> elements strictly back-to-back with no
+# inter-slot padding (only region_blob()'s intra-slot filling), since MRA is
+# a sequential byte stream, not an addressed one. An earlier version of this
+# table used "nice round hex" BASE offsets that didn't actually tile with
+# the sizes (gaps after fgtiles and after road/bgcolor) -- invisible in
+# sim/build_rom.py (which writes at absolute offsets, immune to stream-order
+# bugs) but fatal on real hardware: everything from PROMS onward arrived at
+# the wrong ioctl_addr window and got silently dropped by rom_download.v's
+# decode. Keep rtl/rom_download.v's localparams byte-identical to this.
+#
+# (PROMS is 0x2000, not the original 0x1000 draft: Turbo's proms region is
+# 0x1020 bytes, just over 4KB, so the slot needs headroom.)
 REGIONS = {
     "maincpu":  (0x000000, 0x8000),
     "subcpu":   (0x008000, 0x2000),
     "fgtiles":  (0x00A000, 0x1000),
-    "proms":    (0x00C000, 0x2000),
-    "road":     (0x00E000, 0x8000),   # Turbo road / Buck Rogers bgcolor share this slot
-    "bgcolor":  (0x00E000, 0x8000),
-    "sprites":  (0x016000, 0x40000),
+    "proms":    (0x00B000, 0x2000),
+    "road":     (0x00D000, 0x8000),   # Turbo road / Buck Rogers bgcolor share this slot
+    "bgcolor":  (0x00D000, 0x8000),
+    "sprites":  (0x015000, 0x40000),
 }
-BLOB_SIZE = 0x056000
+BLOB_SIZE = 0x055000
 
 def region_blob(parts, region_size):
     """parts: list of (name, offset, size, crc) as transcribed from ROM_LOAD.
@@ -50,12 +61,21 @@ def build_rom_xml(game):
     lines = []
     zip_attr = game["zip"]
     lines.append(f'  <rom index="0" zip="{zip_attr}" md5="none">')
-    for region_name in ["maincpu", "subcpu", "fgtiles", "proms", "road", "bgcolor", "sprites"]:
-        if region_name not in game["regions"]:
-            if region_name in REGIONS:
-                # No parts for this region in this game -- fill the whole slot.
-                _, size = REGIONS[region_name]
-                lines.append(f'    <part repeat="{size}">FF</part> <!-- {region_name} (unused) -->')
+    # "road" (Turbo) and "bgcolor" (Buck Rogers) are mutually exclusive
+    # alternatives sharing the SAME address slot (see REGIONS) -- each game
+    # defines at most one of the two, so they must be emitted as a single
+    # slot, not iterated independently (that would double-emit the slot: a
+    # full-size filler for the absent one, then the real data for the
+    # present one, shifting every region after it -- i.e. all of "sprites"
+    # -- later in the stream than rom_download.v expects).
+    slots = [["maincpu"], ["subcpu"], ["fgtiles"], ["proms"], ["road", "bgcolor"], ["sprites"]]
+    for slot in slots:
+        region_name = next((n for n in slot if n in game["regions"]), None)
+        if region_name is None:
+            # No parts for this slot in this game -- fill the whole slot.
+            # All names in a slot share the same REGIONS entry, so any works.
+            _, size = REGIONS[slot[0]]
+            lines.append(f'    <part repeat="{size}">FF</part> <!-- {"/".join(slot)} (unused) -->')
             continue
         _, size = REGIONS[region_name]
         blob = region_blob(game["regions"][region_name], size)

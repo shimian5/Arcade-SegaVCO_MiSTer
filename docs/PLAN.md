@@ -6,11 +6,14 @@
 background dressing render correctly in simulation) **and hardware-hardened**:
 Quartus full compile (synthesis + fit + assembler + TimeQuest) succeeds clean,
 0 errors, positive timing slack (+0.356 ns worst-case setup), 20% ALM / 14%
-block-memory / 19% RAM-block utilization on the DE10-Nano's 5CSEBA6 — ready
-for an on-hardware smoke test. `Arcade-Z80-3D.rbf`/`.sof` build in
-`output_files/` (gitignored, not committed — rebuild with
-`quartus_sh --flow compile Arcade-Z80-3D`). Working tree is
-`.claude/worktrees/phase0-1a`, branch `worktree-phase0-1a` — not yet merged.
+block-memory / 19% RAM-block utilization on the DE10-Nano's 5CSEBA6.
+`Arcade-Z80-3D.rbf`/`.sof` build in `output_files/` (gitignored, not
+committed — rebuild with `quartus_sh --flow compile Arcade-Z80-3D`). Working
+tree is `.claude/worktrees/phase0-1a`, branch `worktree-phase0-1a` — not yet
+merged.
+
+**First on-hardware test found a real bug the sim harness structurally could
+not catch** (see "MRA ROM-download gap bug" below) — fixed. Awaiting retest.
 
 | Item | State |
 |---|---|
@@ -75,8 +78,64 @@ road/tunnel dressing and ship-lives icons (all fg-tilemap content).
    MHz"`, which the fitter rejected outright — Quartus's PLL solver needs a
    frequency it can hit exactly, not merely close; it reports the nearest
    legal value in the error message.)
-3. `pll`'s `locked` output is now wired into the top-level `reset`, so the
-   core stays in reset until the PLL has actually locked.
+3. `pll`'s `locked` output was briefly wired into the top-level `reset`, then
+   pulled back out (see "First on-hardware test" below) — untested-on-real-
+   silicon logic added the same session as an on-hardware failure is exactly
+   the wrong thing to leave in while isolating that failure. Re-add once the
+   MRA fix below is confirmed to be the actual/whole story.
+
+**First on-hardware test: MRA ROM-download gap bug (found and fixed).**
+
+First DE10-Nano test came back showing a flat, uniform background fill with
+no attract text — the flat color matched what character-code-0's tile
+renders as with real ROM data (confirmed by reproducing the identical
+pattern in an early, broken sim run where VRAM was never written but PROMs
+still loaded), so the read was "CPU isn't producing real graphics," not "ROM
+never loaded at all." Removing the `pll_locked`-gates-reset wiring (the only
+other untested-on-hardware change) didn't fix it, which prompted a full
+audit of the MRA against `rom_download.v`'s decode.
+
+Found two real bugs in `tools/gen_mra.py`, both invisible to every test run
+so far because `sim/build_rom.py` writes each ROM region directly at its
+`REGIONS` offset into a pre-allocated buffer — immune to stream-order bugs
+that only matter for the real sequential MRA byte stream:
+
+1. **`"road"`/`"bgcolor"` double-emission.** They're mutually-exclusive
+   alternatives sharing one address slot (Turbo's road generator vs. Buck
+   Rogers' bgcolor), but the emission loop iterated both names
+   independently: for `buckrogn` (which only defines `"bgcolor"`), it
+   emitted a full-size filler for the absent `"road"` entry, then the real
+   `"bgcolor"` data right after — doubling that slot and shifting every
+   region after it (all of `"sprites"`) later in the stream. Fixed by
+   collapsing them into one slot in the emission loop, picking whichever of
+   the two names the game actually defines.
+2. **Non-contiguous `REGIONS` base offsets (the real culprit).** The
+   original offsets (`0x00A000`/`0x00C000`/`0x00E000`/`0x016000`) were
+   picked as "nice round hex numbers" without checking they actually tile
+   with the preceding region's size — there was a 4KB gap after `fgtiles`
+   and another after `road`/`bgcolor`. The MRA generator emits `<part>`
+   elements strictly back-to-back with **no** inter-region padding (MRA is
+   a sequential byte stream, not an addressed one), so the real data is
+   naturally contiguous — but `rom_download.v`'s decode used the gapped
+   absolute offsets. Everything from PROMS onward (critically PR-5194, the
+   X-shift PROM every fg-tilemap column lookup depends on) arrived at the
+   wrong `ioctl_addr` window on real hardware and was silently dropped.
+   Fixed by recomputing `REGIONS` as genuinely contiguous
+   (`maincpu` 0x000000 / `subcpu` 0x008000 / `fgtiles` 0x00A000 / `proms`
+   0x00B000 / `road`+`bgcolor` 0x00D000 / `sprites` 0x015000, total
+   `0x055000`) and mirroring the same offsets in `rom_download.v`. Also
+   replaced `rom_download.v`'s address subtraction (which sliced the
+   *operands* before subtracting — only correct when BASE happens to be a
+   round number in that field's bit width, true by luck for the old offsets
+   but not guaranteed going forward) with full-width subtraction sliced
+   *after*.
+
+Added `tools/verify_mra_stream.py` as a permanent regression check: builds
+the ROM blob two independent ways (parsing the actual generated MRA's
+`<part>` stream in file order vs. `sim/build_rom.py`'s absolute-offset
+writes) and asserts they're byte-identical. This is exactly the check that
+would have caught the bug before it ever reached hardware — run it after any
+`REGIONS`/MRA change. All three games pass post-fix.
 
 **Known simplification still open before phase 1b's bit-exact MAME frame-diff:**
 
@@ -356,20 +415,24 @@ headless, and dumps one PPM per frame. Compare against MAME snapshots
 plumbing, a frame-diff loop is the difference between a week and a month on each mixer.
 
 **ROM loading**: MRA files concatenate the MAME ROM set into one blob; `rom_download.v`
-decodes `ioctl_addr` into regions. Fixed download map (pad each region), as
-implemented in `tools/gen_mra.py`'s `REGIONS` dict and `rtl/rom_download.v`
-(source of truth — update both together if this ever changes):
+decodes `ioctl_addr` into regions. Fixed download map, as implemented in
+`tools/gen_mra.py`'s `REGIONS` dict and `rtl/rom_download.v` (source of
+truth — update both together if this ever changes, and re-run
+`tools/verify_mra_stream.py` after). **Offsets must be perfectly
+contiguous** — MRA is a sequential byte stream with no inter-region padding,
+so any gap here silently misroutes everything after it on real hardware
+(see "First on-hardware test" above; this table used to have gaps):
 
 | Offset | Region |
 |---|---|
 | `0x000000` | maincpu (32 KB) |
 | `0x008000` | subcpu (8 KB) |
 | `0x00A000` | fgtiles (4 KB) |
-| `0x00C000` | proms (8 KB — bumped from an earlier 4 KB draft; Turbo's proms ROM_REGION is 4128 bytes) |
-| `0x00E000` | road / bgcolor (32 KB) |
-| `0x016000` | sprites (256 KB, 8 × 32 KB) |
+| `0x00B000` | proms (8 KB — bumped from an earlier 4 KB draft; Turbo's proms ROM_REGION is 4128 bytes) |
+| `0x00D000` | road / bgcolor (32 KB) |
+| `0x015000` | sprites (256 KB, 8 × 32 KB) |
 
-Total blob size: `0x056000` (344 KB).
+Total blob size: `0x055000` (340 KB).
 
 ---
 

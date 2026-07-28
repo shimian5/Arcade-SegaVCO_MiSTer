@@ -14,7 +14,7 @@
     <!-- fgtiles @ 0x00a000, 0x1000 bytes -->
     <part name="epr-5201.cpu-ic102" crc="7f21b0a4"/>
     <part name="epr-5202.cpu-ic103" crc="43f3e5a7"/>
-    <!-- proms @ 0x00c000, 0x2000 bytes -->
+    <!-- proms @ 0x00b000, 0x2000 bytes -->
     <part name="pr-5194.cpu-ic39" crc="bc88cced"/>
     <part name="pr-5195.cpu-ic53" crc="181c6d23"/>
     <part repeat="192">FF</part>
@@ -23,11 +23,10 @@
     <part name="pr-5198.cpu-ic93" crc="32e74bc8"/>
     <part name="pr-5199.cpu-ic95" crc="45e997a8"/>
     <part repeat="5376">FF</part>
-    <part repeat="32768">FF</part> <!-- road (unused) -->
-    <!-- bgcolor @ 0x00e000, 0x8000 bytes -->
+    <!-- bgcolor @ 0x00d000, 0x8000 bytes -->
     <part name="epr-5203.cpu-ic91" crc="631f5b65"/>
     <part repeat="24576">FF</part>
-    <!-- sprites @ 0x016000, 0x40000 bytes -->
+    <!-- sprites @ 0x015000, 0x40000 bytes -->
     <part name="epr-5216.prom-ic100" crc="8155bd73"/>
     <part repeat="24576">FF</part>
     <part name="epr-5213.prom-ic84" crc="fd78dda4"/>
