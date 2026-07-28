@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+
+# Quartus build output
+db/
+incremental_db/
+output_files/
+simulation/
+greybox_tmp/
+*.qws
+*.rpt
+*.summary
+*.sof
+*.rbf
+*.pin
+*.done
+*.jdi
+*.sld
+*.qdf
+*.smsg
+
+# Verilator / sim output
+sim/obj_dir/
+sim/out/
+*.vcd
+*.ppm
+
+# built ROM images (produced from MRA + MAME sets, never checked in)
+*.rom
