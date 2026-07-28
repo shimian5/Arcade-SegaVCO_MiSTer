@@ -18,6 +18,9 @@ greybox_tmp/
 *.sld
 *.qdf
 *.smsg
+build_id.v
+jtag.cdf
+c5_pin_model_dump.txt
 
 # Verilator / sim output
 sim/obj_dir/

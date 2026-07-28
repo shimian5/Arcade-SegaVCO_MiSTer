@@ -101,17 +101,23 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
-// TODO: reconfigure pll.v for a 39.936 MHz core clock (2x Z80-3D master,
-// see docs/PLAN.md "Clocking"). Left at the template's default until phase 1b.
+// 39.936 MHz core clock = 2x the Z80-3D board's 19.968 MHz master XTAL, per
+// docs/PLAN.md "Clocking". Not exactly representable from the 50 MHz
+// reference (the board's XTAL isn't a round number either), so
+// rtl/pll/pll_0002.v targets Quartus's nearest legal PLL setting instead:
+// 39,935,064 Hz, ~23 ppm low. Tighter than the crystal tolerance on real
+// hardware, so this is not a meaningful source of timing error.
 wire clk_sys;
+wire pll_locked;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
-	.outclk_0(clk_sys)
+	.outclk_0(clk_sys),
+	.locked(pll_locked)
 );
 
-wire reset = RESET | status[0] | buttons[1];
+wire reset = RESET | status[0] | buttons[1] | ~pll_locked;
 
 wire HBlank;
 wire HSync;

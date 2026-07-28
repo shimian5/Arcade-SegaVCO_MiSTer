@@ -12,6 +12,18 @@
 // mixer_buckrog.v in docs/PLAN.md) since the full mixer belongs to phase 1c;
 // forebits/palette addressing follow the plan's formulas verbatim, with
 // fchg (PPI0 port C bits 0-2) tied to 0 until PPI0 is wired up.
+//
+// MEMORY READS ARE ALL REGISTERED (synchronous), including the CPU's program
+// ROM/work RAM ports, so Quartus infers real M10K block RAM instead of large
+// combinational muxes. This needs no Z80 wait-state handling: cpu_a is held
+// stable for the CPU's whole T-state (many core-clk cycles, since ce_z80
+// only pulses once every 8), which is far longer than the 1-cycle read
+// latency -- the registered output settles long before the CPU's next CEN
+// sample point. The video path's registered reads (fg_tilemap + the local
+// color-table/palette lookups below) form a fixed-depth pipeline instead;
+// see VIDEO_PIPE_LATENCY, which delay-matches hblank/vblank/hsync/vsync/
+// ce_pix so the sync bundle output stays aligned with the pixel data it
+// describes.
 module z80_3d
 (
     input  wire        clk,             // core clock, ~39.936 MHz nominal
@@ -48,6 +60,7 @@ module z80_3d
     // ------------------------------------------------------------------
     wire [9:0] hpos;
     wire [8:0] vpos;
+    wire       hblank_raw, vblank_raw, hsync_raw, vsync_raw;
     video_timing vtiming
     (
         .clk         (clk),
@@ -55,10 +68,10 @@ module z80_3d
         .reset       (reset),
         .hpos        (hpos),
         .vpos        (vpos),
-        .hblank      (hblank),
-        .vblank      (vblank),
-        .hsync       (hsync),
-        .vsync       (vsync),
+        .hblank      (hblank_raw),
+        .vblank      (vblank_raw),
+        .hsync       (hsync_raw),
+        .vsync       (vsync_raw),
         .vblank_rise (vblank_rise)
     );
 
@@ -69,7 +82,6 @@ module z80_3d
         if (reset) pix_div <= 0;
         else       pix_div <= pix_div + 2'd1;
     end
-    assign ce_pix = ce_pix_int;
 
     wire vblank_rise;
 
@@ -122,15 +134,24 @@ module z80_3d
     end
 
     // ------------------------------------------------------------------
-    // Main program ROM (32KB, 0000-7fff)
+    // Main program ROM (32KB, 0000-7fff) -- registered read
     // ------------------------------------------------------------------
     reg [7:0] maincpu_rom[0:32767];
-    always @(posedge clk) if (maincpu_we) maincpu_rom[maincpu_wraddr] <= rom_dout;
+    reg [7:0] maincpu_dout;
+    always @(posedge clk) begin
+        if (maincpu_we) maincpu_rom[maincpu_wraddr] <= rom_dout;
+        maincpu_dout <= maincpu_rom[cpu_a[14:0]];
+    end
 
     // ------------------------------------------------------------------
-    // Work RAM (f800-ffff, 2KB)
+    // Work RAM (f800-ffff, 2KB) -- registered read
     // ------------------------------------------------------------------
     reg [7:0] work_ram[0:2047];
+    reg [7:0] work_ram_dout;
+    always @(posedge clk) begin
+        if (sel_workram && cpu_write) work_ram[cpu_a[10:0]] <= cpu_do;
+        work_ram_dout <= work_ram[cpu_a[10:0]];
+    end
 
     // ------------------------------------------------------------------
     // CPU
@@ -192,8 +213,7 @@ module z80_3d
     // ------------------------------------------------------------------
     // Memory decode (main_prg_map, docs/PLAN.md phase 1)
     // ------------------------------------------------------------------
-    wire cpu_mem_valid = ~cpu_mreq_n && ~cpu_rd_n || ~cpu_mreq_n && ~cpu_wr_n;
-    wire cpu_write     = ~cpu_mreq_n && ~cpu_wr_n;
+    wire cpu_write = ~cpu_mreq_n && ~cpu_wr_n;
 
     wire sel_rom     = (cpu_a < 16'h8000);
     wire sel_vram    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
@@ -220,13 +240,9 @@ module z80_3d
         .foreraw      (foreraw)
     );
 
-    always @(posedge clk) begin
-        if (sel_workram && cpu_write) work_ram[cpu_a[10:0]] <= cpu_do;
-    end
-
-    assign cpu_di = sel_rom     ? maincpu_rom[cpu_a[14:0]] :
-                     sel_vram   ? vram_rdata               :
-                     sel_workram? work_ram[cpu_a[10:0]]    :
+    assign cpu_di = sel_rom     ? maincpu_dout  :
+                     sel_vram   ? vram_rdata    :
+                     sel_workram? work_ram_dout :
                                   8'hFF;
 
     // ------------------------------------------------------------------
@@ -239,20 +255,49 @@ module z80_3d
     // ------------------------------------------------------------------
     // Phase-1a mixer stub: fg tier-1 path only (docs/PLAN.md mixer_buckrog.v)
     // fchg (PPI0 port C bits 0-2) is tied to 0 until PPI0 is wired up.
+    // color_table and palette_rom reads are each registered (+1 clk each),
+    // on top of fg_tilemap's own FG_TILEMAP_LATENCY=4 -- see
+    // VIDEO_PIPE_LATENCY below.
     // ------------------------------------------------------------------
     wire [1:0] fchg = 2'b00;
     wire [8:0] color_addr = ({7'b0, foreraw[1:0]}) |
                             ({1'b0, foreraw & 8'hF8} >> 1) |
                             ({fchg, 7'b0});
-    wire [7:0] forebits = color_table[color_addr];
-    wire [7:0] palbits  = ((forebits & 8'h3c) << 2) | ((forebits & 8'h06) << 1) | (forebits & 8'h01);
+    reg [7:0] forebits_reg;
+    always @(posedge clk) forebits_reg <= color_table[color_addr];
+
+    wire [7:0] palbits = ((forebits_reg & 8'h3c) << 2) | ((forebits_reg & 8'h06) << 1) | (forebits_reg & 8'h01);
 
     reg [23:0] palette_rom[0:1023];
     initial $readmemh("roms/palette_buckrog.hex", palette_rom);
 
-    wire [23:0] rgb = (hblank || vblank) ? 24'h0 : palette_rom[{2'b00, palbits}];
-    assign video_r = rgb[23:16];
-    assign video_g = rgb[15:8];
-    assign video_b = rgb[7:0];
+    reg [23:0] rgb_reg;
+    always @(posedge clk) rgb_reg <= palette_rom[{2'b00, palbits}];
+
+    assign video_r = (hblank | vblank) ? 8'h0 : rgb_reg[23:16];
+    assign video_g = (hblank | vblank) ? 8'h0 : rgb_reg[15:8];
+    assign video_b = (hblank | vblank) ? 8'h0 : rgb_reg[7:0];
+
+    // ------------------------------------------------------------------
+    // Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with
+    // the pipeline latency above (fg_tilemap's 4 + color_table's 1 +
+    // palette_rom's 1 = 6), so the sync signals output alongside rgb_reg
+    // describe the same original hpos/vpos that produced it.
+    // ------------------------------------------------------------------
+    localparam VIDEO_PIPE_LATENCY = 6;
+
+    reg [VIDEO_PIPE_LATENCY-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
+    always @(posedge clk) begin
+        hblank_pipe <= {hblank_pipe[VIDEO_PIPE_LATENCY-2:0], hblank_raw};
+        vblank_pipe <= {vblank_pipe[VIDEO_PIPE_LATENCY-2:0], vblank_raw};
+        hsync_pipe  <= {hsync_pipe [VIDEO_PIPE_LATENCY-2:0], hsync_raw};
+        vsync_pipe  <= {vsync_pipe [VIDEO_PIPE_LATENCY-2:0], vsync_raw};
+        ce_pix_pipe <= {ce_pix_pipe[VIDEO_PIPE_LATENCY-2:0], ce_pix_int};
+    end
+    assign hblank = hblank_pipe[VIDEO_PIPE_LATENCY-1];
+    assign vblank = vblank_pipe[VIDEO_PIPE_LATENCY-1];
+    assign hsync  = hsync_pipe [VIDEO_PIPE_LATENCY-1];
+    assign vsync  = vsync_pipe [VIDEO_PIPE_LATENCY-1];
+    assign ce_pix = ce_pix_pipe[VIDEO_PIPE_LATENCY-1];
 
 endmodule

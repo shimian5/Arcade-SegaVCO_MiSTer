@@ -3,7 +3,13 @@
 ## Status — 2026-07-28
 
 **Phase 0 done. Phase 1a done** (Buck Rogers `buckrogn` attract-mode text +
-background dressing render correctly in simulation). Working tree is
+background dressing render correctly in simulation) **and hardware-hardened**:
+Quartus full compile (synthesis + fit + assembler + TimeQuest) succeeds clean,
+0 errors, positive timing slack (+0.356 ns worst-case setup), 20% ALM / 14%
+block-memory / 19% RAM-block utilization on the DE10-Nano's 5CSEBA6 — ready
+for an on-hardware smoke test. `Arcade-Z80-3D.rbf`/`.sof` build in
+`output_files/` (gitignored, not committed — rebuild with
+`quartus_sh --flow compile Arcade-Z80-3D`). Working tree is
 `.claude/worktrees/phase0-1a`, branch `worktree-phase0-1a` — not yet merged.
 
 | Item | State |
@@ -38,28 +44,57 @@ the stubs, the real CPU reaches and renders the attract screen: verified
 visually in `sim/out/` — the "SEGA" copyright text is legible, along with the
 road/tunnel dressing and ship-lives icons (all fg-tilemap content).
 
-**Known simplifications to fix before phase 1b's bit-exact MAME frame-diff:**
+**Hardware-hardening pass (done, post phase-1a):**
 
-1. `fg_tilemap.v`'s VRAM/tile-ROM/PROM reads are combinational array reads,
-   not registered BRAM ports — fine for sim, not synthesizable as single-cycle
-   BRAM. Pipeline this (mirroring the sprite engine's per-pixel fetch design)
-   before phase 1b.
-2. `cpu_z80.v`'s TV80 path runs the CPU at the **full core clock**, undivided
-   — TV80's `tv80s.v` wrapper ties its internal `cen` permanently to 1 (no
-   usable clock-enable input; confirmed against the tv80 repo's own
-   reference testbench, which does the same). So in simulation the CPU
-   currently runs ~8x faster relative to video than real hardware. Fine for
-   "does the attract screen render" but wrong for cycle-accurate frame
-   diffing. Fix by driving `tv80_core` directly (it does expose a `cen`
-   port) with a real per-T-state enable, or by giving the CPU its own
-   free-running clock domain. T80 (real synthesis target) is unaffected —
-   it takes a genuine `CEN` clock-enable and needs no workaround.
-3. `pll.v` is still the Template's default PLL — not yet reconfigured for
-   the 39.936 MHz core clock the plan's clocking table calls for.
-4. ROM download map's PROMS slot was bumped from the original draft's 4 KB to
-   8 KB (Turbo's `proms` ROM_REGION is 4128 bytes, just over 4 KB) — see the
-   updated "ROM loading" table below. `tools/gen_mra.py`'s `REGIONS` dict is
-   the source of truth; keep `rom_download.v` in sync with it by hand.
+1. `fg_tilemap.v` and `z80_3d.v`'s memory reads (VRAM, tile ROM, X-shift/
+   color-table PROMs, main program ROM, work RAM, palette ROM) were
+   combinational array reads — fine for sim, but not synthesizable as
+   single-cycle BRAM (Quartus was going to have to build a giant
+   combinational mux, worst for the 32 KB program ROM). **Fixed**: all of
+   these are now registered (synchronous) reads. No Z80 wait-state handling
+   was needed for the CPU-side reads — `cpu_a` is held stable for the whole
+   Z80 T-state (many core-clk cycles, since `ce_z80` only pulses once every
+   8), far longer than the 1-cycle registration latency, so the registered
+   value is always correct well before the CPU's next sample point. The
+   video-side reads form a real fixed-depth pipeline instead (`fg_tilemap`'s
+   4-stage tile fetch + 1 cycle for the color-table lookup + 1 cycle for the
+   palette lookup = 6 cycles total); `z80_3d.v` delay-matches
+   hblank/vblank/hsync/vsync/ce_pix through a 6-stage shift register so the
+   sync bundle output stays aligned with the pixel data it describes.
+   Verified in `sim/`: re-rendered the same attract frame post-pipelining,
+   pixel-identical to the pre-pipeline version. Confirmed in Quartus too —
+   Analysis & Synthesis reports 939 RAM segments inferred (`altsyncram`
+   blocks), not combinational logic.
+2. `pll.v` reconfigured for the 39.936 MHz core clock. The exact value isn't
+   representable from the 50 MHz reference (39,936,000 Hz reduces to the
+   coprime fraction 2496/3125 — no small-integer PLL ratio hits it), so
+   `rtl/pll/pll_0002.v` targets Quartus's nearest **exactly legal** PLL
+   setting instead, which the fitter itself reports: **39,935,064 Hz, ~23
+   ppm low**. That's tighter than a real crystal's own tolerance and not a
+   meaningful error. (First attempt used the rounded string `"39.936000
+   MHz"`, which the fitter rejected outright — Quartus's PLL solver needs a
+   frequency it can hit exactly, not merely close; it reports the nearest
+   legal value in the error message.)
+3. `pll`'s `locked` output is now wired into the top-level `reset`, so the
+   core stays in reset until the PLL has actually locked.
+
+**Known simplification still open before phase 1b's bit-exact MAME frame-diff:**
+
+`cpu_z80.v`'s TV80 (simulation-only) path runs the CPU at the **full core
+clock**, undivided — TV80's `tv80s.v` wrapper ties its internal `cen`
+permanently to 1 (no usable clock-enable input; confirmed against the tv80
+repo's own reference testbench, which does the same). So in simulation the
+CPU currently runs ~8x faster relative to video than real hardware. Fine for
+"does the attract screen render" but wrong for cycle-accurate frame diffing.
+Fix by driving `tv80_core` directly (it does expose a `cen` port) with a real
+per-T-state enable, or by giving the CPU its own free-running clock domain.
+T80 (real synthesis target) is unaffected — it takes a genuine `CEN`
+clock-enable and was never part of this problem.
+
+ROM download map's PROMS slot was bumped from the original draft's 4 KB to
+8 KB (Turbo's `proms` ROM_REGION is 4128 bytes, just over 4 KB) — see the
+updated "ROM loading" table below. `tools/gen_mra.py`'s `REGIONS` dict is
+the source of truth; keep `rom_download.v` in sync with it by hand.
 
 **Sim harness (`sim/`):**
 
