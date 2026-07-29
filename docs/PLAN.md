@@ -295,21 +295,67 @@ Two things worth keeping from that exercise:
   control flow) that was pure artifact. With the taps rooted in `_G`, MAME
   writes ~160×/frame indefinitely. The committed script now roots them and
   prints `last_tap_frame` — check that line before trusting a trace.
-- **New top suspect, cheap to check: a frame-index off-by-one inside the
-  harness itself.** The RTL image dump for "frame 150" shows a rendered logo,
-  while the sprite-RAM snapshot says nothing was enabled during frame 150's
-  active display. Both cannot describe the same frame, so `tb_z80_3d.cpp`'s
-  frame counter (selects the image dump) and `sprite_engine.v`'s
-  `dbg_cur_frame` (selects the RAM snapshots) are probably off by one relative
-  to each other. Settle this before running the co-sim again, and re-baseline
-  both dumps onto a frame where the logo is fully programmed (151+) rather
-  than the transitional frame.
+- **CONFIRMED AND FIXED (2026-07-29): the frame-index off-by-one was real.**
+  `sprite_engine.v`'s `dbg_cur_frame` initialised to `-1` while the C++
+  testbench's own `frame` counter started at `0`; both increment on the
+  identical `$time` tick (proved by instrumenting both sides with a temporary
+  `ENGINE_BOUNDARY`/`TB_BOUNDARY` probe pair — every `ENGINE_BOUNDARY` sat a
+  constant 347,698 ticks after its matching `TB_BOUNDARY`, exactly the
+  ROM-download ticks elapsed before the tb starts counting, i.e. simultaneous),
+  so engine frame N always meant tb frame N+1. Fixed by initialising
+  `dbg_cur_frame` to `0`. Re-ran `make -C sim dump` (`--frames 152
+  --dumpframe 150`) after the fix: `sim/out/dbg_sprram.hex` (state at the
+  *start* of frame 150) now shows slot 2 **enabled** (`b2 6f 90 01 40 00 80
+  1f` — the same y-scale/rowbytes/offset payload the investigation traced to
+  the logo art), and `sim/out/dbg_150.ppm` shows the (garbled) logo rendered
+  for that same frame — the RAM snapshot and the image dump finally agree.
+  By `sim/out/dbg_sprram_end.hex` (end of frame 150 / start of frame 151)
+  slot 2 is disabled again and `dbg_151.ppm` already shows the road/gameplay
+  screen, confirming the CPU turns the logo sprite off during frame 150's own
+  VBLANK in preparation for frame 151. **Frame 150 is therefore the correct,
+  already-correct baseline for all future co-sim work — no shift to 151+ is
+  needed once the counter fix is in.** Also re-verified the raster-phase
+  probe used to help pin this down: the RTL's `(dbg_hpos,dbg_vpos)` is not a
+  constant "+1 pixel ahead" of the testbench's own `(x,y)` as first assumed
+  (that assumption was itself measurably wrong, see `sim/tb_z80_3d.cpp`) —
+  measured directly (dumping the first ~700 `ce_pix` ticks), it is the tb's
+  `(x,y)` delayed by a constant **4 ce_pix ticks** (confirmed across both the
+  `x`-wrap and the `hpos`-wrap, which land exactly 4 ticks apart), after a
+  short few-tick startup transient right after reset. The standing
+  `RASTER ALIGNMENT` check in `tb_z80_3d.cpp` now encodes this measured
+  relationship (a 4-deep history buffer, not a same-tick `+1` compare) and
+  reports 0/844800 deviations on a clean run. The temporary
+  `ENGINE_BOUNDARY`/`TB_BOUNDARY` probes have been removed now that the fix
+  is confirmed; the raster-alignment check itself is kept as a standing
+  invariant test.
 
-**IN FLIGHT (dispatched 2026-07-29):** the remaining schematic threads — the
-LS157 nibble-select XOR (IC23 pin 12, and the `CW0`→ROM `A0` contradiction)
-plus the LS109 gating / VCO-phase-reset semantics, picking up from
-§7.4/§7.5/§7.6/§8.2 of `docs/reference/VCO_schematic_findings.md`.
-Measure-and-report only; not authorised to change engine logic.
+**Schematic threads dispatched 2026-07-29: DONE, folded in below.** See
+`docs/reference/VCO_schematic_findings.md` SESSION 3 (committed `0d4224b`)
+for full detail. Headlines:
+  - The nibble-order-vs-count-direction hypothesis is **REFUTED**: IC23 pin 12
+    (previously unresolved) is `CLK0`, the VCO's own output, so the LS157
+    select is `S = CW15 XOR CLK0` — functionally identical to MAME's `offs`
+    bit-0 behaviour (nibble order swaps with `offs`'s sign/direction). No RTL
+    change indicated.
+  - The LS109 gating network (Task B) is now fully decoded. Correcting a
+    session-2 mis-reading (a mislabelled pin), **`CWEN0 ... SHT.1` is an
+    OUTPUT of the level sheet back to sheet 1**, gating the VCO's own `EN`
+    pin — both prior sessions had this backwards (had assumed it was an
+    input). `BLANK` asynchronously clears the gating flip-flop, which
+    disables the counter, disables the VCO, and clears the pixel latch to
+    transparent — i.e. the wiring says the hardware does no sprite fetch
+    work at all while `BLANK` is asserted.
+  - `/PLB0` (IC38) is now confirmed an **exact** match for MAME's
+    `plb_end[] & 1` (`PLB = (pixdata != 15) && (pixdata != 0)`), upgrading a
+    prior "medium confidence" finding to high.
+  - Two questions remain genuinely open (datasheet/further-trace work, not
+    engine changes): (1) whether the SN74LS626's `EN` pin halts the
+    oscillator core itself or merely gates its output — this is the last
+    thing standing between us and settling whether VCO phase truly resets
+    per scanline; (2) whether the `BLANK` on CN2 that gates the above is
+    composite (H+V) or H-only blanking — this bears directly on the latent
+    `y_target` VBLANK bug noted below (does hardware run `prepare_sprites`
+    during VBLANK at all).
 
 | Item | State |
 |---|---|

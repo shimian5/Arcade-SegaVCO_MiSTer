@@ -540,7 +540,17 @@ module sprite_engine
         integer dbg_dumpframe;
         initial if (!$value$plusargs("dumpframe=%d", dbg_dumpframe)) dbg_dumpframe = -1;
 
-        integer dbg_cur_frame = -1;   // frame index we are currently inside (-1 = before frame 0)
+        // Frame index we are currently inside, in the SAME numbering the C++
+        // testbench uses, so `--dumpframe N` selects the same frame on both
+        // sides. Starts at 0 (not -1): measured with the ENGINE_BOUNDARY /
+        // TB_BOUNDARY probes, this counter's increment and the testbench's
+        // fire on the identical tick, and at that instant the testbench moves
+        // from its frame 0 to its frame 1 -- so incrementing from -1 made
+        // engine frame N mean testbench frame N+1. That off-by-one silently
+        // made the RAM snapshots and the image/pixel dumps describe DIFFERENT
+        // frames, which is what produced the co-sim's "RTL drew a logo, the
+        // golden model drew nothing" result.
+        integer dbg_cur_frame = 0;
         integer dbg_lvl_fh    = 0;    // open only while dbg_cur_frame == dbg_dumpframe
         integer dbg_wr_fh     = 0;    // open only while dbg_cur_frame == dbg_dumpframe; logs CPU writes
         integer dbg_li;

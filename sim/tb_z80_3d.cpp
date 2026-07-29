@@ -119,11 +119,40 @@ int main(int argc, char **argv)
     long max_ticks = (long)HTOTAL * VTOTAL * 4 * (frames + 1) * 2; // safety cap
 
     // Deliverable 2: sim/out/dbg_rtl_spr.bin, ACTIVE_W*ACTIVE_H*5 bytes,
-    // raster order, opened/closed exactly while frame == dumpframe. x/y here
-    // track ce_pix ticks the same way hpos/vpos do in the RTL (both reset to
-    // 0 the moment `reset` deasserts, right before this loop starts), so
-    // they are the same (hpos,vpos) the dbg_hpos/dbg_vpos ports would report
-    // -- no separate alignment check needed.
+    // raster order, opened/closed exactly while frame == dumpframe.
+    //
+    // x/y here are meant to track the same raster position the RTL's own
+    // hpos/vpos do. That was previously ASSERTED (on the grounds that both
+    // reset to 0 as `reset` deasserts) and never checked -- and the whole
+    // co-sim's frame indexing rests on it, so it is now measured against the
+    // dbg_hpos/dbg_vpos ports every ce_pix. See the RASTER ALIGNMENT report
+    // printed at the end of the run.
+    //
+    // MEASURED (not assumed) relationship, established by dumping
+    // (tick, tbx, tby, hpos, vpos) for the first ~700 ce_pix ticks of a run
+    // (spanning the x=639->0 wrap and the following hpos=639->0 wrap) and
+    // reading the pattern off directly:
+    //   - hpos/vpos is a raster-order-delayed replica of the tb's own (x,y),
+    //     lagging by a CONSTANT 4 ce_pix ticks -- i.e. the whole (x,y) pair
+    //     is shifted, not just one axis. Confirmed across the x wrap: tbx
+    //     wraps 639->0 (tby 0->1) at tick 2543, and hpos independently wraps
+    //     639->0 (vpos 0->1) exactly 4 ticks later at tick 2559 -- the same
+    //     4-tick lag holds through the wrap, so this is one delay line over
+    //     the coordinate pair, not two independent per-axis offsets.
+    //   - There is a short startup transient right after reset (the first
+    //     ~7 ce_pix ticks), during which the lag climbs from -1 up to the
+    //     steady 4 rather than being constant from tick 0 -- consistent with
+    //     the RTL's ce_pix/pipeline generator filling after reset deasserts,
+    //     not a genuine phase defect. The check below skips this window.
+    // The check maintains a 4-deep history of (x,y) and compares hpos/vpos
+    // against the entry from 4 ce_pix ticks back; any deviation once past
+    // the startup window means a real phase glitch.
+    static const int RASTER_LAG = 4;
+    static const int RASTER_SKIP = 16; // past the startup transient, comfortably
+    int hist_x[RASTER_LAG] = {0}, hist_y[RASTER_LAG] = {0};
+    long align_checked = 0, align_bad = 0;
+    int  first_bad_x = -1, first_bad_y = -1, first_bad_rx = -1, first_bad_ry = -1;
+    long first_bad_tick = -1;
     FILE *dbg_spr_f = nullptr;
     if (dumpframe >= 0) {
         dbg_spr_f = fopen("sim/out/dbg_rtl_spr.bin", "wb");
@@ -145,6 +174,34 @@ int main(int argc, char **argv)
         tick(top);
         tick_count++;
         if (top->ce_pix) {
+            // Raster alignment check (see note above): hpos/vpos is the tb's
+            // own (x,y) delayed by a constant RASTER_LAG (4) ce_pix ticks.
+            // This is NOT corrected in the framebuffer indexing below: which
+            // pixel the video output actually belongs to depends on the
+            // mixer pipeline depth, and that pipeline currently free-runs on
+            // `clk` rather than `ce_pix` (see docs/PLAN.md), so "fixing" the
+            // indexing here would just be guessing. What matters is that the
+            // lag stays CONSTANT -- any deviation means a real phase glitch.
+            {
+                int rx = (int)top->dbg_hpos, ry = (int)top->dbg_vpos;
+                int hidx = (int)(align_checked % RASTER_LAG);
+                if (align_checked >= RASTER_SKIP) {
+                    int exp_x = hist_x[hidx];
+                    int exp_y = hist_y[hidx];
+                    if (rx != exp_x || ry != exp_y) {
+                        if (align_bad == 0) {
+                            first_bad_x = exp_x; first_bad_y = exp_y;
+                            first_bad_rx = rx;   first_bad_ry = ry;
+                            first_bad_tick = tick_count;
+                        }
+                        align_bad++;
+                    }
+                }
+                hist_x[hidx] = x;
+                hist_y[hidx] = y;
+                align_checked++;
+            }
+
             if (x < ACTIVE_W && y < ACTIVE_H) {
                 int idx = (y * ACTIVE_W + x) * 3;
                 fb[idx + 0] = top->video_r;
@@ -186,6 +243,16 @@ int main(int argc, char **argv)
     }
 
     if (frame < frames) fprintf(stderr, "WARNING: only produced %d/%d frames before tick cap\n", frame, frames);
+
+    printf("RASTER ALIGNMENT: %ld/%ld ce_pix ticks deviating from the expected\n"
+           "  constant %d-tick RTL-lags-tb raster relationship\n",
+           align_bad, align_checked, RASTER_LAG);
+    if (align_bad) {
+        printf("  first deviation at tick %ld: expected RTL=(%d,%d) got RTL=(%d,%d)\n",
+               first_bad_tick, first_bad_x, first_bad_y, first_bad_rx, first_bad_ry);
+        printf("  => the raster phase is NOT constant; investigate before trusting\n"
+               "     any pixel-level comparison from this run.\n");
+    }
 
     if (dbg_spr_f) {
         fclose(dbg_spr_f);

@@ -45,14 +45,14 @@ writes ~160 times per frame indefinitely. The script now roots them and prints
 **What this leaves.** The garbling itself is still unexplained, but the open threads are
 now the schematic ones (§2/3/4 below) plus one new harness question:
 
-- **Frame-index alignment in the harness (check this first).** The RTL *image* dump for
-  "frame 150" shows a rendered logo, yet no sprite slot is enabled during frame 150's
-  active display per the snapshot above. Those two cannot both describe the same frame,
-  so `tb_z80_3d.cpp`'s frame counter (which selects the image dump) and
-  `sprite_engine.v`'s `dbg_cur_frame` (which selects the RAM snapshots) are most likely
-  **off by one relative to each other**. Verify before drawing any conclusion from a
-  co-sim run, and re-baseline both dumps to a frame where the logo is fully programmed
-  (151+), not the transitional frame.
+- **Frame-index alignment in the harness (check this first). CONFIRMED AND FIXED,
+  2026-07-29 — see `docs/PLAN.md`'s logo section for the full writeup.** It was a real
+  off-by-one: `sprite_engine.v`'s `dbg_cur_frame` initialised to `-1`, one behind the
+  testbench's own `frame` counter, so engine frame N meant tb frame N+1. Fixed by
+  initialising it to `0`. Re-running `make -C sim dump` afterward, `sim/out/dbg_sprram.hex`
+  (start-of-frame-150 snapshot) now shows slot 2 enabled with the logo's payload, and
+  `sim/out/dbg_150.ppm` shows the (garbled) logo for that same frame — the two dumps
+  finally agree, and **frame 150 itself is the correct baseline**, not 151+.
 - The co-sim's "18,812 mismatching pixels" result remains vacuous for the reason given
   further below, but the *reason* is now clearer: the golden model was fed a snapshot
   from a moment when the logo genuinely was not yet programmed, so an empty reference was
