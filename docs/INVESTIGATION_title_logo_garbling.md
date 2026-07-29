@@ -5,6 +5,87 @@ below before the rest of this document — it retracts the TL;DR that follows it
 
 ---
 
+## UPDATE 2026-07-29 (session 3): the VBLANK-writeback FSM bug is FIXED. Logo still garbled. Measured.
+
+The "one real RTL bug found so far" below (`y_target` truncation causing
+`prepare_sprites` to spuriously re-run during VBLANK) is now **fixed** in
+`rtl/video/sprite_engine.v`: `ST_IDLE` only launches when a new
+`run_prepare_sprites` wire (derived from the full 9-bit `vpos`, not the
+truncated `y_target_next`) is true, which happens exactly once per visible
+scanline y=0..223 and never during VBLANK — matching MAME's
+`for (y = cliprect.min_y; y <= cliprect.max_y; y++)`. `y_target` itself and
+the enable ALU were left untouched, so the ported arithmetic is unchanged.
+
+**Verified structurally, directly:**
+- Rebuilt and re-ran `make -C sim dump`. `RASTER ALIGNMENT: 0/25681920 ce_pix
+  ticks deviating` — clean run, instrument trustworthy.
+- `sim/out/dbg_rtl_levels.txt` for slot 2 (the logo sprite, level 2): `ve=1`
+  for exactly y=78..143 (66 visible scanlines), `offset` advancing by exactly
+  `0x80` (rowbytes=0x40, preshifted <<1) per committed line, with the
+  expected occasional same-line repeat where the Y-scale PROM skips a row
+  (1-in-5, matching the intentional 4:5 vertical compression already
+  established). **Zero** spurious advances anywhere outside y=78..143,
+  including all of y=224..263 (VBLANK) where `y_target` is now simply frozen
+  (the FSM doesn't run there at all, so nothing to log). Before the fix this
+  same trace would have shown extra `offset` bumps during VBLANK for any
+  sprite whose Y-range satisfied the ALU compare there; after the fix there
+  are structurally none, because the FSM never launches during VBLANK.
+
+**Tested against the visual symptom — the fix does NOT clear the garbling.**
+Compared `sim/out/dbg_150.ppm` (native 512×224, no scaling needed — MAME's
+`:screen` device is *also* 512×224 native for this driver, confirmed via
+`screen.width`/`screen.height` in Lua; a naive `-video none` snapshot via
+`manager.machine.video:snapshot()` is NOT usable for this — see harness note
+below) against a MAME reference captured with a Lua script that reads
+`screen:pixel(x,y)` directly.
+
+**Game-state alignment, the trap this doc already warned about, hit again and
+resolved by measurement, not assumption:** sim's own frame timeline runs
+noticeably ahead of MAME's for the same coin(90-99)/start(150-159) input
+schedule — sim shows "GAME OVER/INSERT COIN" at its frame 90 where MAME still
+shows it at MAME's frame ~100, and sim reaches the post-start transition frame
+(logo + blank "SPEED:" HUD + lives icons, no CREDIT text) at sim frame 150
+while MAME reaches the *same* HUD content only at MAME frame 162. Confirmed
+match by HUD text/layout, not just position: both show `SPEED:` with no
+numeric value yet, lives icons bottom-left, `(C) SEGA 1982` bottom-right, no
+`CREDIT` text, logo in the same position/size. (MAME frames 100-161 show the
+"CREDIT 1" title/scoreboard screen instead — a different game state, and
+exactly the kind of mismatch that produced a false result in an earlier
+session.)
+
+**Pixel diff, sim frame 150 vs. MAME frame 162, both native 512×224:** 8059 /
+114688 pixels differ (7.0%), concentrated entirely inside the logo's
+bounding box — the starfield, HUD text, lives icons and copyright line are
+pixel-clean between the two. The logo interior is still visibly garbled in
+sim (color noise / bleeding between letters) versus MAME's crisp render, in
+the same way as before the fix.
+
+**Conclusion, stated plainly: this was a real, worth-fixing RTL bug (VBLANK
+writeback was corrupting ROM row pointers, a genuine fidelity gap vs. MAME
+and vs. the schematic's BLANK-gates-everything behavior), but it is not the
+cause of the title-logo garbling.** The garbling must come from somewhere
+else. Given the FSM's writeback/offset path is now further confirmed clean
+(bit-exact single advance per visible line, zero VBLANK contamination), the
+remaining open threads are the schematic ones already tracked below
+(nibble-select XOR, `END` source note already closed clean, VCO→pixel-clock
+resync) — none of which this session touched.
+
+**Harness note, worth keeping:** `manager.machine.video:snapshot()` (and
+`-snapsize WxH`) on this driver returns a canvas that also includes the
+cabinet's physical side scoreboard ("BEST 5" / "YOUR SCORE") panels, at a
+non-native, seemingly-arbitrary width (646, or stretched/cropped to whatever
+`-snapsize` requests) — this is MAME's default *view* compositing, not the
+emulated screen's own framebuffer, and diffing against it manufactures
+differences (wrong layout, wrong width) that have nothing to do with the
+core. Reading `screen:pixel(x,y)` directly off
+`manager.machine.screens[":screen"]` for `x` in `0..screen.width-1`, `y` in
+`0..screen.height-1` and writing a raw PPM gives the actual 512×224 native
+framebuffer with no side panels and no scaling — use that, not
+`video:snapshot()`, for any future pixel-level sim-vs-MAME comparison on this
+driver.
+
+---
+
 ## UPDATE 2026-07-29 (post-reboot): the write-timing suspect is REFUTED. Measured.
 
 The "TL;DR" section below is **wrong** and is kept only so the reasoning is auditable.
@@ -128,7 +209,7 @@ steps" for the fix (drive it from a timestamped write trace, not a snapshot).
 
 ---
 
-## The one solid RTL bug found so far
+## The one solid RTL bug found so far — FIXED 2026-07-29 (session 3), did not fix the logo
 
 `rtl/video/sprite_engine.v` — `y_target` is declared `[7:0]` but `VTOTAL = 264` needs 9 bits:
 
@@ -143,13 +224,26 @@ spurious passes per frame**, each of which can perform the `offset += rowbytes` 
 (`ST_COMMIT`/`ST_COMMIT2`), advancing every enabled sprite's ROM row pointer by up to
 9 extra rows per frame.
 
-Real and worth fixing. **But note it is currently latent**, because nothing is enabled
-during those lines in the captured frame. Do not assume fixing it fixes the logo.
+**Fixed.** `ST_IDLE` now only launches on `hblank_rise && run_prepare_sprites`, where
+`run_prepare_sprites = (vpos == VTOTAL-1) || (vpos < VDISP-1)` is evaluated on the full
+9-bit `vpos` (not the truncated `y_target_next`), so the FSM runs exactly once per visible
+scanline y=0..223 and never during VBLANK. `y_target` itself stays 8 bits and the enable
+ALU is untouched — only *when* the FSM is allowed to launch changed. See the UPDATE at the
+top of this file for the measured verification (raster alignment, level-log offset trail,
+and the pixel-diff test against MAME). **Confirmed real and worth keeping as a fidelity
+fix vs. MAME/hardware, but it does not clear the title-logo garbling** — the symptom is
+unchanged after the fix, measured via pixel diff.
 
-Open question it raises (needs the schematic, not MAME): does the hardware's
-`prepare_sprites` equivalent run during VBLANK at all? MAME only ever calls it for
-`y` in the visible cliprect, so MAME cannot answer this. The `BLANK` input to the per-level
-LS109 gating network (EPROM board sheet 3, PDF p.37) is the place to look.
+The open schematic question below is now **closed in the "no VBLANK activity" direction**
+by this fix matching MAME's behavior, but note the schematic evidence
+(`docs/reference/VCO_schematic_findings.md`, SESSION 3) was the actual justification for
+the fix's shape (gate on vpos, don't just widen y_target) — `BLANK` asynchronously clears
+the per-level gating flip-flop, turning off the ROM address counter, gating off the
+scaling VCO, and clearing the ROM data latch, so the hardware does not fetch sprite data
+while `BLANK` is asserted. Whether that `BLANK` is composite (H+V) or horizontal-only
+remains open and was **not** settled by this session — not needed for this fix, since
+`prepare_sprites` firing once per visible scanline during active display is correct either
+way.
 
 ---
 

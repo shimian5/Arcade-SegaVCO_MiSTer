@@ -357,6 +357,41 @@ for full detail. Headlines:
     `y_target` VBLANK bug noted below (does hardware run `prepare_sprites`
     during VBLANK at all).
 
+**`y_target` VBLANK bug: FIXED 2026-07-29 (session 3) — logo still garbled, measured.**
+`rtl/video/sprite_engine.v`'s `prepare_sprites` FSM (`ST_IDLE`) now only launches on
+`hblank_rise && run_prepare_sprites`, where `run_prepare_sprites` is evaluated on the
+full 9-bit `vpos` (`(vpos == VTOTAL-1) || (vpos < VDISP-1)`, new `VDISP=224` parameter)
+instead of the previously-unconditional `hblank_rise`. This makes the FSM run exactly
+once per visible scanline y=0..223 and never during VBLANK, matching MAME's
+`for (y = cliprect.min_y; y <= cliprect.max_y; y++)` and the schematic finding above
+(BLANK clears the per-level gating flip-flop, disabling fetch entirely). `y_target`
+itself stays 8 bits and the enable ALU is untouched — a narrow, deliberate fix (do not
+widen `y_target`; see `docs/INVESTIGATION_title_logo_garbling.md`'s top UPDATE for why).
+
+Verified: `make -C sim dump` reports `RASTER ALIGNMENT: 0/25681920` deviations (clean
+run), and `sim/out/dbg_rtl_levels.txt` shows slot 2 (the logo sprite) with `ve=1` for
+exactly y=78..143 and `offset` advancing by exactly rowbytes (0x80 preshifted) per
+committed line, zero spurious advances anywhere else including all of VBLANK — the
+9-spurious-passes-per-frame defect described below is gone.
+
+**But it does not fix the garbled logo.** Pixel-diffed sim's frame 150
+(`sim/out/dbg_150.ppm`, native 512×224) against a MAME reference captured by reading
+`screen:pixel(x,y)` directly off `manager.machine.screens[":screen"]` (native 512×224,
+no scaling) — NOT `manager.machine.video:snapshot()`, which on this driver returns a
+non-native-width canvas that also bakes in the cabinet's side scoreboard panels and
+manufactures spurious differences. Game-state alignment required care (the trap this
+doc already flags): sim's internal timeline runs ~11-12 frames ahead of MAME's for the
+identical coin(90-99)/start(150-159) schedule, so the MAME frame with matching HUD
+content (blank "SPEED:", lives icons, no CREDIT text — confirmed by literally reading
+the HUD text in both, not just position) is MAME's frame 162, not 150. Result: 8059 /
+114688 pixels differ (7.0%), **entirely inside the logo's bounding box** — starfield,
+HUD text, lives icons and copyright are pixel-clean. The logo interior is still visibly
+garbled in sim vs. MAME's crisp render, same as before this fix. The FSM fix is real and
+worth keeping (a genuine fidelity/correctness gap vs. both MAME and the schematic), but
+the root cause of the garbling is still open — see
+`docs/INVESTIGATION_title_logo_garbling.md` for the remaining schematic threads
+(nibble-select XOR, VCO→pixel-clock resync).
+
 | Item | State |
 |---|---|
 | `tools/gen_tables.py` | done — X-scale + palette tables, self-checks, MAME golden diff |
