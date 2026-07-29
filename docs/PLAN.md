@@ -35,13 +35,91 @@ replicate directly as boolean logic instead of a table lookup — so it's
 downloaded as part of the PROMS blob but intentionally unused; see
 `sprite_engine.v`'s header comment.
 
-**Background/starfield is still missing on purpose** — Buck Rogers'
+**Background/starfield was missing on purpose through phase 1b** — Buck Rogers'
 `bitmap_ram` "star" layer and `bgcolorrom` lookup (the last two branches of
 `mixer_buckrog.v`'s priority chain) are driven by the **sub CPU**
-(`bitmap_w`), which isn't implemented yet. That's phase 1c scope (sub CPU +
-bitmap + bgcolor + full priority chain), not phase 1b. The current mixer's
-fallback branch (where star/bgcolor will go) just repacks the fg-tier-1
-color for now.
+(`bitmap_w`), which wasn't implemented yet at that point. That was phase 1c
+scope (sub CPU + bitmap + bgcolor + full priority chain). **Phase 1c is now
+done in simulation** — see below.
+
+**Phase 1c done in simulation** (sub CPU + bitmap/starfield + bgcolor + full
+mixer priority chain): `rtl/io/i8255.v` (generic mode-0 PPI, including BSR
+bit-set/reset mode) and `rtl/io/i8279.v` (minimal, DSW1-via-RL only) are new;
+`rtl/z80_3d.v` gained a second `cpu_z80` instance (the sub CPU, sharing the
+main CPU's `ce_z80`), the sub program ROM / mirrored work RAM / bitmap RAM
+(`bitmap_w`: `0000-dfff` write, `y=addr>>8`/`x=addr&0xff`), PPI0 (`c800-c803`)
+and PPI1 (`d000-d003`) wired for real (replacing the `8'hFF`/dropped-write
+stubs), i8279 (`d800-d801`), real IN0/IN1/DSW reads (`e800-e803`, wired from
+`Arcade-Z80-3D.sv`'s hps_io joystick/OSD machinery), a registered-read
+`bgcolorrom` BRAM off the shared road/bgcolor download slot, and the mixer's
+remaining two branches (star, bgcolor) plus the real fg-tier-2 gate. The
+main↔sub protocol is exactly the plan's three-step version (command register
+= PPI0 port A, `/INT` = PPI0 port C bit 7 directly, ACK = a dedicated flag
+overriding port C bit 6's readback) — MAME's `delayed_i8255_w`/600 Hz-quantum
+scheduling was **not** reproduced, per the plan (no hardware analogue).
+Verified in `sim/`: `tb_z80_3d.cpp` now drives real IN0/IN1 and pulses
+coin-in then start1; the core boots, coins up, and reaches actual gameplay
+(HUD "TIME LEFT"/"UFO COUNT" bars, an enemy ship, the road scrolling) with a
+correct-looking gradient sky, scattered starfield, and road/tunnel dressing —
+confirmed by direct comparison against real headless-MAME reference frames
+(`tools/mame/dump_frames.lua`, `mame.exe buckrogn -video none`, coin/start
+pulsed via the Lua ioport API). Not yet synthesized-and-fitted end-to-end on
+real hardware; a synthesis-only Quartus pass (`quartus_map`) succeeds clean,
+0 errors, 1372 RAM segments inferred (up from 939 in phase 1b, consistent
+with the two new PPIs/i8279/sub-CPU memories/bgcolor ROM).
+
+Three real bugs found and fixed during phase 1c bring-up, all instructive
+about the "trust the hardware, not MAME's C++ shortcuts" principle above:
+
+1. **i8255 reset state.** A real 8255 powers up with its control word at
+   0x9B (all ports in **input mode**) — nothing drives the output pins until
+   firmware configures and writes them, so a physical net left undriven
+   sits at its pulled-up idle level. The first RTL draft reset the internal
+   port-C output latch to `0x00`, and since `sub_int_n` taps that latch
+   directly (`= ppi0_pc[7]`), this asserted the sub CPU's `/INT` from the
+   instant of reset, before the main CPU ever touched PPI0. The sub CPU
+   spun forever re-servicing a phantom interrupt and never ran its real
+   program — no bitmap writes, no sprite RAM content past the initial
+   POST-clear pass. Fixed by resetting the output latches to `0xFF` (idle
+   high, this project's standard idle-bus convention) instead of `0x00`.
+2. **8255 BSR mode not implemented.** Also found (and fixed) while chasing
+   bug 1: the first `i8255.v` draft only implemented the mode-set control
+   word and silently ignored BSR (bit set/reset) writes, control-register
+   writes with D7=0 that toggle a single port-C output bit — the standard
+   real-8255 idiom for a single control line like `/INT`, and (per the
+   trace evidence) what this ROM's firmware actually uses. Implemented:
+   `pc[din[3:1]] <= din[0]` on a BSR write.
+3. **Palette-address truncation + bgcolor-ROM download aliasing**, found
+   by directly comparing rendered frames against real headless-MAME output
+   (`tools/mame/dump_frames.lua`) after bug 1/2 fixed sprites/stars but the
+   sky was still a flat, wrong-hued fill instead of MAME's dark-to-light
+   gradient:
+   - `repack_bg()`'s shifts genuinely overflow 8 bits in MAME's C++ (`int
+     palbits`) — Buck Rogers' palette is 1024 entries (10-bit index), and
+     the bgcolor branch's overflow is *how* it reaches the upper 3/4 of the
+     palette (the other three branches all happen to stay under 256). The
+     RTL had `palbits` truncated to 8 bits with the palette address's top 2
+     bits forced to `00`, silently routing every bgcolor pixel to the wrong
+     bank. Fixed by widening `palbits`/`repack_bg` to 10 bits end to end.
+   - Separately, `bgcolorrom` (8192 entries) was fed `road_wraddr[12:0]`
+     with no range gate, but `road_wraddr` spans the *full* 32KB shared
+     road/bgcolor download slot — Buck Rogers' real bgcolor ROM only fills
+     the first 8KB of it, the rest is `0xFF` filler
+     (`sim/build_rom.py`'s blob-fill default, standing in for "no ROM chip
+     here" on real hardware). Truncating to 13 bits aliased those filler
+     writes back onto the same 8192 entries, and since they arrive *later*
+     in the sequential download stream, they silently overwrote every real
+     byte with `0xFF`. Fixed by gating the write on `road_wraddr < 0x2000`,
+     the same range-gated-forwarding idiom already used for
+     `xshift_we`/`proms_is_colortab` elsewhere in this file.
+
+Known open item carried forward: star density in sim looks visibly sparser
+than the real-hardware/MAME reference in the frames compared so far — not
+yet root-caused (could be legitimate game-state pacing in the specific
+coin/start timing `tb_z80_3d.cpp` uses, or a remaining bug in how often the
+sub CPU redraws/refreshes the bitmap). Worth another look with a longer or
+differently-timed sim run and a matched MAME frame before calling phase 1c
+bit-exact.
 
 | Item | State |
 |---|---|
@@ -50,6 +128,7 @@ color for now.
 | `roms/palette_{turbo,buckrog}.hex` | generated; **bit-exact vs MAME**, all 1280 entries |
 | `tools/render_sheets.py` | done — renders schematic PDF pages to PNG |
 | `tools/mame/dump_palette.lua` | done — headless palette dump for the golden diff |
+| `tools/mame/dump_frames.lua` | done (phase 1c) — headless MAME PNG snapshots with scripted coin/start, used for the phase 1c visual comparison above |
 | `docs/hardware-audio.md` | done — full sound board trace |
 | `docs/reference/Buck_theory.txt` | added — official theory-of-operation text; confirms the 8-level/EPROM-board sprite architecture, no new pinout-level detail |
 | `docs/schematics/` | sound sheets 1-3 + assembly drawing rendered at 400 dpi |
@@ -60,8 +139,10 @@ color for now.
 | `rtl/cpu_z80.v` | done — wraps T80 (synthesis) / TV80 (Verilator sim) behind one interface |
 | `rtl/rom_download.v`, `rtl/video/video_timing.v`, `rtl/video/fg_tilemap.v`, `rtl/z80_3d.v` | done — phase 1a scope (see below) |
 | `rtl/video/sprite_engine.v` | done in sim (phase 1b) — see above; not synthesized yet |
-| `sim/` Verilator harness | done — see "Sim harness" below; now also builds `rtl/video/sprite_engine.v` |
-| Phase 1c (sub CPU/bitmap/full mixer), 1d (decryption), phase 3 (Turbo) | not started |
+| `rtl/io/i8255.v`, `rtl/io/i8279.v` | done (phase 1c) — see above |
+| `sim/` Verilator harness | done — see "Sim harness" below; now also builds `rtl/video/sprite_engine.v`, `rtl/io/i8255.v`, `rtl/io/i8279.v`, and drives real IN0/IN1/DSW + coin/start stimulus |
+| Phase 1c (sub CPU/bitmap/full mixer) | done in sim, not synthesized end-to-end on real hardware (see above) |
+| Phase 1d (`315-5014` decryption), phase 3 (Turbo) | not started |
 
 **Phase 1a scope, what's real vs. stubbed:**
 
@@ -231,12 +312,28 @@ to leave in, off by default.
   red/green have 3, and MAME's autoscale uses one global factor from the largest net.
   Confirmed correct against MAME. Do not "fix" this.
 
-**Next step:** phase 1c (sub CPU + bitmap/starfield + bgcolor + full mixer
-priority chain), the TV80 cen/clocking fix, and the first real MAME
-frame-diff (needed to confirm the phase 1b sprite engine bit-exact, not just
-visually plausible) — then a Quartus synthesis-only pass on the sprite
-engine to check the 8 sprite-ROM banks infer as separate M10K blocks before
-committing to a full compile.
+**Next step:** phase 1c is done in sim (see above) but not yet hardware-
+hardened or fully bit-exact. Before starting phase 1d, in rough priority
+order:
+
+1. Chase the star-density open item noted above against a matched MAME
+   frame (same coin/start timing) — small chance it's another aliasing-
+   style bug like the two found during phase 1c bring-up, rather than pacing.
+2. The TV80 cen/clocking fix (still open from phase 1b, see "Known
+   simplification" above) — needed before any bit-exact frame-diff is
+   meaningful, since sim currently runs the CPU ~8x too fast relative to
+   video.
+3. Build real frame-diff tooling (`sim/*.ppm` vs. `mame buckrogn -snapshot`,
+   pixel-diffed, not eyeballed) and get the sprite engine (phase 1b) and
+   full mixer (phase 1c) to bit-exact, not just visually-plausible-and-
+   matching-MAME-by-eye.
+4. Hardware-harden phase 1c the same way phase 1a was: a Quartus
+   synthesis-only pass already succeeds clean (1372 RAM segments, 0
+   errors — see above), but a full fit + TimeQuest + DE10-Nano retest
+   hasn't happened yet, and the two real bugs found by comparing against
+   MAME in sim (see above) are a strong reminder that "synthesizes clean"
+   and "correct" are different claims.
+5. Only then phase 1d (`315-5014` decryption).
 
 ## Context
 
@@ -246,6 +343,28 @@ sources `turbo.cpp` / `turbo_v.cpp` / `turbo_a.cpp` / `turbo.h` / `resnet.h`, pl
 Z80-3D board family — **Turbo** (1981), **Subroc-3D** (1982) and **Buck Rogers: Planet
 of Zoom / Zoom 909** (1982). The goal is one FPGA core targeting the DE10-Nano, built
 in stages around the single video/sprite architecture all these boards share.
+
+**Reference-source priority**: this core's goal is to be a faithful reimplementation of
+the *real hardware*, not a port of MAME. When a question arises about how something
+actually behaves — chip reset states, interrupt polarity, timing, bus contention, address
+decode — **the schematics and the theory-of-operation manual
+(`docs/reference/Buck_Schematics.pdf`, `docs/reference/Buck_theory.txt`, and the Turbo
+equivalents) are the primary reference, not MAME's driver source.** MAME's C++ is a
+software *behavioral* model built to reproduce the *outward result*, and it routinely
+takes shortcuts that are invisible from the outside but wrong as a hardware description —
+e.g. it initializes its i8255 model's output-latch state directly rather than modeling
+the chip's real power-on reset (control word 0x9B, all ports default to input/undriven
+until firmware configures them), which caused a real bug here: an RTL i8255 that reset
+its port-C latch to 0x00 instead of "undriven/idle-high" asserted the sub-CPU's `/INT`
+line from the instant of reset, before the main CPU ever touched the chip, and the sub
+CPU spun forever re-servicing a phantom interrupt instead of running its real program
+(see "Phase 1c" below). Use `docs/reference/turbo.cpp`/`turbo_v.cpp`/`turbo_a.cpp` for
+memory maps, bit-for-bit formulas, and PROM semantics (they're accurate and save a lot of
+schematic-tracing time for that kind of detail) — but treat MAME as **a check against
+behavior**, confirming the RTL produces the right outward result, not as the source of
+truth for *why* or *how* real hardware gets there. When the two disagree on a matter of
+hardware truth (chip reset behavior, signal polarity, timing margins), trust the
+schematic/datasheet.
 
 Decisions already made:
 

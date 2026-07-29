@@ -60,6 +60,19 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"-;",
+	"P1,Dip Switches;",
+	"P1O[27:25],Coin A,1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C;",
+	"P1O[30:28],Coin B,1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C;",
+	"P1O[31],DSW1 SW1:7 (Unknown),On,Off;",
+	"P1O[32],DSW1 SW1:8 (Unknown),On,Off;",
+	"P1O[33],Collisions,On,Off (Cheat);",
+	"P1O[34],Accel By,Pedal,Button;",
+	"P1O[35],Best 5 Scores,On,Off;",
+	"P1O[36],Score Display,Off,On;",
+	"P1O[37],Difficulty,Hard,Normal;",
+	"P1O[39:38],Lives,3,4,5,6;",
+	"P1O[40],Cabinet,Cockpit,Upright;",
+	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
 	"v,0;", // [optional] config version 0-99.
@@ -72,6 +85,8 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
+
+wire [31:0] joystick_0, joystick_1;
 
 wire        ioctl_download;
 wire        ioctl_wr;
@@ -87,6 +102,9 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 	.forced_scandoubler(forced_scandoubler),
 
+	.joystick_0(joystick_0),
+	.joystick_1(joystick_1),
+
 	.ioctl_download(ioctl_download),
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
@@ -98,6 +116,20 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 	.ps2_key(ps2_key)
 );
+
+// IN0/IN1/DSW1/DSW2 -- docs/PLAN.md phase 1 CPU/memory table, buckrog
+// INPUT_PORTS_START in docs/reference/turbo.cpp. Joystick bit convention:
+// [0]=Right [1]=Left [2]=Down [3]=Up [4]=Fire1 [5]=Fire2 [6]=Fire3
+// [8]=Start1 [9]=Start2 [10]=Coin1 [11]=Coin2 [12]=Service1 (the
+// start/coin/service extension bits used by other MiSTer arcade cores in
+// this style, e.g. the Donkey Kong core T80 was vendored from). All
+// active-low (idle = 1), matching MAME's ACTIVE_LOW convention -- pedal
+// (accel-by-pedal DSW mode) is not wired yet, only the button-accel bits.
+wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5], ~joystick_1[8], 3'b111};
+wire [7:0] in1 = {~joystick_0[10], ~joystick_0[11], ~joystick_0[12], 1'b1, ~joystick_0[8], ~joystick_0[4], ~joystick_0[1], ~joystick_0[0]};
+
+wire [7:0] dsw1 = {status[32], status[31], status[30:28], status[27:25]};
+wire [7:0] dsw2 = {status[40], status[39:38], status[37], status[36], status[35], status[34], status[33]};
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
@@ -142,6 +174,11 @@ z80_3d z80_3d
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
+
+	.in0(in0),
+	.in1(in1),
+	.dsw1(dsw1),
+	.dsw2(dsw2),
 
 	.hblank(HBlank),
 	.vblank(VBlank),

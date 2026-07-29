@@ -1,9 +1,15 @@
-// Verilator testbench for rtl/z80_3d.v (phase 1a).
+// Verilator testbench for rtl/z80_3d.v (phase 1a/1b/1c).
 //
 // Loads a flat ROM blob (built by sim/build_rom.py, same layout rom_download.v
 // expects) via the ioctl_download port, free-runs the core, and dumps one PPM
 // per frame for the 512x224 active area -- for diffing against
 // `mame buckrogn -snapshot` (see docs/PLAN.md "Verilator frame diff").
+//
+// Phase 1c: drives IN0/IN1/DSW1/DSW2 directly (z80_3d.v's top-level ports,
+// not through the HPS/OSD machinery Arcade-Z80-3D.sv uses on real hardware)
+// and pulses coin-in then start1 partway through the run, to exercise the
+// sub CPU/bitmap/mixer path far enough to reach actual gameplay instead of
+// just the attract loop.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,9 +38,11 @@ int main(int argc, char **argv)
 
     std::string rom_path = "sim/buckrogn.rom";
     std::string out_prefix = "sim/out/frame";
-    // 60 frames gives the CPU enough simulated time to run past its init/POST
-    // sequence and draw the attract screen (see docs/PLAN.md phase 1a notes).
-    int frames = 60;
+    // 180 frames gives the CPU enough simulated time to run past its
+    // init/POST sequence, draw the attract screen, respond to a coin-in +
+    // start1 pulse (see below), and get partway into actual gameplay
+    // (see docs/PLAN.md phase 1c notes).
+    int frames = 180;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -54,12 +62,17 @@ int main(int argc, char **argv)
 
     Vz80_3d *top = new Vz80_3d;
 
-    // Reset
+    // Reset. IN0/IN1 idle-high (active low, no buttons pressed); DSW1 = 0
+    // (default coinage), DSW2 = 0x80 (Upright, MAME's real default).
     top->reset = 1;
     top->ioctl_download = 0;
     top->ioctl_wr = 0;
     top->ioctl_addr = 0;
     top->ioctl_dout = 0;
+    top->in0 = 0xFF;
+    top->in1 = 0xFF;
+    top->dsw1 = 0x00;
+    top->dsw2 = 0x80;
     for (int i = 0; i < 32; i++) tick(top);
 
     // Load ROM blob
@@ -81,6 +94,16 @@ int main(int argc, char **argv)
     long max_ticks = (long)HTOTAL * VTOTAL * 4 * (frames + 1) * 2; // safety cap
 
     while (frame < frames && tick_count < max_ticks) {
+        // Coin1 (IN1 bit 7) pulsed frames 30-39; Start1 (IN1 bit 3) pulsed
+        // frames 60-69 -- enough separation for the main CPU's coin/credit
+        // handling and the sub-CPU handshake to settle between the two.
+        bool coin_active  = (frame >= 30 && frame < 40);
+        bool start_active = (frame >= 60 && frame < 70);
+        unsigned char in1v = 0xFF;
+        if (coin_active)  in1v &= ~(1 << 7);
+        if (start_active) in1v &= ~(1 << 3);
+        top->in1 = in1v;
+
         tick(top);
         tick_count++;
         if (top->ce_pix) {

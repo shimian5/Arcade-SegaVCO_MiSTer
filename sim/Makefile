@@ -20,6 +20,8 @@ SOURCES = \
 	$(RTL_DIR)/video/video_timing.v \
 	$(RTL_DIR)/video/fg_tilemap.v \
 	$(RTL_DIR)/video/sprite_engine.v \
+	$(RTL_DIR)/io/i8255.v \
+	$(RTL_DIR)/io/i8279.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80s.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_core.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_alu.v \
@@ -38,7 +40,7 @@ obj_dir/V$(TOP): $(SOURCES) tb_z80_3d.cpp
 # repo root, so the built binary must be run with cwd = repo root, not sim/.
 run: obj_dir/V$(TOP) buckrogn.rom
 	mkdir -p out
-	cd .. && sim/obj_dir/V$(TOP) --rom sim/buckrogn.rom --frames 60 --out sim/out/buckrogn_
+	cd .. && sim/obj_dir/V$(TOP) --rom sim/buckrogn.rom --frames 180 --out sim/out/buckrogn_
 
 buckrogn.rom:
 	python3 build_rom.py buckrogn buckrogn.rom /mnt/c/MiSTerDev/mame/roms
