@@ -374,10 +374,30 @@ for full detail. Headlines:
 | `rtl/tv80/` | done — hutch31/tv80 (pure Verilog Z80), vendored from `SuperOffRoad_MiSTer`, **simulation only** |
 | `rtl/cpu_z80.v` | done — wraps T80 (synthesis) / TV80 (Verilator sim) behind one interface |
 | `rtl/rom_download.v`, `rtl/video/video_timing.v`, `rtl/video/fg_tilemap.v`, `rtl/z80_3d.v` | done — phase 1a scope (see below) |
-| `rtl/video/sprite_engine.v` | done in sim (phase 1b) — see above; not synthesized yet |
+| `rtl/video/sprite_engine.v` | done in sim (phase 1b) — see above; **synthesizes clean** as of 2026-07-29 (see the build note below) |
 | `rtl/io/i8255.v`, `rtl/io/i8279.v` | done (phase 1c) — see above |
 | `sim/` Verilator harness | done — see "Sim harness" below; now also builds `rtl/video/sprite_engine.v`, `rtl/io/i8255.v`, `rtl/io/i8279.v`, and drives real IN0/IN1/DSW + coin/start stimulus |
-| Phase 1c (sub CPU/bitmap/full mixer) | done in sim, not synthesized end-to-end on real hardware (see above) |
+| Phase 1c (sub CPU/bitmap/full mixer) | done in sim; **now also synthesizes end-to-end** (2026-07-29, see below) — still never run on a real device |
+
+**First full Quartus compile — passed (2026-07-29, commit `0d4224b`).** Quartus 17.0.2
+Lite, 5CSEBA6U23I7. Analysis & Synthesis 0 errors / 30 warnings, Fitter 0 errors / 4,
+Assembler 0 errors, TimeQuest 0 errors; `Arcade-Z80-3D.rbf` produced. **Timing closed**:
+worst-case setup slack **+0.547 ns**, hold +0.192, recovery +3.229, removal +0.842,
+min-pulse-width +0.569 — no negative-slack paths. Resources: 17,426 / 41,910 ALMs (42%),
+21,892 registers, 398 / 553 M10K (72% — see the BRAM note under "Memory placement", there
+is ~22% of the device to reclaim), 33 / 112 DSP, 145 / 314 pins. No inferred latches and
+no multi-driver nets. The 30 synthesis warnings are benign classes (unread `coin_meter*`/
+`start_lamp` outputs, `no driver` on unused ROM write ports, two truncations checked by
+hand: `z80_3d.v`'s `xx_native = hpos[9:1]` is 9 bits into 8 — harmless for visible pixels
+but it *wraps during HBLANK*; `sprite_engine.v`'s `~(... & 1'b1)` into a 1-bit wire is
+correct because bit 0 of the inverted byte is the wanted value).
+
+Caveats, so this is not over-read: it built **T80**, not the TV80 that every sim result in
+this document comes from, so it exercises a CPU path none of the simulation work touches;
+and synthesis passing says nothing about whether the core *works* on hardware — the two
+fixes for the earlier real-hardware failure (the MRA ROM-download gap in `60bc3b8`, and
+un-gating reset from `pll_locked` in `a216bc1`) remain unvalidated on a device.
+
 | Phase 1d (`315-5014` decryption), phase 3 (Turbo) | not started |
 
 **Phase 1a scope, what's real vs. stubbed:**
@@ -677,6 +697,42 @@ BRAMs running in parallel, one access each per pixel — no arbitration, no SDRA
 | work/video/sprite RAM | ~6 KB | |
 
 Total ≈ 320 KB against ~696 KB of M10K on the 5CSEBA6 — comfortable.
+
+**Measured against a real build (2026-07-29) this estimate was too optimistic — and
+there is ~22% of the device to reclaim. Deferred, not urgent: the core fits and closes
+timing today.** First full Quartus compile (commit `0d4224b`, Quartus 17.0.2 Lite,
+5CSEBA6U23I7) came out at **398 / 553 M10K = 72%**, not the ~46% the line above implies.
+Two separate reasons:
+
+1. **An M10K yields only 8192 usable bits in ×8 mode, not 10240.** The block's legal
+   configs are 1024×8 / 512×16 / 256×32 / 8192×1 etc.; in byte-wide mode the extra 2
+   bits per word are parity and unreachable. So the "~696 KB" figure (553 × 10240 bits)
+   is only achievable by non-byte-wide memories. For byte-wide ROM the honest ceiling is
+   **553 KB**, and the useful rule of thumb is **1 M10K ≈ 1 KB**. A 32768×8 bank costs
+   **32** blocks, not the 26 that 262144/10240 suggests.
+2. **We allocate 256 KB of sprite ROM but Buck Rogers only has ~136 KB of sprite data.**
+   `ROM_ADDR_BITS = 15` gives every level a uniform 32 KB bank, while the real per-level
+   populations are uneven (from `tools/gen_mra.py`'s `"sprites"` list): levels 0-1 are
+   8 KB, levels 2-4 are 16 KB, levels 5-7 are 24 KB (a 16 KB + 8 KB pair). So roughly
+   **120 M10K — 22% of the whole device — currently holds nothing but MRA gap-fill.**
+   Right-sizing per level would take the core from ~72% to ~50%.
+
+Where the 398 blocks actually go: `emu` (our core) **341**, of which the 8 sprite ROM
+banks alone are **256**; the entire MiSTer framework is only **57** (`ascal` scaler 43,
+the two OSDs 8, shadowmask 4, `vga_out` 2). The 8 physically separate banks are *not*
+waste — the engine does one fetch per level per output pixel, so 8 concurrent read ports
+are genuinely required, and each bank holds different data. It is only the uniform depth
+that is wrong.
+
+**Accuracy constraint on any such optimisation:** the banks today return `0xFF` above
+each level's real data, because `region_blob()` gap-fills to the 32 KB stride. That
+matches the hardware — each level sheet takes two 27128s and the unpopulated sockets
+float high — so a right-sized memory must **return `0xFF` outside the populated range,
+not alias back into valid data**. The sprite offset counter is 16-bit and can run past
+the end of a level's real ROM, so this is a live path, not a theoretical one.
+
+Worth doing before phase 3: Turbo/Subroc-3D add their own banks, and 72% is where that
+becomes a wall rather than a note.
 
 ### The sprite engine (`rtl/video/sprite_engine.v`) — the critical module
 
