@@ -534,3 +534,364 @@ contradiction (7.5) must be reconciled, before recommending any code change. Bot
 are precisely scoped, low-effort next steps (see NEXT STEP notes in 7.4 and 7.5)
 that a future session should tackle first, before spending time on Task B's
 remaining items (8.2), since Task A is the top priority per the task brief.
+
+---
+
+# SESSION 3
+
+Scratchpad for this session's crops (outside the repo):
+`C:\Users\matt\AppData\Local\Temp\s3\<letter>\buck_p37_crop.png` (or `_p38_`), one
+sub-directory per crop, each listed with its exact command below.
+
+**Tooling note (new, important):** `--scale 2000` silently produces an
+**all-white image** on this machine (the full-page render at that DPI is ~750 Mpx
+and pdfium appears to bail). `--scale 1600` and below are fine. If a crop comes
+back blank, that is the cause, not an empty region of the sheet.
+
+**Reading convention established this session (high confidence, and it corrects a
+session-2 mis-attribution):** on these Gremlin/Sega sheets a net name is written
+**above** the wire it names, with the sheet cross-reference written **below** that
+same wire (`CLK 0` / line / `SHT. I`). Applying this consistently is what unlocked
+Task A. A downward-pointing solid triangle is **GND** (verified against ROM0 pin 22
+`/OE` in crop C).
+
+---
+
+## HEADLINE ANSWERS
+
+### Task A — the nibble-order-vs-direction hypothesis is **REFUTED**. Confidence: high.
+
+The XOR is real, its second input is now identified, and the resulting circuit is
+**functionally identical to MAME's `>> ((~offs & 1) * 4)` with a signed
+increment/decrement of `offs`**. MAME and our RTL are correct on this point. No RTL
+change is indicated. Details in section 9.
+
+The complete, now fully-traced nibble path is:
+
+```
+IC103 (74LS157) S (pin 1)  =  IC23 (74LS86) pin 11
+IC23 pin 13                =  CW15   (counter MSB, also the shared U/D direction input)
+IC23 pin 12                =  CLK0   (the raw VCO output from sheet 1)   <-- NEW, was 7.4
+=>  S = CW15 XOR CLK0
+```
+
+and the same `CLK0` net *also* clocks the ROM data latch IC102 (74LS273, pin 11)
+and the counter IC96 (pin 14). So within **one VCO period** the hardware emits
+**two** pixels: the byte latched on the rising edge is presented high-nibble-first
+while `CLK0` is high and low-nibble-second while `CLK0` is low — and the XOR with
+`CW15` swaps that order when the counter is counting **down** (mirrored sprite).
+That is exactly what MAME's shared `offs` bit 0 does when `offs` decrements.
+
+### Task A 7.5 contradiction — **RESOLVED**, and it was never a contradiction. Confidence: high.
+
+`CW0 -> ROM A0` is correct (re-verified with a fresh tight crop, 9.2). The
+resolution is that **the hardware counter has no nibble bit at all**: the 16-bit
+LS191 chain is `CW0-CW13 -> ROM A0-A13`, `CW14 -> ROM bank select`, `CW15 ->
+direction`. MAME's `offs` is 17 bits, and the mapping is
+
+| MAME `offs` bit | hardware |
+|---|---|
+| 0 (nibble select) | **not a counter bit** — it is the `CLK0` phase, XOR'd with `CW15` |
+| 1-14 | `CW0`-`CW13` -> ROM `A0`-`A13` |
+| 15 | `CW14` -> ROM0/ROM1 `/CE` select (ROM1 via IC22 LS86 used as an inverter) |
+| 16 | `CW15` -> shared `U/D` of all four LS191s, and one XOR input |
+
+This is corroborated inside MAME itself: `m_sprite_info.offset[level] = offset << 1`
+(turbo_v.cpp:852) — the CPU-board ALU result is pre-shifted by one, i.e. the ALU
+value is what is loaded into the hardware's `AL0-AL15 -> CW0-CW15`, and MAME
+synthesises the extra bit 0 below it. And `frac >= 0x800000` against a `step` scaled
+to `2^24` per `5MHz*X_SCALE` pixel means MAME advances **2 nibbles per VCO period**,
+matching the two-pixels-per-VCO-period hardware exactly. (Turbo uses `0x1000000`,
+i.e. one nibble per VCO period — different hardware, so the constant is not a typo.)
+
+### Task B — the LS109 network is now fully decoded. Confidence: high on the wiring.
+
+Session 2's reading of IC35 was partly wrong because of the label-placement
+convention: **`/END` labels pin 13 (`/K`), not pin 12 (`CLK`).** The corrected
+network (section 10) is an exact structural match for MAME's `lst` per-level enable
+flip-flop, and it also shows that **`CWEN0 ... SHT.1` is an OUTPUT of the level
+sheet back to sheet 1** (the VCO's enable), not an input as previously assumed.
+
+---
+
+## 9. Task A — completed
+
+### 9.1 IC23 pin 12 = `CLK0` (the VCO output). Confidence: **high**. Closes 7.4.
+
+Rendered at 1500 DPI, the junction is unambiguous — a large solid dot, not a
+crossing:
+
+```
+python tools/render_sheets.py buck 37 --scale 1500 --crop 0.50,0.40,0.62,0.68    # crop D
+python tools/render_sheets.py buck 37 --scale 1500 --crop 0.505,0.47,0.60,0.57   # crop G  <-- clearest
+```
+
+Crop G shows, at page (x~0.5264, y~0.549), a filled junction dot where three
+segments meet: the horizontal running right into **IC102 pin 11 (`CLK`)**, a
+vertical going **up**, and a vertical going **down** which continues to **IC23 pin
+12** (visible in crop D). So IC102's latch clock and IC23's second XOR input are the
+same net.
+
+Following the upward branch (crop H,
+`--scale 1100 --crop 0.52,0.14,0.60,0.54`) it runs up at page x~0.584 to page
+y~0.236, where it joins a horizontal net. Crop K
+(`--scale 1500 --crop 0.135,0.222,0.32,0.272`) reads that net's label directly and
+resolves it beyond doubt: the horizontal at page y~0.2367 is labelled **`CLK 0`**
+above / **`SHT. I`** below, and the taps in that x-range are:
+
+| page x | direction | destination |
+|---|---|---|
+| 0.2141 | down | *(this dot is on the `CWEN0` line below, -> IC96 pin 4 `/G`)* |
+| 0.2367 | down | **IC96 pin 14** (`CLK` of the LSB LS191) |
+| 0.2936 | up | **IC35 pin 12** (`CLK` of the second LS109) |
+| 0.584 (crop H) | — | **IC102 pin 11** + **IC23 pin 12** |
+
+- So `CLK0` fans out to: counter clock, LS273 latch clock, LS109 clock, XOR input.
+- Confidence **high**: the label, the dots, and the pin numbers were each read at
+  1100-1500 DPI, and every 74LS157/74LS191/74LS109/74LS86 pin number on these sheets
+  matches the real device pinouts (checked), so the drawing is pin-accurate.
+
+### 9.2 ROM address-pin labels re-verified. Confidence: **high**. Closes 7.5.
+
+```
+python tools/render_sheets.py buck 37 --scale 1600 --crop 0.30,0.27,0.42,0.47     # crop C
+```
+
+ROM0 (IC100, 27128-3, tACC <= 400 ns) reads, unambiguously:
+`CW0->A0, CW1->A1, CW2->A2, CW3->A3, CW4->A4, CW5->A5, CW6->A6, CW7->A7,
+CW8->A8(pin25), CW9->A9(24), CW10->A10(21), CW11->A11(23), CW12->A12(2),
+CW13->A13(26), CW14->/CE(20), /OE(22)->GND`. Session 1's overview transcription was
+correct.
+
+IC96 (crop A, `--scale 1600 --crop 0.19,0.20,0.30,0.40`): `QA(3)=CW0, QB(2)=CW1,
+QC(6)=CW2, QD(7)=CW3`, `pin 14 = CLK <- CLK0`, `pin 4 = /G <- CWEN0`,
+`pin 11 = /LO <- ADL0`, `pin 5 = U/D <- CW15`. So `CW0` genuinely is the counter LSB
+and genuinely is ROM `A0`. See the headline section for why this is consistent.
+
+### 9.3 The resulting boolean, and why MAME is right
+
+74LS157: `S=L` selects the **A** group. IC102 -> IC103 wiring (re-confirmed from
+crop D + crop O pin numbers): `1Q-4Q` = `PD0-PD3` = ROM byte **low** nibble ->
+`1A-4A`; `5Q-8Q` = `PD4-PD7` = **high** nibble -> `1B-4B`. 74LS191 `U/D` (pin 5):
+`L` = count up, `H` = count down.
+
+Counting **up** (`CW15=0`):
+- `CLK0` rising edge: IC102 latches the ROM byte; IC96 advances the byte address.
+- `CLK0` high -> `S = 0 XOR 1 = 1` -> B group -> **high** nibble.
+- `CLK0` low  -> `S = 0 XOR 0 = 0` -> A group -> **low** nibble.
+
+Counting **down** (`CW15=1`): high phase -> `S=0` -> **low** nibble; low phase ->
+`S=1` -> **high** nibble. Order reversed.
+
+MAME, with `offs` pre-shifted so bit 0 starts at 0 and stepping +/-1:
+- incrementing: `offs` even -> `~offs&1 = 1` -> shift 4 -> **high** nibble, then odd
+  -> **low** nibble. Same order as hardware counting up. MATCH.
+- decrementing: the odd `offs` is visited first -> **low** nibble, then even ->
+  **high**. Same order as hardware counting down. MATCH.
+
+**The XOR is how the hardware synthesises MAME's bit 0 out of a clock phase plus a
+direction bit. There is no divergence.** Our RTL
+(`rtl/video/sprite_engine.v:467`, `nibble_sel_pending[lvl] <= ~offset_reg[lvl][0]`
+with a signed offset step and `OFFSET_PRESHIFT=1`, `XSCALE_THRESHOLD=0x800000`)
+reproduces the same behaviour. **No RTL change recommended.**
+
+- Confidence: **high** on the wiring and on the equivalence argument.
+- Residual, **low-importance / unresolved**: the ROM has tACC <= 400 ns while IC102
+  latches on the same `CLK0` edge that advances the counter, so the byte actually
+  captured is the one for an *earlier* address — a fixed pipeline delay of one (or,
+  at high VCO frequencies, possibly two) bytes relative to MAME. That is a constant
+  offset indistinguishable from a different load address, so it is very unlikely to
+  be visible; it is *not* a direction-dependent effect. Noted, not chased.
+
+### 9.4 Cross-check on level 1 (PDF p.38) — pattern repeats. Confidence: **high**. Closes 7.6.
+
+```
+python tools/render_sheets.py buck 38 --scale 500                                # crop N (overview)
+python tools/render_sheets.py buck 38 --scale 1400 --crop 0.50,0.50,0.61,0.67    # crop P
+```
+
+Level 1 is the same circuit with different designators: **IC34** (LS109 x2),
+**IC80-IC83** (LS191 x4), **IC84/IC85** (ROM0/ROM1), **IC86** (LS273), **IC87**
+(LS157), **IC22** (LS86 bank inverter), **IC38** (LS25), **IC39** (LS20), and
+**IC23** again — the *same physical LS86 package* as level 0, using its **gate 3**
+(pins 9,10 -> 8) instead of gate 4. Crop P shows the identical topology: a junction
+dot on the `CLK1` horizontal feeding IC86 pin 11, with one branch up to IC34 pin 12
+and one branch down to **IC23 pin 9**, while **IC23 pin 10 = `CW15`**, output pin 8
+-> IC87 `S`. Signals are per-level: `HP1` on CN3-9 (vs `HP0` on CN3-7), `BLANK` on
+CN2-3 (vs CN2-1), `CLK1`/`CWEN1`/`ADL1` to/from sheet 1.
+
+- Confidence **high** that the wiring pattern is per-level identical. (Levels 2-7,
+  PDF p.39-44, were not opened; given two identical instances and a
+  one-sheet-per-level drawing style, extrapolation is safe.)
+
+---
+
+## 10. Task B — LS109 gating network fully decoded (supersedes section 5 and 8.2)
+
+```
+python tools/render_sheets.py buck 37 --scale 1600 --crop 0.22,0.09,0.42,0.24     # crop B
+python tools/render_sheets.py buck 37 --scale 1100 --crop 0.13,0.145,0.61,0.27    # crop I  (wide: all control nets + labels)
+python tools/render_sheets.py buck 37 --scale 1500 --crop 0.255,0.145,0.36,0.275  # crop J  (IC35 lower wiring)
+python tools/render_sheets.py buck 37 --scale 1500 --crop 0.31,0.195,0.41,0.285   # crop L  (pin 9 routing: crossings vs. dots)
+python tools/render_sheets.py buck 37 --scale 1000 --crop 0.595,0.145,0.68,0.56   # crop M  (CWEN to IC102 /CL)
+python tools/render_sheets.py buck 37 --scale 700  --crop 0.62,0.20,0.80,0.73     # crop O  (/END back to IC35, IC38/IC39)
+```
+
+### 10.1 Complete IC35 (74LS109 x2) netlist. Confidence: **high**.
+
+Pin numbers below are the real 74LS109 pinout, which matches the drawing exactly
+(1=1/CL, 2=1J, 3=1/K, 4=1CLK, 5=1/PR, 6=1Q, 9=2/Q, 10=2Q, 11=2/PR, 12=2CLK,
+13=2/K, 14=2J, 15=2/CL).
+
+**FF1 (first LS109):**
+
+| pin | signal |
+|---|---|
+| 1 `/CL` | VCC (never cleared) |
+| 2 `J` | `HP0` (CN3-7) |
+| 3 `/K` | `HP0` — same net, junction dot on the `HP0` line |
+| 4 `CLK` | `5M` (CN2-1) |
+| 5 `/PR` | `BLANK` (junction dot on the `BLANK` line) |
+| 6 `Q` | -> FF2 pin 11 (`/PR`) |
+
+Tying `J` and `/K` together makes an LS109 into a **D flip-flop with `D = HP0`**
+(J=1,K=0 -> set; J=0,K=1 -> reset). So **FF1 = `HP0` resynchronised to `5M`**, with
+`BLANK` asynchronously forcing `Q=1`.
+
+**FF2 (second LS109):**
+
+| pin | signal |
+|---|---|
+| 11 `/PR` | FF1 `Q` (i.e. `HP0` resynced to `5M`) — asynchronous **set** |
+| 12 `CLK` | **`CLK0`** (the VCO output) — verified by the dot in crop K |
+| 13 `/K` | **`/END`** — traced in crop O all the way back to **IC39 pin 8** |
+| 14 `J` | **GND** (downward triangle) |
+| 15 `/CL` | `BLANK` — asynchronous **clear** |
+| 10 `Q` | `CWEN` -> **IC102 pin 1 (`/CL`)** (crop M: right, then up page x~0.633 to the `CWEN` row) |
+| 9 `/Q` | `/CWEN` -> **the `CWEN0 ... SHT.1` net** (crop L: corners onto it at page x~0.344, crossing two other horizontals with no dots), which taps **IC96 pin 4 (`/G`)** at page x~0.2141 and continues off to sheet 1 |
+
+### 10.2 What the network does, vs. MAME. Confidence: **high** on logic, **medium** on the meaning of `HP0`.
+
+With `J=0` and `/K = /END` (so `K = END`), FF2 is a **latch that can only ever be
+cleared by a clock edge**:
+
+- `HP0`(resynced) low -> `/PR` low -> **asynchronous set**, `CWEN=1`, `/CWEN=0`:
+  counter enabled (`/G=0`), VCO enabled, IC102 released. Sprite fetch starts.
+- On each `CLK0` rising edge: if `END` is asserted (`/END=0`, i.e. `pixdata==15`,
+  section 8.1) then `J=0,K=1` -> `Q<-0` -> `CWEN=0`: counter disabled, VCO disabled,
+  IC102 cleared -> `CDA-CDD = 0` (transparent). Otherwise `J=0,K=0` -> hold.
+- `BLANK` asserted -> FF2 asynchronously **cleared** -> everything off, output
+  transparent; simultaneously FF1 is preset so FF2 is not re-set during blanking.
+
+This is a **gate-for-gate match** to MAME's per-level `lst` bit: set when the level
+is live for the line, cleared the moment `plb_end[pixdata] & 2` (`pixdata==15`), and
+with `latched[level] = 0` (transparent) whenever the level is not live — the latter
+implemented in hardware by wiring `CWEN` to the LS273's `/CL`.
+
+- `HP0`/`HP1` are per-level (CN3-7, CN3-9, ...), i.e. one "this level is live /
+  start now" strobe per level from the CPU board — the hardware analogue of MAME's
+  `lst` bit being set in `prepare_sprites`. **Confidence medium**: the per-level
+  pin-out and the way it is used strongly imply this, but `HP` was not traced onto
+  the CPU-board sheets to confirm how it is generated.
+
+### 10.3 Task B Q1 — `CLK0` reaches IC96 pin 14 directly. Confidence: **high** (explicitly re-verified).
+
+Re-verified from scratch this session in crops A + I + K: the `CLK 0 / SHT. I`
+horizontal carries a junction dot at page x~0.2367 whose vertical drops straight
+into IC96 pin 14. **No LS109 or any other stage is in that path.** Session 1's claim
+stands. Note however the newly-found fact that the *same* net also clocks IC35 FF2 —
+so the sprite-termination flip-flop is synchronous to the VCO clock, not to `5M`.
+
+### 10.4 Task B Q2 — which clock clocks which flip-flop. Confidence: **high**.
+
+`5M` clocks **FF1 only** (it exists purely to resynchronise `HP0` to `5M`).
+`CLK0` (the VCO output) clocks **FF2**. Neither LS109 divides or resyncs the VCO
+clock on its way to the counter. There is no `HP0`-qualified "2x rate" edge anywhere
+in this network — that hypothesis is **refuted**.
+
+### 10.5 Task B Q3 — VCO phase reset. **Partially resolved; one question left, now precisely posed.** Confidence: **medium**.
+
+New hard fact (high confidence): the VCO is **not** free-running-and-ignored. Its
+enable is driven by this sheet: `/CWEN` = FF2 `/Q` goes to sheet 1 as `CWEN0`, i.e.
+to the LS626 section's active-low `EN` pin. The clock train is therefore switched
+off during `BLANK` and off after `END`, and switched on when `HP0` (resynced to
+`5M`) asserts. So the *train of edges* the counter sees definitely restarts once per
+level per line, at a `5M`-quantised instant.
+
+The remaining question is a **datasheet** question, not a schematic one: does the
+SN74LS626's `EN` input **stop the oscillator core** (in which case the phase truly
+restarts and MAME's per-scanline `frac = 0` is exactly right), or does it only
+**gate the output** of a still-running core (in which case the first period after
+enable is a random fraction and MAME's `frac = 0` is an approximation)? The
+schematic cannot answer this. **Unresolved.** Note this can only ever produce a
+sub-pixel phase error at the left edge of a sprite, never a nibble-order error.
+
+Also worth recording: because FF2's set is `5M`-synchronous and its clear is
+`CLK0`-synchronous, the *number* of nibbles fetched in a line is not forced to be
+even — a sprite source run can legitimately be an odd number of nibbles, so the
+"source pixel can never be an odd number of 2x sub-pixels" concern in the brief does
+**not** hold. Confidence **medium** (follows from the wiring, but not from an
+observed waveform).
+
+### 10.6 Does the hardware fetch during VBLANK? **No — `BLANK` hard-disables it.** Confidence: **high** on the wiring, **medium** on which blank.
+
+`BLANK` (CN2-1 on level 0, CN2-3 on level 1) asynchronously clears FF2 (pin 15),
+which simultaneously disables the counter (`/G`), disables the VCO (`EN`), and
+clears the pixel latch to `0`. So while `BLANK` is asserted no level fetches
+anything and every level outputs transparent.
+
+- **Unresolved:** whether this `BLANK` is composite blank (H+V) or only one of them.
+  It arrives on CN2 from the CPU board and was **not** traced there this session.
+  This matters for the separate latent RTL bug mentioned in the brief: if `BLANK` is
+  composite, then hardware truly does no sprite work during VBLANK.
+- **NEXT STEP**: trace `BLANK` on CN2 back to its generator on CPU board 834-5120,
+  PDF pages 29-34. Start with an overview of each
+  (`python tools/render_sheets.py buck 29-34 --scale 500`) and look for the `H`/`V`
+  counter chain and a gate producing `BLANK` onto CN2 pins 1/3.
+
+### 10.7 Bonus: IC38 / `/PLB0` now also matches MAME exactly. Confidence: **high**. Upgrades 8.1's "medium".
+
+Crop O shows **IC38 pin 11** — the 74LS25's **strobe** input for that gate — tied by
+a junction dot to the **`/END`** vertical at page (x~0.754, y~0.688). So
+`/PLB0 = NOT( /END AND (CDA+CDB+CDC+CDD) )`, i.e. active-high
+`PLB = (pixdata != 15) AND (pixdata != 0)`. That is **exactly** MAME's
+`plb_end[pixdata] & 1` for the table `{0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2}`.
+IC39/`/END` (8.1) and IC38/`PLB0` are now both confirmed to match MAME.
+
+---
+
+## Session 3 summary of confidence levels
+
+| # | Question | Answer | Confidence |
+|---|----------|--------|------------|
+| A 7.4 | What drives IC23 pin 12? | **`CLK0`, the raw VCO output** — same net as IC102's latch clock, IC96's counter clock and IC35 FF2's clock. Junction dot verified at 1500 DPI | **High** |
+| A 7.5 | `CW0->A0` vs. separate nibble logic | **No contradiction.** The LS191 chain = MAME `offs` bits 1-16; MAME's bit 0 is the `CLK0` phase, XOR'd with `CW15`. Corroborated by MAME's own `offset << 1` and `0x800000` threshold | **High** |
+| A 7.6 | Does the pattern repeat per level? | **Yes** — level 1 (p.38) is identical with IC34/IC80-87 and IC23's other gate | **High** |
+| A Q3 | Does nibble order depend on count direction? | **Yes it does — and MAME already models exactly that.** Hypothesis **REFUTED**; MAME and our RTL are correct | **High** |
+| A extra | ROM byte pipeline delay | Latch and counter share the `CLK0` edge, so the latched byte lags the counter by >=1 byte — a constant offset, not direction-dependent | Medium; low importance, not chased |
+| B Q1 | `CLK0` direct to IC96 pin 14? | **Yes, direct.** Explicitly re-verified. No LS109 in the path | **High** |
+| B Q2 | `5M` or `HP0`-qualified clock on each LS109? | `5M` clocks FF1 (resyncs `HP0`); **`CLK0` clocks FF2**. No 2x-rate/`HP0`-qualified edge exists | **High** |
+| B — | `/END` destination | IC39 pin 8 -> **IC35 FF2 pin 13 (`/K`)**. Session 2's "pin 12" attribution was a label-placement mis-read and is corrected | **High** |
+| B — | `CWEN0 ... SHT.1` direction | **Output** of the level sheet (FF2 `/Q`) -> IC96 `/G` **and** sheet 1's VCO `EN`. Not an input | **High** |
+| B — | `CWEN` (FF2 `Q`) destination | IC102 pin 1 `/CL` — clears the pixel latch to 0 (transparent) whenever the level is inactive. Matches MAME's `latched[level]=0` | **High** |
+| B Q3 | Does anything reset VCO phase? | The VCO's `EN` **is** switched per level per line by FF2, so the edge train restarts at a `5M`-quantised instant. Whether LS626's `EN` stops the core or only gates the output is a **datasheet** question — **unresolved** | Medium |
+| B extra | Fetch during VBLANK? | `BLANK` asynchronously clears FF2 -> counter off, VCO off, output transparent. **Whether this `BLANK` is composite or H-only is unresolved** | High (wiring) / Medium (which blank) |
+
+## Recommendation (session 3)
+
+**No RTL change.** Every point that was open and could have implied a change now
+matches MAME and our core: the nibble-select XOR (section 9), the `END`/`PLB` decode
+(8.1, 10.7), the per-level enable flip-flop (10.2), the direct VCO->counter clock
+(10.3), and the 2-nibbles-per-VCO-period rate (headline). The `R4 = 3.9K` vs. MAME's
+`3.8e3` discrepancy from section 3 remains the only known numeric mismatch and is
+still not worth acting on alone.
+
+The two genuinely useful remaining threads, in priority order:
+
+1. **Trace `BLANK` on CN2 back to the CPU board** (10.6 NEXT STEP). This is the one
+   that bears on a real latent RTL bug (whether the `prepare_sprites` equivalent
+   happens during VBLANK), and it is a bounded search on PDF p.29-34.
+2. **Pull the actual TI SN74LS624/626 datasheet PDF** and answer both section 6 (the
+   frequency-vs-Cext numbers behind MAME's log-quadratic fit) and 10.5 (whether `EN`
+   halts the oscillator core or only gates its output). Both are datasheet reads,
+   not schematic reads.
