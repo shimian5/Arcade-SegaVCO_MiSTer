@@ -272,14 +272,44 @@ authoritative status and it changes the prime suspect.** Summary:
   mutually consistent, so sub-pixel offset only — but the comments lie).
   `tools/gen_tables.py` R4 is silkscreened 3.9K, MAME hardcodes 3.8e3.
 
-**Immediate next step:** log `vpos`/`hpos` of every `cpu_sprram_we` /
-`cpu_sprpos_we` for one frame, do the same in MAME via a sprite-RAM write
-tap + `screen:vpos()`, and compare. If MAME writes in VBLANK and we write
-mid-frame → the bug is CPU/interrupt timing (Z80 clock divider, VBLANK IRQ
-assert/clear, the `WAIT` sync in `Buck_theory.txt` p.70-71, or residual TV80
-clocking, cf. 529d7ae). If MAME *also* writes mid-frame, our live-read
-engine is the more correct one and the reference image itself is suspect —
-re-baseline and say so.
+**MEASURED AND REFUTED (2026-07-29): the CPU-write-timing suspect is dead.**
+Instrumented `cpu_sprram_we`/`cpu_sprpos_we` with `vpos`/`hpos` logging on the
+RTL side (`sim/out/dbg_rtl_writes.txt`) and added a MAME write tap
+(`tools/mame/dump_sprite_write_trace.lua`) using the same coin/start schedule.
+At frame 150 the RTL writes at **vpos 225-253** and MAME writes at **vpos
+225-253** — VBSTART=224, so both are entirely in VBLANK, neither touches
+sprite RAM during active display. The original inference came from the harness
+defining "start of frame N" as `hblank_rise && vpos == VTOTAL-1` (i.e. the
+*end* of VBLANK, after that frame's writes have already landed); "all slots
+disabled at the frame-150 start snapshot, four programmed by its end snapshot"
+is precisely what correct VBLANK programming looks like through that
+instrument. The logo is set up during frame 150's VBLANK and first displays on
+frame 151. Our live-per-scanline sprite-RAM read is vindicated.
+
+Two things worth keeping from that exercise:
+
+- **MAME Lua write taps get garbage-collected if you discard the object
+  `install_write_tap` returns — silently, no error, the log simply ends.** A
+  first pass did exactly that and produced a confident-looking result (MAME
+  stops writing sprite RAM after frame ~13; sim and MAME have diverged in CPU
+  control flow) that was pure artifact. With the taps rooted in `_G`, MAME
+  writes ~160×/frame indefinitely. The committed script now roots them and
+  prints `last_tap_frame` — check that line before trusting a trace.
+- **New top suspect, cheap to check: a frame-index off-by-one inside the
+  harness itself.** The RTL image dump for "frame 150" shows a rendered logo,
+  while the sprite-RAM snapshot says nothing was enabled during frame 150's
+  active display. Both cannot describe the same frame, so `tb_z80_3d.cpp`'s
+  frame counter (selects the image dump) and `sprite_engine.v`'s
+  `dbg_cur_frame` (selects the RAM snapshots) are probably off by one relative
+  to each other. Settle this before running the co-sim again, and re-baseline
+  both dumps onto a frame where the logo is fully programmed (151+) rather
+  than the transitional frame.
+
+**IN FLIGHT (dispatched 2026-07-29):** the remaining schematic threads — the
+LS157 nibble-select XOR (IC23 pin 12, and the `CW0`→ROM `A0` contradiction)
+plus the LS109 gating / VCO-phase-reset semantics, picking up from
+§7.4/§7.5/§7.6/§8.2 of `docs/reference/VCO_schematic_findings.md`.
+Measure-and-report only; not authorised to change engine logic.
 
 | Item | State |
 |---|---|

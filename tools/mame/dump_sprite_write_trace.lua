@@ -11,9 +11,9 @@
 --   map(0xe400, 0xe7ff).ram().share(m_spriteram);        -- CONT RAM (SPRRAM)
 -- These match rtl/video/sprite_engine.v's own comments (cpu_sprram e400-e7ff,
 -- cpu_sprpos e000-e3ff) and rtl/z80_3d.v wires cpu_sprram_addr/cpu_sprpos_addr
--- to cpu_a[9:0] -- i.e. the tap `offset` below (0x000-0x3ff, relative to the
--- tap range start) is already directly comparable to the RTL log's addr
--- field, no rebasing needed.
+-- to cpu_a[9:0]. NOTE: the tap's `offset` argument is the ABSOLUTE CPU address
+-- (logged as e.g. `addr=e400`), not an offset relative to the tap range start,
+-- so mask it with 0x3ff before comparing against the RTL log's addr field.
 --
 -- Same coin/start input schedule as dump_frames_logo.lua (coin1 pulsed
 -- frames 90-99, start1 pulsed frames 150-159) so this lands on the SAME
@@ -26,6 +26,17 @@
 -- scan_period/pixel_period, exactly like reset_phase_capture.lua.
 --
 --   mame.exe buckrogn -video none -sound none -autoboot_script tools/mame/dump_sprite_write_trace.lua -str 8
+
+-- !! CRITICAL, do not "clean this up" !!  The two tap objects returned by
+-- install_write_tap MUST stay reachable from _G for the lifetime of the run.
+-- If they are discarded (or held only in a local that the periodic closure
+-- doesn't capture), Lua garbage-collects them and the taps SILENTLY STOP
+-- FIRING -- no error, no warning, the log just ends. The first version of
+-- this script discarded them and appeared to prove that MAME's CPU stops
+-- writing sprite RAM after frame ~13, which is false: with the taps rooted
+-- here, MAME writes ~160 times per frame, every frame, indefinitely. Always
+-- check the "last frame a tap fired" line below before trusting a trace.
+_G.KEPT_TAPS = {}
 
 local f = io.open("dump_sprite_write_trace.log", "w")
 local m = manager.machine
@@ -49,6 +60,7 @@ local frames = 0
 local coin_pulsed = false
 local start_pulsed = false
 local wr_count = 0
+local last_tap_frame = -1
 local done = false
 
 local mdev = m.devices[":maincpu"]
@@ -59,20 +71,22 @@ f:write(string.format("maincpu program space=%s scan_period=%.9f pixel_period=%.
 f:flush()
 
 if mprog then
-	mprog:install_write_tap(0xe000, 0xe3ff, "sprpos_wr", function(offset, data, mask)
+	_G.KEPT_TAPS[1] = mprog:install_write_tap(0xe000, 0xe3ff, "sprpos_wr", function(offset, data, mask)
 		local ok, err = pcall(function()
 			local vpos, hpos = beam_pos()
 			wr_count = wr_count + 1
+			last_tap_frame = frames
 			f:write(string.format("SPRPOS frame=%d vpos=%d hpos=%d addr=%03x data=%02x\n",
 				frames, vpos, hpos, offset, data & 0xff))
 		end)
 		if not ok then f:write("LUA ERR sprpos tap " .. tostring(err) .. "\n") end
 	end)
 
-	mprog:install_write_tap(0xe400, 0xe7ff, "sprram_wr", function(offset, data, mask)
+	_G.KEPT_TAPS[2] = mprog:install_write_tap(0xe400, 0xe7ff, "sprram_wr", function(offset, data, mask)
 		local ok, err = pcall(function()
 			local vpos, hpos = beam_pos()
 			wr_count = wr_count + 1
+			last_tap_frame = frames
 			f:write(string.format("SPRRAM frame=%d vpos=%d hpos=%d addr=%03x data=%02x\n",
 				frames, vpos, hpos, offset, data & 0xff))
 		end)
@@ -116,7 +130,11 @@ emu.register_periodic(function()
 
 	if frames == 170 then
 		done = true
-		f:write(string.format("trace complete: total_frames=%d total_writes=%d\n", frames, wr_count))
+		-- Validity check, not decoration: if last_tap_frame is far below
+		-- total_frames the taps were collected mid-run and everything after
+		-- that point is missing rather than absent. See the _G.KEPT_TAPS note.
+		f:write(string.format("trace complete: total_frames=%d total_writes=%d last_tap_frame=%d\n",
+			frames, wr_count, last_tap_frame))
 		f:flush()
 		f:close()
 		manager.machine:exit()

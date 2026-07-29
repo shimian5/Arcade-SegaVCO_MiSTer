@@ -1,11 +1,69 @@
 # Title-logo garbling: investigation state
 
-Status as of session end. Branch `worktree-phase0-1a`. Nothing here is committed unless
-noted. **Read this before resuming — it changes what the prime suspect is.**
+Status as of session end. Branch `worktree-phase0-1a`. **Read the update immediately
+below before the rest of this document — it retracts the TL;DR that follows it.**
 
 ---
 
-## TL;DR — the prime suspect changed
+## UPDATE 2026-07-29 (post-reboot): the write-timing suspect is REFUTED. Measured.
+
+The "TL;DR" section below is **wrong** and is kept only so the reasoning is auditable.
+Both our RTL and MAME write sprite RAM **in VBLANK, in the same vpos range**. There is
+no write-timing discrepancy.
+
+Measured directly, same coin/start schedule on both sides (coin frames 90-99, start
+150-159), frame 150:
+
+| Side | writes at frame 150 | vpos range | in active display? |
+|---|---|---|---|
+| RTL (`sim/out/dbg_rtl_writes.txt`) | 235 events / 130 addrs | **225-253** | none |
+| MAME (`tools/mame/dump_sprite_write_trace.lua`) | 160 | **225-253** | none |
+
+VBSTART=224, VTOTAL=264, so 225-253 is entirely VBLANK on both. MAME's whole-run vpos
+histogram is concentrated in 224-253 with only a ~140-write one-time burst at vpos 36-65
+during the first few boot frames.
+
+**Why the original inference was wrong.** The harness defines "start of frame N" as
+`hblank_rise && vpos == VTOTAL-1` (vpos 263) — the *end* of VBLANK. The CPU's writes for
+a given frame land at vpos 225-253, i.e. **before** that boundary but after the previous
+one. So "all slots disabled at the frame-150 start snapshot, four slots programmed by the
+frame-150 end snapshot" is exactly what correct VBLANK-time programming looks like
+through this instrument: the logo is simply set up during frame 150's VBLANK and first
+displays on frame 151. Nothing was ever written during active display. The engine's
+live-per-scanline sprite-RAM read is fine, and MAME's whole-frame rendering is not hiding
+anything here.
+
+**Beware of one measurement trap, since it nearly inverted this result.** A first pass at
+the MAME side discarded the objects returned by `install_write_tap`. Lua then
+garbage-collected them and the taps **silently stopped firing** — no error, the log just
+ends. That produced an apparently solid finding that MAME's CPU stops writing sprite RAM
+after frame ~13 and writes nothing at frame 150, and an inference that sim and MAME had
+diverged in CPU control flow. Both were artifacts. With the taps rooted in `_G`, MAME
+writes ~160 times per frame indefinitely. The script now roots them and prints
+`last_tap_frame`; **check that line before trusting any trace from it.**
+
+**What this leaves.** The garbling itself is still unexplained, but the open threads are
+now the schematic ones (§2/3/4 below) plus one new harness question:
+
+- **Frame-index alignment in the harness (check this first).** The RTL *image* dump for
+  "frame 150" shows a rendered logo, yet no sprite slot is enabled during frame 150's
+  active display per the snapshot above. Those two cannot both describe the same frame,
+  so `tb_z80_3d.cpp`'s frame counter (which selects the image dump) and
+  `sprite_engine.v`'s `dbg_cur_frame` (which selects the RAM snapshots) are most likely
+  **off by one relative to each other**. Verify before drawing any conclusion from a
+  co-sim run, and re-baseline both dumps to a frame where the logo is fully programmed
+  (151+), not the transitional frame.
+- The co-sim's "18,812 mismatching pixels" result remains vacuous for the reason given
+  further below, but the *reason* is now clearer: the golden model was fed a snapshot
+  from a moment when the logo genuinely was not yet programmed, so an empty reference was
+  the correct output for that input.
+
+---
+
+## TL;DR — RETRACTED, see the update above
+
+**The claim in this section — that the CPU writes sprite RAM during active display — was
+measured and is false.** Retained for auditability only.
 
 The sprite engine is probably **not** the bug. The evidence now points at **when the CPU
 writes sprite RAM**.
@@ -111,7 +169,10 @@ LS109 gating network (EPROM board sheet 3, PDF p.37) is the place to look.
 
 ## Open threads, in priority order
 
-### 1. CPU write timing (NEW — highest priority)
+### 1. CPU write timing — CLOSED, refuted by measurement (see the UPDATE at the top)
+Both sides write in VBLANK, vpos 225-253. Do not re-open without new evidence. The
+original text of this thread follows, for auditability.
+
 Log the `vpos`/`hpos` of every `cpu_sprram_we` and `cpu_sprpos_we` for one frame. Then do
 the same in MAME via a `memory write tap` on the sprite RAM range plus
 `screen:vpos()`. Compare.
