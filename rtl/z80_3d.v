@@ -691,8 +691,11 @@ module z80_3d
             else if (star_bit)          dbg_star   = dbg_star + 1;
             else                        dbg_bg     = dbg_bg + 1;
         end
-        if (vblank_rise) $display("[%0t] MIX FRAME %0d: tier1=%0d sprite=%0d tier2=%0d star=%0d bg=%0d",
-                                   $time, dbg_frame, dbg_tier1, dbg_sprite, dbg_tier2, dbg_star, dbg_bg);
+        if (vblank_rise) begin
+            $display("[%0t] MIX FRAME %0d: tier1=%0d sprite=%0d tier2=%0d star=%0d bg=%0d",
+                      $time, dbg_frame, dbg_tier1, dbg_sprite, dbg_tier2, dbg_star, dbg_bg);
+            dbg_tier1 = 0; dbg_sprite = 0; dbg_tier2 = 0; dbg_star = 0; dbg_bg = 0;
+        end
     end
     always @(posedge clk) begin
         if (sel_vram   && cpu_write) dbg_vram_wr   = dbg_vram_wr + 1;

@@ -113,13 +113,55 @@ about the "trust the hardware, not MAME's C++ shortcuts" principle above:
      the same range-gated-forwarding idiom already used for
      `xshift_we`/`proms_is_colortab` elsewhere in this file.
 
-Known open item carried forward: star density in sim looks visibly sparser
-than the real-hardware/MAME reference in the frames compared so far — not
-yet root-caused (could be legitimate game-state pacing in the specific
-coin/start timing `tb_z80_3d.cpp` uses, or a remaining bug in how often the
-sub CPU redraws/refreshes the bitmap). Worth another look with a longer or
-differently-timed sim run and a matched MAME frame before calling phase 1c
-bit-exact.
+**Star-density open item: root-caused and fixed (2026-07-29).** The gap
+traced to the TV80 clocking bug flagged below ("Known simplification"), not
+to game-state pacing or a bitmap-refresh bug: `rtl/cpu_z80.v`'s sim path
+instantiated `tv80s`, whose internal `cen` is hardwired to 1 (confirmed
+against the tv80 repo's own testbench) — both Z80 CPUs ran at the full
+39.936 MHz core clock in sim instead of the correct 4.992 MHz (core_clk/8),
+~8x too fast relative to video. Since the sub CPU's star/HUD-bar drawing is
+paced by real elapsed time (vblank-relative), this desynced its output from
+what the same number of *video frames* would produce on real hardware.
+Fixed by instantiating `tv80_core` directly (it exposes a real `cen` port;
+its FSM genuinely gates on it internally — confirmed in
+`tv80_core.v`/`ClkEn = cen && ~BusAck`) with the bus-decode logic ported
+verbatim from `tv80s.v`, driven by the same `ce_z80` (core_clk/8) already
+used for T80. `sim/tb_z80_3d.cpp`'s coin/start pulse timing (previously
+tuned empirically around the 8x-fast bug) was updated to match
+`tools/mame/dump_frames.lua`'s real schedule exactly (coin 90-99, start
+150-159), and default frame count raised to 410 to reach the same
+post-start1 point MAME's reference snapshot uses (frame 400). Verified: a
+30-frame MAME window (`tools/mame/dump_frames_range.lua`, frames 380-409)
+gives a stable star-color-pixel baseline of ~599-610/frame (excluding a few
+outlier frames with an unrelated bright explosion sprite); sim's equivalent
+window is now in the same range, vs. wildly different pre-fix behavior
+(matched MAME's attract-mode count almost exactly by coincidence, then
+diverged sharply once gameplay started). Also fixed a real bug in the
+`SIM_DEBUG_TRACE` counters (`dbg_tier1/sprite/tier2/star/bg` in
+`rtl/z80_3d.v` were never reset per-frame, unlike their sibling counters —
+made them cumulative-since-t=0 instead of per-frame, misleading for exactly
+this kind of density comparison).
+
+**New open item found while re-verifying visuals post-fix (2026-07-29,
+NOT yet root-caused):** the title-logo screen ("BUCK ROGERS / PLANET OF
+ZOOM", shown right at the start1 pulse, ~frame 150) renders badly garbled/
+illegible in sim — letters bleed together with jagged color noise —
+confirmed against a matched MAME reference frame
+(`tools/mame/dump_frames_logo.lua`, frames 130-170) which shows it crisp
+and clean. By contrast, a simple solid-color sprite (the gameplay "TIME
+LEFT" bar, frame 399) renders correctly with zero pixel-level defects
+(verified by exact color-run scan, not just eyeballing). That contrast
+(simple solid-color sprite fine, complex multi-color artwork garbled)
+points at something specific to multi-level/multi-color sprite compositing
+in `sprite_engine.v` or `mixer_buckrog.v` — e.g. cross-level timing sync,
+or wrong sprite-RAM-entry selection when multiple logo pieces have to share
+one of the 8 hardware "levels" across different scanlines (only 16 sprite-
+RAM entries fold onto 8 levels; entries 8-15 overwrite 0-7 for the same
+level, "second half wins" per-scanline). Also reported (separately, not yet
+re-verified against current code): a possibly-related distortion on an
+in-game UFO/ship sprite, from an older pre-clocking-fix capture — re-check
+this once the logo bug is understood, it may be the same root cause or may
+already be fixed.
 
 | Item | State |
 |---|---|
@@ -248,18 +290,18 @@ writes) and asserts they're byte-identical. This is exactly the check that
 would have caught the bug before it ever reached hardware — run it after any
 `REGIONS`/MRA change. All three games pass post-fix.
 
-**Known simplification still open before phase 1b's bit-exact MAME frame-diff:**
-
-`cpu_z80.v`'s TV80 (simulation-only) path runs the CPU at the **full core
-clock**, undivided — TV80's `tv80s.v` wrapper ties its internal `cen`
-permanently to 1 (no usable clock-enable input; confirmed against the tv80
-repo's own reference testbench, which does the same). So in simulation the
-CPU currently runs ~8x faster relative to video than real hardware. Fine for
-"does the attract screen render" but wrong for cycle-accurate frame diffing.
-Fix by driving `tv80_core` directly (it does expose a `cen` port) with a real
-per-T-state enable, or by giving the CPU its own free-running clock domain.
-T80 (real synthesis target) is unaffected — it takes a genuine `CEN`
-clock-enable and was never part of this problem.
+**TV80 cen/clocking simplification: fixed (2026-07-29).** `cpu_z80.v`'s TV80
+(simulation-only) path used to run the CPU at the full core clock,
+undivided — TV80's `tv80s.v` wrapper ties its internal `cen` permanently to
+1 (no usable clock-enable input; confirmed against the tv80 repo's own
+reference testbench, which does the same), so sim ran the CPU ~8x faster
+relative to video than real hardware. This turned out not to be a benign
+simplification — it was the root cause of the star-density mismatch (see
+above). Fixed by instantiating `tv80_core` directly instead of `tv80s`
+(it exposes a real `cen` port and genuinely gates its internal FSM on it)
+with `tv80s.v`'s bus-decode logic ported over unchanged. T80 (real
+synthesis target) was never affected — it takes a genuine `CEN`
+clock-enable.
 
 ROM download map's PROMS slot was bumped from the original draft's 4 KB to
 8 KB (Turbo's `proms` ROM_REGION is 4128 bytes, just over 4 KB) — see the
@@ -313,21 +355,23 @@ to leave in, off by default.
   Confirmed correct against MAME. Do not "fix" this.
 
 **Next step:** phase 1c is done in sim (see above) but not yet hardware-
-hardened or fully bit-exact. Before starting phase 1d, in rough priority
-order:
+hardened or fully bit-exact. Star density and the TV80 clocking bug are
+now fixed (2026-07-29, see above); a new sprite/mixer corruption bug
+(garbled title logo) was found while re-verifying visuals post-fix. Before
+starting phase 1d, in rough priority order:
 
-1. Chase the star-density open item noted above against a matched MAME
-   frame (same coin/start timing) — small chance it's another aliasing-
-   style bug like the two found during phase 1c bring-up, rather than pacing.
-2. The TV80 cen/clocking fix (still open from phase 1b, see "Known
-   simplification" above) — needed before any bit-exact frame-diff is
-   meaningful, since sim currently runs the CPU ~8x too fast relative to
-   video.
-3. Build real frame-diff tooling (`sim/*.ppm` vs. `mame buckrogn -snapshot`,
+1. **Root-cause and fix the garbled title-logo sprite bug** (new, see
+   above) — multi-color/multi-level sprite compositing is suspect
+   (`sprite_engine.v` and/or `mixer_buckrog.v`); a simple solid-color
+   sprite (HUD bar) renders correctly, so this isn't a wholesale sprite-
+   engine failure. Also re-check the previously-reported UFO/ship sprite
+   distortion once this is understood (that report predates the clocking
+   fix, may be the same bug or may already be resolved).
+2. Build real frame-diff tooling (`sim/*.ppm` vs. `mame buckrogn -snapshot`,
    pixel-diffed, not eyeballed) and get the sprite engine (phase 1b) and
    full mixer (phase 1c) to bit-exact, not just visually-plausible-and-
    matching-MAME-by-eye.
-4. Hardware-harden phase 1c the same way phase 1a was: a Quartus
+3. Hardware-harden phase 1c the same way phase 1a was: a Quartus
    synthesis-only pass already succeeds clean (1372 RAM segments, 0
    errors — see above), but a full fit + TimeQuest + DE10-Nano retest
    hasn't happened yet, and the two real bugs found by comparing against

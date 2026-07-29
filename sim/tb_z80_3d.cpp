@@ -38,11 +38,13 @@ int main(int argc, char **argv)
 
     std::string rom_path = "sim/buckrogn.rom";
     std::string out_prefix = "sim/out/frame";
-    // 180 frames gives the CPU enough simulated time to run past its
-    // init/POST sequence, draw the attract screen, respond to a coin-in +
-    // start1 pulse (see below), and get partway into actual gameplay
-    // (see docs/PLAN.md phase 1c notes).
-    int frames = 180;
+    // Now that cpu_z80.v drives TV80 with a real cen (see rtl/cpu_z80.v),
+    // both CPUs run at the correct core_clk/8 rate in sim, same as real
+    // hardware -- so frame counts here are directly comparable to real
+    // time/MAME frame counts. 410 frames gives the same post-start1 runway
+    // as tools/mame/dump_frames.lua's reference capture at frame 400 (see
+    // docs/PLAN.md phase 1c notes).
+    int frames = 410;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -94,11 +96,12 @@ int main(int argc, char **argv)
     long max_ticks = (long)HTOTAL * VTOTAL * 4 * (frames + 1) * 2; // safety cap
 
     while (frame < frames && tick_count < max_ticks) {
-        // Coin1 (IN1 bit 7) pulsed frames 30-39; Start1 (IN1 bit 3) pulsed
-        // frames 60-69 -- enough separation for the main CPU's coin/credit
-        // handling and the sub-CPU handshake to settle between the two.
-        bool coin_active  = (frame >= 30 && frame < 40);
-        bool start_active = (frame >= 60 && frame < 70);
+        // Coin1 (IN1 bit 7) pulsed frames 90-99; Start1 (IN1 bit 3) pulsed
+        // frames 150-159 -- matches tools/mame/dump_frames.lua's schedule
+        // exactly, so sim and MAME reference frames are directly comparable
+        // by frame index now that both CPUs run at real-hardware speed.
+        bool coin_active  = (frame >= 90 && frame < 100);
+        bool start_active = (frame >= 150 && frame < 160);
         unsigned char in1v = 0xFF;
         if (coin_active)  in1v &= ~(1 << 7);
         if (start_active) in1v &= ~(1 << 3);
