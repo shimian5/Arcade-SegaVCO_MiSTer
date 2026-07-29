@@ -163,6 +163,124 @@ in-game UFO/ship sprite, from an older pre-clocking-fix capture — re-check
 this once the logo bug is understood, it may be the same root cause or may
 already be fixed.
 
+**Logo bug investigation, session 2026-07-29: several suspects ruled out,
+root cause still open.** Instrumented `sprite_engine.v` with temporary
+hierarchical `$display` probes (via `u_sprites.*` from `z80_3d.v`'s existing
+`` `ifdef SIM_DEBUG_TRACE `` block, since forced with a Makefile-local
+`+define+SIM_DEBUG_TRACE`; reverted afterward, not committed) and traced
+frame 150's logo scanlines directly:
+
+- Only **one sprite entry (idx=2, level=2)** ever commits during the whole
+  logo Y-span (vpos 77-142+) — the logo art is a single wide multi-color
+  sprite object on one hardware level, not multiple objects sharing levels.
+  This rules out the "second-half-wins"/cross-entry-conflict theory entirely
+  for this bug (there's no second entry to conflict with).
+- Extracted the raw fetch address/byte sequence for level 2 at vpos=100
+  (hpos 100-179) and diffed it byte-for-byte against the actual assembled
+  ROM blob at the corresponding address (bank 2 = `sprites_base + 0x10000`,
+  offset from the committed per-scanline `offset` register). **Bit-exact
+  match, zero divergence** — the offset/frac accumulator, nibble
+  high/low selection, and ROM addressing are reading the *exact* intended
+  byte stream in order. This rules out an addressing/fetch-cadence bug in
+  `get_sprite_bits`'s real-time path.
+- Dumped the full per-scanline Y-scale/rowbytes commit trail for level 2
+  (`y_lo`/`y_hi`/`yscale`/rowbytes bytes, the `writeback` decision, and the
+  resulting `new_offset`) across the whole logo span: rowbytes is a
+  constant 0x40/line, the writeback PROM test skips exactly 1 line in 5
+  (an intentional 4:5 vertical compression), and the offset accumulates
+  smoothly with no discontinuity or reset anywhere in the range. This rules
+  out an accumulated Y-scale drift/skew theory.
+- Verified the mixer's `sprite_expand`/`plb_end` bit layout, the
+  `find_lsb`/`countl_zero` priority encoder, the `cd` bit-extraction
+  (`bitswap<4>(sprbits>>mux,24,16,8,0)`), and the `sprcolor_table` address
+  (`{obch,mux,cd}`) all match `docs/reference/turbo_v.cpp`'s
+  `buckrog_state::get_sprite_bits`/`screen_update` line-for-line. Also
+  reconfirmed the sprite ROM MRA region (`tools/gen_mra.py`'s `"sprites"`
+  list, offsets like `0x08000`/`0x10000`/...) already gets correctly
+  gap-filled to 32KB/bank boundaries by `region_blob()` — not a re-run of
+  the earlier MRA-gap bug class.
+- A crude row-by-row color-run comparison against the MAME reference
+  (`ar_mame_logo.png`, aspect-corrected) shows large solid-color regions
+  (e.g. the lower "SEGA"/ribbon band around native vpos~130) line up
+  reasonably well in shape and width, while the fine-detail letter rows
+  (vpos~90-120) show a lot of small-run color noise and what looked like a
+  consistent ~2-pixel rightward start-column shift in sim vs. MAME at
+  several rows — **not yet confirmed as a real, isolated offset** (could be
+  an artifact of comparing frames from slightly different game states: the
+  sim capture still shows the attract-mode "SPEED:" HUD text, while
+  `ar_mame_logo.png` shows "CREDIT  1", so a credit had already been
+  inserted for that MAME capture — these may not be exactly the same
+  underlying frame content and the two should be re-captured from truly
+  matching game states before trusting a pixel-position diff further).
+
+**Superseded.** The X-shift / sprite-position-RAM (`he`) next steps listed
+above were followed up in the next session and the `he`/`sprpos` path came
+out **clean** (traced bank split, one-column prefetch, hpos 639→0 wrap).
+
+**Logo bug, current state (session interrupted by reboot 2026-07-29) — read
+`docs/INVESTIGATION_title_logo_garbling.md` before resuming; it is the
+authoritative status and it changes the prime suspect.** Summary:
+
+- **New prime suspect: CPU sprite-RAM write timing, not the sprite engine.**
+  At the start of the visible logo frame all 16 sprite slots are disabled
+  (`y_lo=00`/`y_hi=ff` ⇒ MAME's enable ALU yields 0); by the last HBLANK of
+  the same frame slots 7/8/9/13 hold real data written by the CPU. So the
+  CPU programs sprite RAM *during active display*. Our engine reads sprite
+  RAM live per scanline (as hardware does) while MAME renders the whole
+  frame once at `screen_update` from end-of-frame RAM — so MAME is blind to
+  write timing and we are not. Symptom fits exactly: right position, right
+  size, scrambled interior.
+- **Consequence:** the sprite co-sim harness built that session
+  (`sim/golden_buckrog.py`, `sim/compare_spr.py`, `--dumpframe`, debug dump
+  ports — all uncommitted, all worth keeping) was fed a start-of-frame
+  snapshot, so the golden model rendered an *empty* frame. Its "18,812
+  mismatching pixels at y=82" result and the conclusion blaming
+  `get_sprite_bits`/`he`/`lst` carry **no diagnostic weight**. Fix before
+  reuse: drive the golden model from a *timestamped* `(vpos, addr, data)`
+  write trace, replayed per scanline, not a snapshot.
+- **One real RTL bug found (uncommitted fix pending):**
+  `sprite_engine.v`'s `y_target` is `[7:0]` but `VTOTAL=264` needs 9 bits,
+  so `vpos[7:0]+1` wraps at 255 and `prepare_sprites` re-runs 9 spurious
+  times per frame during VBLANK lines 256-262, each able to advance every
+  enabled sprite's `offset` writeback. Currently **latent** (nothing is
+  enabled on those lines in the captured frame) — fixing it probably does
+  not fix the logo. Raises an open schematic question: does hardware run
+  `prepare_sprites` during VBLANK at all? (`BLANK` into the per-level LS109
+  network, EPROM bd sheet 3, PDF p.37 — MAME cannot answer this.)
+- **Ruled out, do not re-investigate without new evidence:** cross-level
+  conflicts, fetch/addressing, Y-scale accumulation, mixer bit layout,
+  horizontal-enable / sprite-position path, `prepare_sprites` FSM + carry
+  ALU + PR-5196 addressing, MUX/priority/palette chain, accumulator cadence
+  being 2× off, a hidden ÷2 between VCO and pixel counter, and the VCO
+  analogue model being a MAME fabrication.
+- **Schematic reading (`docs/reference/VCO_schematic_findings.md`,
+  uncommitted, two sessions' worth):** VCO confirmed SN74LS626 ×4 = 8
+  independent oscillators, 220 pF on all 8, and every resistor in MAME's
+  CV formula traced (R2=2.2K, R7=1.5K, R3=1K, VR1=R5=1.2K, VR2=R6=820Ω,
+  fixed not trimpots) — MAME's model is schematic-backed, keep it. `END`
+  confirmed **data-derived** (IC39 74LS20 NAND on CDA-CDD ⇒ `pixdata==15`),
+  exactly matching MAME — clean negative, no RTL change. `CLKn` directly
+  clocks the LS191 chain, no divider. **Still open:** the LS157
+  nibble-select XOR (IC23) — input pin 13 confirmed to be `CW15`, the
+  counter's own up/down direction feedback, but pin 12 unresolved, plus a
+  flagged contradiction that `CW0` appears wired straight to ROM `A0`; and
+  the LS109 gating/VCO-phase-reset semantics (§8.2). Exact next-step crop
+  commands are recorded in §7.4, §7.5, §7.6 and §8.2 of that doc.
+- **Cosmetic/latent, fix after the real bug:** `rtl/z80_3d.v:521-632` mixer
+  pipeline free-runs on `clk` not `ce_pix`, so `SPR_TO_MIX_DELAY`/
+  `COORD_DELAY`/`VIDEO_PIPE_LATENCY` are core clocks, not pixels (depths
+  mutually consistent, so sub-pixel offset only — but the comments lie).
+  `tools/gen_tables.py` R4 is silkscreened 3.9K, MAME hardcodes 3.8e3.
+
+**Immediate next step:** log `vpos`/`hpos` of every `cpu_sprram_we` /
+`cpu_sprpos_we` for one frame, do the same in MAME via a sprite-RAM write
+tap + `screen:vpos()`, and compare. If MAME writes in VBLANK and we write
+mid-frame → the bug is CPU/interrupt timing (Z80 clock divider, VBLANK IRQ
+assert/clear, the `WAIT` sync in `Buck_theory.txt` p.70-71, or residual TV80
+clocking, cf. 529d7ae). If MAME *also* writes mid-frame, our live-read
+engine is the more correct one and the reference image itself is suspect —
+re-baseline and say so.
+
 | Item | State |
 |---|---|
 | `tools/gen_tables.py` | done — X-scale + palette tables, self-checks, MAME golden diff |

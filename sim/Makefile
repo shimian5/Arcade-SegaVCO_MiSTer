@@ -44,7 +44,17 @@ run: obj_dir/V$(TOP) buckrogn.rom
 buckrogn.rom:
 	python3 build_rom.py buckrogn buckrogn.rom /mnt/c/MiSTerDev/mame/roms
 
+# Phase0-1a sprite debug harness: dump the RTL's sprite-engine inputs
+# (dbg_sprram*.hex, dbg_sprpos_*.hex, dbg_obch*.hex from sprite_engine.v),
+# per-scanline level state (dbg_rtl_levels.txt) and per-pixel outputs
+# (dbg_rtl_spr.bin) for frame 150 (title-logo screen, matches
+# tools/mame/dump_frames.lua's start1 schedule -- see tb_z80_3d.cpp). Only
+# runs 151 frames (not the full 410) since nothing past frame 150 is needed.
+dump: obj_dir/V$(TOP) buckrogn.rom
+	mkdir -p out
+	cd .. && sim/obj_dir/V$(TOP) --rom sim/buckrogn.rom --frames 152 --out sim/out/dbg_ --dumpframe 150
+
 clean:
 	rm -rf obj_dir out *.rom
 
-.PHONY: all run clean
+.PHONY: all run dump clean

@@ -498,4 +498,101 @@ module sprite_engine
                       latched_masked[4] | latched_masked[5] | latched_masked[6] | latched_masked[7];
     assign plb     = lst_eff & plb_bit_reg;
 
+    // ------------------------------------------------------------------
+    // VERILATOR_SIM debug instrumentation (see prompt for phase0-1a sprite
+    // debug harness). Snapshots the engine's INPUTS (sprram/sprpos/obch) at
+    // the start and end of one chosen frame -- selected via +dumpframe=N --
+    // so a golden Python re-implementation of MAME's prepare_sprites/
+    // get_sprite_bits can be driven from the exact same inputs the RTL saw,
+    // instead of comparing screenshots at possibly-different game states.
+    // Also logs step_reg/offset_reg/ve per level per scanline for that same
+    // frame, which is the highest-value diagnostic (isolates the FSM logic
+    // from the per-pixel ROM-fetch logic).
+    //
+    // "Start of frame N" and "end of frame N" are the SAME hardware event
+    // (the true, unambiguous frame wrap) observed on two successive
+    // occurrences: occurrence #N is the start of frame N (sprram/sprpos not
+    // yet touched by frame N's FSM passes), occurrence #(N+1) is the end of
+    // frame N (== start of frame N+1, captured before frame N+1's FSM runs).
+    //
+    // NOTE: this boundary is deliberately detected as `hblank_rise &&
+    // (vpos == VTOTAL-1)` -- the full 9-bit vpos -- and NOT as
+    // `y_target_next == 0` (which is what the FSM itself uses, see ST_IDLE
+    // above). That's not a style choice: `y_target_next` is truncated to 8
+    // bits (`vpos[7:0] + 1`) while VTOTAL=264 needs 9, so for vpos==255 the
+    // FSM already (mis)computes y_target_next==0 one frame-boundary "early".
+    // This is a genuine, pre-existing bug in the FSM itself (see the phase0-
+    // 1a sprite-debug report): every real frame, the FSM spuriously
+    // re-processes y_target=0..7 a SECOND time using vpos=256..263 (vblank
+    // scanlines, never displayed, but very much alive as far as the FSM's
+    // sprnum-vs-y ALU and offset/step commit logic are concerned) before
+    // finally reaching the real vpos==263 wrap. Any sprite whose Y range
+    // happens to satisfy the ALU compare during vpos=256..263 gets its
+    // level's offset_reg/step_reg spuriously re-committed with the WRONG y,
+    // and that state is what's still sitting in offset_reg/step_reg when
+    // the new frame's real y=0..7 begin -- for any level not immediately
+    // re-committed by a real sprite at real y=0..7, this is live corruption
+    // carried into the new frame. Left as-is (not fixed) per the
+    // instructions this harness was built under; using vpos here instead of
+    // y_target_next keeps the DEBUG SNAPSHOT boundary itself trustworthy
+    // regardless, since it doesn't touch the FSM.
+    `ifdef VERILATOR_SIM
+        integer dbg_dumpframe;
+        initial if (!$value$plusargs("dumpframe=%d", dbg_dumpframe)) dbg_dumpframe = -1;
+
+        integer dbg_cur_frame = -1;   // frame index we are currently inside (-1 = before frame 0)
+        integer dbg_lvl_fh    = 0;    // open only while dbg_cur_frame == dbg_dumpframe
+        integer dbg_li;
+
+        always @(posedge clk) begin
+            if (dbg_dumpframe >= 0 && hblank_rise && (vpos == VTOTAL-1)) begin
+                // occurrence check for END-of-frame first (uses PRE-increment dbg_cur_frame)
+                if (dbg_cur_frame == dbg_dumpframe) begin
+                    $writememh("sim/out/dbg_sprram_end.hex",     sprram,     0, 127);
+                    $writememh("sim/out/dbg_sprpos_lo_end.hex",  sprpos_lo,  0, 255);
+                    $writememh("sim/out/dbg_sprpos_hi_end.hex",  sprpos_hi,  0, 255);
+                    begin : dbg_obch_end_blk
+                        integer fh_oe;
+                        fh_oe = $fopen("sim/out/dbg_obch_end.hex", "w");
+                        $fwrite(fh_oe, "%02x\n", obch);
+                        $fclose(fh_oe);
+                    end
+                    if (dbg_lvl_fh != 0) begin
+                        $fclose(dbg_lvl_fh);
+                        dbg_lvl_fh = 0;
+                    end
+                end
+
+                dbg_cur_frame = dbg_cur_frame + 1;
+
+                if (dbg_cur_frame == dbg_dumpframe) begin
+                    $writememh("sim/out/dbg_sprram.hex",     sprram,     0, 127);
+                    $writememh("sim/out/dbg_sprpos_lo.hex",  sprpos_lo,  0, 255);
+                    $writememh("sim/out/dbg_sprpos_hi.hex",  sprpos_hi,  0, 255);
+                    begin : dbg_obch_blk
+                        integer fh_os;
+                        fh_os = $fopen("sim/out/dbg_obch.hex", "w");
+                        $fwrite(fh_os, "%02x\n", obch);
+                        $fclose(fh_os);
+                    end
+                    dbg_lvl_fh = $fopen("sim/out/dbg_rtl_levels.txt", "w");
+                end
+            end
+
+            // Per-scanline level snapshot, taken at HBLANK end (i.e. right
+            // after the FSM above has committed every level for the
+            // scanline about to start, y_target) -- before get_sprite_bits'
+            // real-time path has advanced anything for this scanline.
+            if (dbg_lvl_fh != 0 && hblank_fall) begin
+                for (dbg_li = 0; dbg_li < 8; dbg_li = dbg_li + 1) begin
+                    $fwrite(dbg_lvl_fh, "y=%0d lvl=%0d step=%08x offset=%05x ve=%0d\n",
+                            y_target, dbg_li, step_reg[dbg_li], offset_reg[dbg_li],
+                            {ve_reg[dbg_li+8], ve_reg[dbg_li]});
+                end
+            end
+        end
+
+        wire hblank_fall = !hblank && hblank_d;
+    `endif
+
 endmodule

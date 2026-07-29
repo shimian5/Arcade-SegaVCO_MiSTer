@@ -34,10 +34,17 @@ static void tick(Vz80_3d *top)
 
 int main(int argc, char **argv)
 {
-    Verilated::commandArgs(argc, argv);
-
     std::string rom_path = "sim/buckrogn.rom";
     std::string out_prefix = "sim/out/frame";
+    // Phase0-1a sprite debug harness: --dumpframe N dumps the real-time
+    // sprite_engine outputs (sprbits/plb) for every active pixel of frame N
+    // to sim/out/dbg_rtl_spr.bin, 512*224*5 bytes (sprbits LE32 + plb byte),
+    // in raster order -- see rtl/z80_3d.v's VERILATOR_SIM dbg_* ports and
+    // rtl/video/sprite_engine.v's matching dbg_rtl_levels.txt dump. Frame
+    // numbering here (tb's own `frame` counter, below) is driven by the same
+    // hpos/vpos wraps sprite_engine.v's dbg_cur_frame counts, so the two are
+    // directly comparable by index.
+    int dumpframe = -1;
     // Now that cpu_z80.v drives TV80 with a real cen (see rtl/cpu_z80.v),
     // both CPUs run at the correct core_clk/8 rate in sim, same as real
     // hardware -- so frame counts here are directly comparable to real
@@ -51,7 +58,23 @@ int main(int argc, char **argv)
         if (a == "--rom" && i + 1 < argc) rom_path = argv[++i];
         else if (a == "--frames" && i + 1 < argc) frames = atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) out_prefix = argv[++i];
+        else if (a == "--dumpframe" && i + 1 < argc) dumpframe = atoi(argv[++i]);
     }
+
+    // Forward --dumpframe to the RTL side as a Verilator plusarg
+    // (+dumpframe=N), which rtl/video/sprite_engine.v's VERILATOR_SIM block
+    // reads via $value$plusargs, so the RTL-input snapshot (Deliverable 1)
+    // and this testbench's per-pixel dump (Deliverable 2) key off the same
+    // frame index.
+    std::vector<std::string> plusarg_storage;
+    std::vector<char *> vargv;
+    for (int i = 0; i < argc; i++) vargv.push_back(argv[i]);
+    if (dumpframe >= 0) {
+        plusarg_storage.push_back("+dumpframe=" + std::to_string(dumpframe));
+        vargv.push_back(const_cast<char *>(plusarg_storage.back().c_str()));
+    }
+    int vargc = (int)vargv.size();
+    Verilated::commandArgs(vargc, vargv.data());
 
     FILE *rf = fopen(rom_path.c_str(), "rb");
     if (!rf) { fprintf(stderr, "cannot open rom %s\n", rom_path.c_str()); return 1; }
@@ -95,6 +118,18 @@ int main(int argc, char **argv)
     long tick_count = 0;
     long max_ticks = (long)HTOTAL * VTOTAL * 4 * (frames + 1) * 2; // safety cap
 
+    // Deliverable 2: sim/out/dbg_rtl_spr.bin, ACTIVE_W*ACTIVE_H*5 bytes,
+    // raster order, opened/closed exactly while frame == dumpframe. x/y here
+    // track ce_pix ticks the same way hpos/vpos do in the RTL (both reset to
+    // 0 the moment `reset` deasserts, right before this loop starts), so
+    // they are the same (hpos,vpos) the dbg_hpos/dbg_vpos ports would report
+    // -- no separate alignment check needed.
+    FILE *dbg_spr_f = nullptr;
+    if (dumpframe >= 0) {
+        dbg_spr_f = fopen("sim/out/dbg_rtl_spr.bin", "wb");
+        if (!dbg_spr_f) fprintf(stderr, "cannot open sim/out/dbg_rtl_spr.bin for write\n");
+    }
+
     while (frame < frames && tick_count < max_ticks) {
         // Coin1 (IN1 bit 7) pulsed frames 90-99; Start1 (IN1 bit 3) pulsed
         // frames 150-159 -- matches tools/mame/dump_frames.lua's schedule
@@ -115,6 +150,17 @@ int main(int argc, char **argv)
                 fb[idx + 0] = top->video_r;
                 fb[idx + 1] = top->video_g;
                 fb[idx + 2] = top->video_b;
+
+                if (dbg_spr_f && frame == dumpframe) {
+                    unsigned char rec[5];
+                    vluint32_t sb = top->dbg_sprbits;
+                    rec[0] = (unsigned char)(sb & 0xFF);
+                    rec[1] = (unsigned char)((sb >> 8) & 0xFF);
+                    rec[2] = (unsigned char)((sb >> 16) & 0xFF);
+                    rec[3] = (unsigned char)((sb >> 24) & 0xFF);
+                    rec[4] = (unsigned char)(top->dbg_plb & 0xFF);
+                    fwrite(rec, 1, 5, dbg_spr_f);
+                }
             }
             x++;
             if (x == HTOTAL) {
@@ -140,6 +186,11 @@ int main(int argc, char **argv)
     }
 
     if (frame < frames) fprintf(stderr, "WARNING: only produced %d/%d frames before tick cap\n", frame, frames);
+
+    if (dbg_spr_f) {
+        fclose(dbg_spr_f);
+        printf("wrote sim/out/dbg_rtl_spr.bin (frame %d)\n", dumpframe);
+    }
 
     top->final();
     delete top;

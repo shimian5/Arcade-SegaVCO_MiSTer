@@ -43,6 +43,17 @@ module z80_3d
     output wire [7:0]   video_r,
     output wire [7:0]   video_g,
     output wire [7:0]   video_b
+
+`ifdef VERILATOR_SIM
+    // Phase0-1a sprite debug harness (see sprite_engine.v's VERILATOR_SIM
+    // block): real-time, zero-latency sprite_engine outputs, exposed so
+    // sim/tb_z80_3d.cpp can dump them per-pixel for the chosen frame without
+    // needing to re-derive the mixer's delay-matched copies.
+    , output wire [31:0] dbg_sprbits
+    , output wire [7:0]  dbg_plb
+    , output wire [9:0]  dbg_hpos
+    , output wire [8:0]  dbg_vpos
+`endif
 );
 
     // ------------------------------------------------------------------
@@ -366,6 +377,12 @@ module z80_3d
     wire [7:0]  sprram_rdata, sprpos_rdata;
     wire [31:0] sprbits;
     wire [7:0]  spr_plb;
+`ifdef VERILATOR_SIM
+    assign dbg_sprbits = sprbits;
+    assign dbg_plb      = spr_plb;
+    assign dbg_hpos      = hpos;
+    assign dbg_vpos      = vpos;
+`endif
     sprite_engine u_sprites
     (
         .clk              (clk),
