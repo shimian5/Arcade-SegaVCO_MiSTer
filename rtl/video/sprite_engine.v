@@ -69,6 +69,7 @@ module sprite_engine
     parameter [31:0] PLB_END          = {2'd2,2'd1,2'd1,2'd1, 2'd1,2'd1,2'd1,2'd1,
                                           2'd1,2'd1,2'd1,2'd1, 2'd1,2'd1,2'd1,2'd0},
     parameter        VTOTAL           = 264,
+    parameter        VDISP            = 224,               // visible scanlines, y=0..VDISP-1 (matches MAME cliprect.min_y/max_y)
     parameter        XSCALE_HEX_FILE  = "roms/xscale_buckrog.hex"
 )
 (
@@ -290,6 +291,17 @@ module sprite_engine
 
     wire [7:0] y_target_next = (vpos == VTOTAL-1) ? 8'd0 : (vpos[7:0] + 8'd1);
 
+    // Gate on the FULL 9-bit vpos (not the truncated y_target_next) so the
+    // FSM runs exactly once per visible scanline, y_target_next = 0..VDISP-1,
+    // matching MAME's `for (y = cliprect.min_y; y <= cliprect.max_y; y++)`
+    // (turbo_v.cpp screen_update). True at vpos = VTOTAL-1 (wrap, prepares
+    // y=0) and at vpos = 0..VDISP-2 (prepares y=vpos+1..VDISP-1); false for
+    // every VBLANK line (vpos = VDISP-1..VTOTAL-2), so no spurious
+    // prepare_sprites passes -- and no offset/step writeback -- ever happen
+    // during blanking. y_target itself stays 8 bits and its arithmetic is
+    // untouched; only WHEN the FSM is allowed to launch changes.
+    wire run_prepare_sprites = (vpos == VTOTAL-1) || (vpos < VDISP-1);
+
     // Two-stage carry ALU (docs/PLAN.md "Per-scanline prepare_sprites state
     // machine", step 1). Combinational from the just-captured Y bytes.
     wire [7:0] y_lo_eff = Y_INVERT ? ~y_lo_reg : y_lo_reg;
@@ -311,7 +323,7 @@ module sprite_engine
 
         case (st)
             ST_IDLE: begin
-                if (hblank_rise) begin
+                if (hblank_rise && run_prepare_sprites) begin
                     idx        <= 4'd0;
                     y_target   <= y_target_next;
                     st         <= ST_ISSUE_Y0;
@@ -517,25 +529,34 @@ module sprite_engine
     //
     // NOTE: this boundary is deliberately detected as `hblank_rise &&
     // (vpos == VTOTAL-1)` -- the full 9-bit vpos -- and NOT as
-    // `y_target_next == 0` (which is what the FSM itself uses, see ST_IDLE
-    // above). That's not a style choice: `y_target_next` is truncated to 8
-    // bits (`vpos[7:0] + 1`) while VTOTAL=264 needs 9, so for vpos==255 the
-    // FSM already (mis)computes y_target_next==0 one frame-boundary "early".
-    // This is a genuine, pre-existing bug in the FSM itself (see the phase0-
-    // 1a sprite-debug report): every real frame, the FSM spuriously
-    // re-processes y_target=0..7 a SECOND time using vpos=256..263 (vblank
-    // scanlines, never displayed, but very much alive as far as the FSM's
-    // sprnum-vs-y ALU and offset/step commit logic are concerned) before
-    // finally reaching the real vpos==263 wrap. Any sprite whose Y range
-    // happens to satisfy the ALU compare during vpos=256..263 gets its
-    // level's offset_reg/step_reg spuriously re-committed with the WRONG y,
-    // and that state is what's still sitting in offset_reg/step_reg when
-    // the new frame's real y=0..7 begin -- for any level not immediately
-    // re-committed by a real sprite at real y=0..7, this is live corruption
-    // carried into the new frame. Left as-is (not fixed) per the
-    // instructions this harness was built under; using vpos here instead of
-    // y_target_next keeps the DEBUG SNAPSHOT boundary itself trustworthy
-    // regardless, since it doesn't touch the FSM.
+    // `y_target_next == 0` (which is what the FSM's y_target register uses,
+    // see ST_IDLE above). `y_target_next` is derived from the truncated
+    // `vpos[7:0] + 1` (`y_target` must stay 8 bits to match MAME's
+    // `prepare_sprites(uint8_t y)` ALU semantics), so in isolation it also
+    // reads 0 at vpos==255, one frame-boundary "early".
+    //
+    // That truncation used to be a live bug: the FSM's ST_IDLE trigger was
+    // bare `hblank_rise`, so it launched a prepare_sprites pass on every one
+    // of the 264 scanlines, including all of VBLANK. Combined with the
+    // vpos==255 truncation, the FSM spuriously re-processed y_target=0..7 a
+    // SECOND time during vpos=256..263 (vblank, never displayed, but fully
+    // live as far as the FSM's sprnum-vs-y ALU and offset/step commit logic
+    // were concerned) before finally reaching the real vpos==263 wrap; any
+    // sprite whose Y range satisfied the ALU compare during those lines got
+    // its level's offset_reg/step_reg spuriously re-committed with the wrong
+    // y. This is now FIXED: ST_IDLE only launches when
+    // `run_prepare_sprites` (full 9-bit vpos) is true, which is exactly
+    // vpos==VTOTAL-1 (wrap, prepares y=0) or vpos<VDISP-1 (prepares
+    // y=vpos+1..VDISP-1) -- i.e. the FSM now runs exactly once per visible
+    // scanline y=0..VDISP-1 and never during VBLANK, matching MAME's
+    // `for (y = cliprect.min_y; y <= cliprect.max_y; y++)`. `y_target`
+    // itself and its ALU were not touched.
+    //
+    // This debug snapshot boundary still deliberately keys off the full
+    // 9-bit vpos rather than the FSM's own y_target_next, on principle: it
+    // should stay correct independent of whatever the FSM's internal
+    // wrap-detection logic does, so it remains a trustworthy instrument even
+    // if a future change to the FSM regresses that logic again.
     `ifdef VERILATOR_SIM
         integer dbg_dumpframe;
         initial if (!$value$plusargs("dumpframe=%d", dbg_dumpframe)) dbg_dumpframe = -1;
