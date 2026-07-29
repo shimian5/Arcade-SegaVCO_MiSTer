@@ -328,3 +328,109 @@ start-of-frame snapshot. Only then does it model what the engine actually consum
 **Structural caveat, permanent:** the co-sim compares our RTL against MAME-with-our-tables.
 It is **blind by construction** to open threads 2, 3 and 4 — those are cases where MAME
 itself is wrong. A clean co-sim result does not exonerate the engine.
+
+---
+
+## UPDATE 2026-07-29 (session 4): NEW PRIME SUSPECT — intra-pipeline coordinate
+## skew in the video path. Measured off a real DE10-Nano capture.
+
+Evidence: a hardware photo of the attract screen ("GAME OVER / INSERT COIN")
+versus a matched MAME capture. Three reported symptoms: stars not confined to
+the sky; the tunnel-wall top edge ragged (tabs sticking **up** on the left wall,
+**down** on the right); the ship sprite garbled.
+
+**The wall is the fg tilemap, not sprites.** Confirmed by dumping `c000-c7ff`
+from MAME at the attract frame (`tmp/probe.lua` idiom): rows 6-23 of the 32x32
+grid hold the V-shaped tunnel (codes 0x90-0xcf on the flanks, 0xe0 fill, 0x80
+sky). So symptom 2 is a foreground-tilemap defect.
+
+**Measured geometry of symptom 2** (hardware capture resampled to the core's
+native 512x224 output grid, per-column top-of-wall scan):
+
+- The defect is **exactly 2 output pixels wide** and recurs with a period of
+  **exactly 16 output pixels** — i.e. **1 native pixel, at every 8-pixel tile
+  column boundary** (the core runs 2x horizontal, so 512 output px = 256 native).
+- Its magnitude is 3-4 scanlines, which is exactly how much the wall's cornice
+  diagonal drops across **one tile column**. So the bad pixel is displaying the
+  neighbouring tile column's art.
+- The sign flips between the left and right walls, because the diagonal's slope
+  flips. That is the "up on the left / down on the right" the user described,
+  and it is a *horizontal* error rendered visible as vertical raggedness.
+
+**Root cause hypothesis — `rtl/video/fg_tilemap.v` samples `xx`/`y` at four
+different times inside one 4-stage fetch.** `xx_native`/`y_native` are fed in
+combinationally from `hpos`/`vpos` and advance once every **8 core clocks**
+(`hpos` steps on `ce_pix` = clk/4; `xx = hpos[9:1]`). But the stages are 1 clk
+apart and each grabs a *different field of the live coordinate*:
+
+| stage | clk | uses |
+|---|---|---|
+| 1 `xshift_dout` | t+0 | `xx[7:3]` (tile column) |
+| 2 `vram_dout`   | t+1 | `y[7:3]` (tile row) |
+| 3 `plane*_dout` | t+2 | `y[2:0]` (row within tile) |
+| 4 `foreraw_reg` | t+3 | **`xx[2:0]` (pixel within tile)** |
+
+So the tile is selected by `xx` at t and the pixel-within-tile by `xx` at t+3.
+For 3 of every 8 clock phases those disagree by one native pixel. The module's
+header comment claims safety because "xx/y are held stable for 8 clk" — true in
+the middle of a native pixel, **false at every native-pixel boundary**, and
+there is no sampling phase that rescues it: the two output sub-pixels of a
+native pixel are 4 clk apart while the skew window is 3 clk wide out of 8, so at
+least one sub-pixel per native pixel is guaranteed to mismatch. At a tile
+boundary that mismatch means rendering the **leftmost pixel of the previous
+tile** — precisely the measured defect.
+
+**Why no earlier test caught it.** The only sim-vs-MAME pixel diff ever run was
+the logo frame, where the fg content is text on blank tiles: the leftmost column
+of a glyph tile is background anyway, so the error is invisible. The tunnel wall
+is the first fg content with dense tile-to-tile variation *and* a shallow
+diagonal, which amplifies a 1-pixel horizontal error into a 4-scanline vertical
+one. MAME can never show it — MAME has no pipeline.
+
+**Same defect class, sprite path — this is the logo/ship garbling suspect.**
+`z80_3d.v` delays `sprbits`/`plb` by `SPR_TO_MIX_DELAY = 5` clk to meet
+`forebits_reg2` at 6 and `star_bit`/`bgcolor_reg` at 6. Output pixels are 4 clk
+apart, so 5 is **not** a whole number of pixels: the sprite layer lands one core
+clock (1/4 pixel) off the layer it is being mixed with, and at the ce_pix
+sampling instant the mixer sees the *previous* output pixel's `plb`/`cd`
+combined with the current pixel's fg/star/bg. That predicts exactly what has
+been observed all along:
+
+- **solid-colour sprites render perfectly** (the HUD "TIME LEFT" bar — no
+  interior pixel boundaries to get wrong) while **multi-colour artwork garbles**
+  (logo, ship) — the single most diagnostic fact in this whole investigation,
+  and this is the first theory that explains it;
+- the earlier "consistent ~2-pixel rightward start-column shift" seen in the
+  crude logo row-scan;
+- everything *inside* `sprite_engine.v` measuring bit-exact — the engine is
+  right, the **sampling of its output** is wrong;
+- all previously ruled-out suspects stay ruled out.
+
+This is the item PLAN.md currently files as **"Cosmetic/latent, fix after the
+real bug"** ("mixer pipeline free-runs on `clk` not `ce_pix` ... depths mutually
+consistent, so sub-pixel offset only"). **That dismissal is wrong.** Depths
+being mutually consistent in core clocks is not the same as being consistent in
+*pixels*, and it is not the same as each stage sampling a coordinate at the same
+time. Promote it to prime suspect.
+
+**Cheapest confirmations, in order:**
+
+1. Register `xx`/`y` into a delay chain inside `fg_tilemap.v` so every stage
+   consumes the *same* pixel's coordinate (stage 4 must use `xx[2:0]` delayed by
+   3, stage 2 `y[7:3]` delayed by 1, stage 3 `y[2:0]` delayed by 2). Re-render
+   an attract frame with the tunnel wall on screen and re-scan the top-of-wall
+   profile — the 1-native-pixel tabs at every tile boundary should vanish.
+2. Gate the whole `z80_3d.v` mixer pipeline with `ce_pix` (or re-time
+   `SPR_TO_MIX_DELAY`/`COORD_DELAY` to whole pixels) and re-diff the logo frame.
+3. **Add an attract frame *with the tunnel wall* to the sim-vs-MAME diff set.**
+   Every diff so far used the logo frame, whose fg content structurally cannot
+   expose a tile-boundary bug. This is the instrument gap that hid it.
+
+**Symptom 1 (stars) is probably NOT this bug.** Checked directly: the wall
+interior in the hardware capture has *no* star bleed-through, so fg tier-2
+opacity is holding. The difference is that MAME's bitmap has stars only in an
+upper band while hardware's has them all the way down to the wall — i.e. the
+**sub CPU is drawing/erasing a different region**, a content issue. Note the
+star-density work was validated in sim against TV80; hardware runs **T80**, a
+CPU path no simulation result in this document has ever exercised. Treat it as a
+separate thread.
