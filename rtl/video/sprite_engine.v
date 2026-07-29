@@ -542,6 +542,7 @@ module sprite_engine
 
         integer dbg_cur_frame = -1;   // frame index we are currently inside (-1 = before frame 0)
         integer dbg_lvl_fh    = 0;    // open only while dbg_cur_frame == dbg_dumpframe
+        integer dbg_wr_fh     = 0;    // open only while dbg_cur_frame == dbg_dumpframe; logs CPU writes
         integer dbg_li;
 
         always @(posedge clk) begin
@@ -561,6 +562,10 @@ module sprite_engine
                         $fclose(dbg_lvl_fh);
                         dbg_lvl_fh = 0;
                     end
+                    if (dbg_wr_fh != 0) begin
+                        $fclose(dbg_wr_fh);
+                        dbg_wr_fh = 0;
+                    end
                 end
 
                 dbg_cur_frame = dbg_cur_frame + 1;
@@ -576,6 +581,7 @@ module sprite_engine
                         $fclose(fh_os);
                     end
                     dbg_lvl_fh = $fopen("sim/out/dbg_rtl_levels.txt", "w");
+                    dbg_wr_fh  = $fopen("sim/out/dbg_rtl_writes.txt", "w");
                 end
             end
 
@@ -589,6 +595,20 @@ module sprite_engine
                             y_target, dbg_li, step_reg[dbg_li], offset_reg[dbg_li],
                             {ve_reg[dbg_li+8], ve_reg[dbg_li]});
                 end
+            end
+
+            // Open thread #1 (docs/INVESTIGATION_title_logo_garbling.md):
+            // log every CPU write to sprite RAM / sprite-position RAM during
+            // the dumped frame, tagged with (vpos, hpos), in write order.
+            // This is the "WHEN does the CPU write sprite RAM" measurement --
+            // purely observational, no engine logic touched.
+            if (dbg_wr_fh != 0) begin
+                if (cpu_sprram_we)
+                    $fwrite(dbg_wr_fh, "SPRRAM vpos=%0d hpos=%0d addr=%03x data=%02x\n",
+                            vpos, hpos, cpu_sprram_addr, cpu_sprram_wdata);
+                if (cpu_sprpos_we)
+                    $fwrite(dbg_wr_fh, "SPRPOS vpos=%0d hpos=%0d addr=%03x data=%02x\n",
+                            vpos, hpos, cpu_sprpos_addr, cpu_sprpos_wdata);
             end
         end
 
