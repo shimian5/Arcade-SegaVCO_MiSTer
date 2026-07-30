@@ -1,7 +1,24 @@
 # Title-logo garbling: investigation state
 
-Status as of session end. Branch `worktree-phase0-1a`. **Read the update immediately
-below before the rest of this document — it retracts the TL;DR that follows it.**
+Status as of session end. Branch `worktree-phase0-1a`.
+
+**Read the LAST section first.** This document is append-only and its sections
+retract each other in order, so the newest one is the current state and everything
+above it is kept for auditability. As of 2026-07-29 (session 4) that is
+*"NEW PRIME SUSPECT — intra-pipeline coordinate skew in the video path"*, plus the
+raw evidence and instruments that follow it. Jump there; the sections between here
+and it are settled history.
+
+Current one-line status: the sprite engine's internals and the CPU's write timing
+are both measured clean. The suspect is now the **video pipeline that samples them**
+— `rtl/video/fg_tilemap.v` reads `xx[7:3]` at stage 1 and `xx[2:0]` at stage 4,
+three core clocks apart, while `xx` only advances every eight; and `z80_3d.v`'s
+mixer delays the sprite layer by 5 core clocks against a 4-clock pixel. This is the
+first theory that explains why solid-colour sprites render perfectly and
+multi-colour artwork garbles.
+
+Older navigation note, still true of the sections below: the update after this
+header retracts the TL;DR that follows *it*.
 
 ---
 

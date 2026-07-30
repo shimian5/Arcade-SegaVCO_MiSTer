@@ -266,11 +266,22 @@ authoritative status and it changes the prime suspect.** Summary:
   flagged contradiction that `CW0` appears wired straight to ROM `A0`; and
   the LS109 gating/VCO-phase-reset semantics (§8.2). Exact next-step crop
   commands are recorded in §7.4, §7.5, §7.6 and §8.2 of that doc.
-- **Cosmetic/latent, fix after the real bug:** `rtl/z80_3d.v:521-632` mixer
-  pipeline free-runs on `clk` not `ce_pix`, so `SPR_TO_MIX_DELAY`/
-  `COORD_DELAY`/`VIDEO_PIPE_LATENCY` are core clocks, not pixels (depths
-  mutually consistent, so sub-pixel offset only — but the comments lie).
-  `tools/gen_tables.py` R4 is silkscreened 3.9K, MAME hardcodes 3.8e3.
+- ~~**Cosmetic/latent, fix after the real bug:**~~ **PROMOTED TO PRIME SUSPECT
+  2026-07-29 (session 4) — this classification was wrong.** `rtl/z80_3d.v:521-632`
+  mixer pipeline free-runs on `clk` not `ce_pix`, so `SPR_TO_MIX_DELAY`/
+  `COORD_DELAY`/`VIDEO_PIPE_LATENCY` are core clocks, not pixels. The dismissal
+  ("depths mutually consistent, so sub-pixel offset only") does not follow:
+  mutually consistent *core-clock* depths are not consistent *pixel* depths when
+  the pixel is 4 clocks wide and the delays are 5/6/7. The same defect class in
+  `rtl/video/fg_tilemap.v` (stage 1 samples `xx[7:3]`, stage 4 samples `xx[2:0]`,
+  three clocks apart, while `xx` advances every eight) has now been **measured on
+  a DE10-Nano capture**: a 1-native-pixel error at every tile column boundary,
+  which is the tunnel wall's ragged top edge. It also explains the logo/ship
+  garbling and, crucially, why a solid-colour sprite renders perfectly while
+  multi-colour artwork does not. See the last section of
+  `docs/INVESTIGATION_title_logo_garbling.md` and `tools/measure_wall_profile.py`.
+- Genuinely cosmetic: `tools/gen_tables.py` R4 is silkscreened 3.9K, MAME
+  hardcodes 3.8e3.
 
 **MEASURED AND REFUTED (2026-07-29): the CPU-write-timing suspect is dead.**
 Instrumented `cpu_sprram_we`/`cpu_sprpos_we` with `vpos`/`hpos` logging on the
