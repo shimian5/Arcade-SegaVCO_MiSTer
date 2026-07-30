@@ -693,6 +693,104 @@ module z80_3d
     assign ce_pix = ce_pix_pipe[VIDEO_PIPE_LATENCY-1];
 
 `ifdef SIM_DEBUG_TRACE
+    // Session-6-continued (CPU/game-state divergence investigation): latch
+    // the main CPU's PC at every opcode fetch (M1 & MREQ & RD asserted --
+    // the point cpu_a *is* PC, before any operand/data bytes move the bus
+    // off it) and print it at each vblank interrupt, so per-frame PC-at-
+    // vblank can be diffed against a MAME Lua trace of the same instant
+    // (see tools/mame/dump_pc_trace.lua). Also count total main-CPU M1
+    // (opcode fetch) cycles as a coarse proxy for "how far execution has
+    // progressed" independent of PC (loops/calls revisit the same PC).
+    reg  [15:0] pc_reg;
+    integer     m1_count = 0;
+    reg         main_m1_fetch_d;
+    wire        main_m1_fetch = ~cpu_m1_n && ~cpu_mreq_n && ~cpu_rd_n;
+    wire        main_m1_fetch_rise = main_m1_fetch && !main_m1_fetch_d;
+    always @(posedge clk) begin
+        main_m1_fetch_d <= main_m1_fetch;
+        if (main_m1_fetch_rise) begin
+            pc_reg   <= cpu_a;
+            m1_count <= m1_count + 1;
+        end
+        if (vblank_rise) $display("[%0t] PCTRACE frame=%0d pc=%04x m1_count=%0d", $time, dbg_frame, pc_reg, m1_count);
+    end
+
+    // Session-6-continued-further: measure TV80's ACTUAL T-state cost for
+    // the IM1 interrupt-acceptance sequence directly, independent of any
+    // MAME comparison -- the real Z80 spec (Zilog Z80 Family CPU User
+    // Manual) fixes this at exactly 13 T-states (extended 7T M1 cycle + two
+    // 3T M-cycles pushing PC), regardless of vector/data-bus content in
+    // IM1. Ground truth here is the spec, not MAME's own number, per this
+    // investigation's "validate against an independent reference, not just
+    // MAME" discipline.
+    //
+    // Method: count ce_z80 pulses (each pulse == one Z80 T-state, see
+    // z80_div above) from the rising edge of int_ack (the M1+IORQ
+    // interrupt-acknowledge cycle, already computed below for irq_pending)
+    // to the very next main-CPU M1 opcode fetch -- i.e. the fetch of the
+    // ISR's first opcode at 0x0038 (RST 38, confirmed via
+    // sim/buckrogn.rom's reset code using IM 1). That gap, in T-states, IS
+    // the interrupt-acceptance cost as TV80 actually implements it; any
+    // deviation from 13 is a real, self-contained TV80 bug report, not
+    // something that needs MAME to confirm.
+    reg        intack_pending;
+    reg        int_ack_d;
+    integer    tstates_since_intack;
+    wire       int_ack_rise = int_ack && !int_ack_d;
+    always @(posedge clk) begin
+        int_ack_d <= int_ack;
+        if (int_ack_rise) begin
+            intack_pending       <= 1'b1;
+            tstates_since_intack <= 0;
+        end else if (intack_pending && ce_z80) begin
+            tstates_since_intack <= tstates_since_intack + 1;
+        end
+        if (intack_pending && main_m1_fetch_rise) begin
+            intack_pending <= 1'b0;
+            $display("[%0t] INTACK_TSTATES frame=%0d tstates=%0d isr_pc=%04x (spec=13)",
+                      $time, dbg_frame, tstates_since_intack, cpu_a);
+        end
+    end
+
+    // Session-6-continued-yet-further: with interrupt-acceptance cost
+    // proven spec-exact (above), the ISR at 0x0e56 (reached via 0x0038's
+    // JP) branches on three work-RAM flags (0xf834/0xf835/0xf836,
+    // disassembled from sim/buckrogn.rom) before returning -- log the flag
+    // byte values as seen at every interrupt-entry (work_ram[] is this
+    // module's own registered-read work RAM array, offsets 0x34/0x35/0x36 =
+    // real addresses 0xf834/0xf835/0xf836, per work_ram's F800-FFFF mapping
+    // above) so a per-frame diff against MAME's own read of the same
+    // addresses (tools/mame/dump_pc_trace.lua) can find the first frame the
+    // two sides' game state actually disagrees on, independent of PC.
+    //
+    // An earlier version of this instrument also tried to measure the ISR's
+    // total T-state length, by capturing the interrupt-ack's 2-byte PC push
+    // (the only way to get the true return address -- see the retracted
+    // paragraph below) and watching for the matching return fetch. That
+    // measurement never completed even once in 60 frames: the first
+    // captured push (frame 1) had return_pc=0x0007, and no later M1 fetch
+    // ever landed back on 0x0007, while a SECOND push was captured on frame
+    // 2 with the SAME return_pc=0x0007 -- i.e. a second interrupt got
+    // accepted before the first one's RET ever fired. That's only possible
+    // if this ISR chain re-enables interrupts (EI) before it finishes
+    // running, which is consistent with the disassembly: the f834-nonzero
+    // path pops AF/EIs/RETs quickly (0x0e5e-0x0e60), but the observed
+    // f834==0 path dives into a longer chain (0x0e61 onward, eventually
+    // 0x0e70's PUSH BC/DE/HL block) whose EI point hasn't been located. A
+    // naive single-level "watch the stack push, watch for the matching
+    // return fetch" probe can't handle a re-entrant/nesting ISR -- it needs
+    // real call-depth tracking to be trustworthy here, which is a bigger
+    // instrument than this session has scoped. Findings doc records this as
+    // a real (if unproven) data point: the ISR is structurally capable of
+    // nesting, which is itself a plausible source of frame-to-frame
+    // scheduling differences independent of anything TV80 does wrong.
+    always @(posedge clk) begin
+        if (int_ack_rise) begin
+            $display("[%0t] ISRFLAGS frame=%0d f834=%02x f835=%02x f836=%02x",
+                      $time, dbg_frame, work_ram[8'h34], work_ram[8'h35], work_ram[8'h36]);
+        end
+    end
+
     integer trace_count = 0;
     always @(posedge clk) begin
         if (!reset && trace_count < 400) begin
