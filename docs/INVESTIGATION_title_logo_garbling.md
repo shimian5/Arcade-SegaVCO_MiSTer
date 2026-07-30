@@ -4,23 +4,27 @@ Status as of session end. Branch `worktree-phase0-1a`.
 
 **Read the LAST section first.** This document is append-only and its sections
 retract each other in order, so the newest one is the current state and everything
-above it is kept for auditability. As of 2026-07-29 (session 6, continued to
-conclusion) the video-pipeline sprite-rendering bugs are fixed and verified.
-The CPU/game-state divergence thread (sim's Z80/TV80 vs. MAME's Z80
-emulation) has been run all the way down at the CPU level: clock ratio,
-interrupt cadence, interrupt-accept T-state cost, AND every individual
-instruction's T-state cost across the divergence window (346,564 instructions
-checked opcode-by-opcode against the real Zilog Z80 timing tables) are all
-independently verified correct. **TV80 is not the bug.** The leading suspect
-is now the *measurement itself* — whether MAME's `register_periodic` callback
-samples at the same T-state-precise instant as `vblank_rise` — which has been
-flagged as an open risk for several updates but never directly checked. See
-the newest section below for the full chain of evidence and the concrete next
-check. Jump there; the sections between here and it are settled history,
-including the session-4 suspect writeup, which explains the background-layer
-fix but turned out not to fully explain the sprite-layer symptom, and the
-session-6 rendering-bug fixes/game-state-divergence framing that prompted this
-follow-up.
+above it is kept for auditability. As of 2026-07-29 (session 6, final) the
+video-pipeline sprite-rendering bugs are fixed and verified. The CPU/game-
+state divergence thread (sim's Z80/TV80 vs. MAME's Z80 emulation) is now
+**fully closed on the CPU-core side**: clock ratio, interrupt cadence,
+interrupt-accept T-state cost, and every individual instruction's T-state
+cost across the *entire* divergence window — including the exact frames
+(44-45) where sim and MAME's execution paths actually split — have been
+checked opcode-by-opcode against the real Zilog Z80 timing tables (551,212
+instructions, zero mismatches). **TV80 is exonerated, conclusively.** An
+earlier pass in this same session reached that conclusion prematurely from an
+audit that stopped short of the actual branch point — caught and corrected;
+see the newest section below for both the correction and the completed
+result. The investigation now points at two remaining, not-yet-explored
+directions: MAME's sampling-instant precision (secondary — can't explain the
+structural split by itself) and non-CPU-cycle causes (what each side's CPU
+actually *reads*, not how fast it runs — the more promising lead). Jump to
+the newest section for the full writeup. The sections between here and it are
+settled history, including the session-4 suspect writeup, which explains the
+background-layer fix but turned out not to fully explain the sprite-layer
+symptom, and the session-6 rendering-bug fixes/game-state-divergence framing
+that prompted this follow-up.
 
 Current one-line status: the intra-pipeline coordinate-skew bug (session 4) is
 fixed in `rtl/video/fg_tilemap.v` and `rtl/z80_3d.v`, and **confirmed fixed by
@@ -1336,4 +1340,111 @@ counter (or an equivalent) at the same point sim's `PCTRACE` samples, and
 check whether the two sides' *cycle counts since reset*, not just PC, agree
 at frame boundaries where PC still matches (frames 1-8) — if cycle counts
 already disagree there despite PC matching, that's the sampling-instant
+
+## UPDATE 2026-07-29 (session 6, final): correction — the previous update's pivot to "the probe is the leading suspect" was premature; the audit had a coverage gap that didn't actually reach the divergence point. Closed that gap. Conclusion holds, now on solid ground: TV80 is exonerated, full stop.
+
+Caught by direct question, not by further digging: the previous update's
+`OPTRACE` audit was bounded to `dbg_frame` 5-30 — but the actual PC-divergence
+*event* this whole thread exists to explain happens at frame 44-45 (per the
+`PCTRACE` diff, several updates back). An audit that stops at frame 30 proves
+TV80 is correct for the *lead-up* to the branch point, not for the branch
+point itself. Concluding "TV80 is exonerated" from that data, and pivoting to
+distrust the measurement instead, was an overreach — the original frame-60
+sprite-RAM mismatch that started this entire thread, and the `PCTRACE` event
+that corroborated it, are not explained away by a hypothetical sampling-
+instant artifact in a *different* set of probes: a few T-states of jitter in
+when `register_periodic` fires would produce a small, constant skew in
+frame-keyed comparisons, not the CPU landing on a completely different
+subroutine and staying decorrelated for the rest of the run. That structural
+divergence is real regardless of any probe-timing question. The right next
+step was always to finish the audit through the actual branch point, not to
+go looking for a reason to distrust the finding.
+
+### Extending the audit through frame 44-45
+
+Widened `OPTRACE`'s frame window in `rtl/z80_3d.v` from `5..30` to `5..48`
+(covering the branch point with margin) and reran. This surfaced a much wider
+variety of opcodes than the first pass (the code on both sides of the branch
+point differs, so naturally exercises more of the ROM), which meant
+substantially filling out `tools/z80_tstate_check.py`'s tables:
+
+- Filled in ~60 more unprefixed base opcodes (loads, arithmetic, more
+  conditional branches: `JR NC/C`, `RET NC/C/PO/PE/P/M`, `JP P/M,nn`,
+  `CALL cc,nn`).
+- Found and fixed a real **bug in the checker itself** (not TV80): the
+  block-instruction classifier for `ED`-prefixed `LDIR`/`CPIR`/`INIR`/`OTIR`
+  and their variants had grouped opcodes by the wrong axis (row instead of
+  column in the standard 4x4 block-instruction opcode grid), which would have
+  silently forced `CPIR`/`INIR`/`OTIR`/`CPDR`/`INDR`/`OTDR` to always report
+  16T (the "final iteration" cost) even when they were genuinely repeating
+  and should cost 21T. This ROM never exercises those specific opcodes (only
+  `LDIR`/`LDDR`/`LDD` appear, confirmed against the actual `ED` second-bytes
+  in the trace), so it didn't corrupt this particular result, but it would
+  have for a different ROM — worth having caught and fixed regardless.
+- Added the remaining `DD`/`FD`-prefixed (`IX`/`IY`) forms actually used
+  (`LD IX,nn`, `INC (IX+d)`, several `LD r,(IX+d)`/`LD (IX+d),r` forms,
+  `ADD IX,BC`), plus a documented fallback for undocumented DD/FD-prefixed
+  forms that don't touch `H`/`L`/`(HL)` at all (e.g. `DD 06 n` = `LD B,n`
+  with a wasted prefix byte): those cost exactly the plain unprefixed
+  instruction's T-states plus 4, which the script now derives automatically
+  from the `BASE` table instead of needing each one hand-listed.
+- Spot-checked the `DD/FD CB d op` (4-byte `(IX+d)` bit/rotate/set) group
+  empirically rather than assuming: confirmed it's genuinely only 2 M1/
+  `OPTRACE` events per instruction (prefix, then one more event whose
+  measured T-states already include the displacement byte, the real opcode
+  byte, and execution — TV80 does *not* emit a phantom third M1 for the CB
+  byte here, matching real Z80 M1 pin behavior for this specific group,
+  unlike plain unprefixed `CB xx` where the second byte genuinely is its own
+  M1 cycle). One instance measured 4+16=20T, exactly spec for
+  `BIT b,(IX+d)`. Since the 4th byte (the actual bit-index/register-target
+  nibble) is consumed as data and never fetched via M1, it can't be
+  individually decoded from this trace — the checker instead does a coarse
+  check that the total is one of the two valid values for this whole group
+  (20T for `BIT`, 23T for everything else: rotates, `RES`, `SET`).
+
+### Result: full coverage, zero mismatches
+
+```
+total logical instructions: 551256
+  ok (matched spec):        551212
+  skipped (irq in window):  44
+  skipped (unknown opcode): 0
+  MISMATCHES:                0
+```
+
+Every logical instruction across the *entire* frame 5-48 window — including
+frames 44 and 45, the exact frames where `PCTRACE` shows sim and MAME's
+execution paths actually split — matches the Zilog Z80 spec exactly. This is
+no longer a partial result with an acknowledged gap: it is now a complete,
+opcode-by-opcode audit of everything TV80 executes across the whole
+divergence window, branch point included, and it found nothing wrong.
+
+### Where this actually leaves the investigation
+
+TV80 is exonerated for real this time — not "exonerated pending a probe-
+validation check," just exonerated. Combined with the already-verified clock
+ratio and interrupt cadence, there is no remaining CPU-core-side explanation
+left to check for why sim's execution and MAME's execution part ways at frame
+44-45. Two candidate directions remain, genuinely open, neither yet
+investigated:
+
+1. **The measurement-instant question** (`register_periodic` vs.
+   `vblank_rise` T-state alignment) is still worth checking — not because it
+   was ever likely to explain away the whole divergence (per the correction
+   above, it can't produce a structural branch-point split), but because it
+   could still explain the *specific magnitude/timing* of when the drift
+   crosses the loop's exit boundary, compounding on top of a real but
+   separate cause.
+2. **Something outside the CPU core entirely**: RAM initial contents at
+   power-on, DIP-switch/port read differences between the two harnesses,
+   sub-CPU timing feeding into shared state the main CPU reads, or some
+   other non-CPU-cycle-accuracy difference in what each side's Z80 actually
+   sees on its data bus at the same wall-clock instant, causing it to
+   compute a genuinely different result even while executing at a perfectly
+   correct, spec-matching rate. Given (1) and full CPU-core cycle-accuracy
+   are now both accounted for, this is the next place to look: diff what
+   each side's CPU actually *reads* (not just how fast it runs) in the
+   frames leading up to 44-45, e.g. instrument every I/O/RAM read the main
+   CPU performs and compare against the same reads MAME's CPU makes at the
+   same PC.
 artifact caught red-handed.

@@ -797,13 +797,19 @@ module z80_3d
     // the direct thing -- log every main-CPU instruction's measured T-state
     // cost and let an offline script (tools/z80_tstate_check.py) check each
     // one against the real Zilog Z80 timing tables. Bounded to a frame
-    // window (dbg_frame 5..30, comfortably spanning the frame-9-start of the
-    // busy-wait loop through several of its interrupts) to keep the log a
-    // manageable size -- unprefixed and CB-prefixed opcodes are both common
-    // in the code this window exercises (the ISR's 0x0e70+ chain uses CB
-    // opcodes, e.g. `cb 7e` = BIT 7,(HL)), so log the raw opcode byte
-    // un-interpreted and let the Python side decode it, rather than build a
-    // second copy of the Z80 opcode table in Verilog.
+    // window to keep the log a manageable size -- unprefixed and CB-prefixed
+    // opcodes are both common in the code this window exercises (the ISR's
+    // 0x0e70+ chain uses CB opcodes, e.g. `cb 7e` = BIT 7,(HL)), so log the
+    // raw opcode byte un-interpreted and let the Python side decode it,
+    // rather than build a second copy of the Z80 opcode table in Verilog.
+    //
+    // IMPORTANT: this window MUST extend through the actual PC-divergence
+    // event (frame 44-45, per PCTRACE) to be conclusive -- an earlier pass
+    // bounded this to dbg_frame 5..30 and found zero mismatches, but that
+    // only audits the *lead-up* to the branch point, not the branch point
+    // itself, so it couldn't actually rule out a TV80 bug as the cause of
+    // the divergence it was nominally investigating. 5..48 covers the whole
+    // lead-up plus the branch event with margin.
     //
     // Method: same "T-states between consecutive M1 fetches" technique as
     // the ISR-length attempt above, but reporting every instruction instead
@@ -818,7 +824,7 @@ module z80_3d
     reg         optrace_valid;
     always @(posedge clk) begin
         if (main_m1_fetch_rise) begin
-            if (optrace_valid && dbg_frame >= 5 && dbg_frame <= 30)
+            if (optrace_valid && dbg_frame >= 5 && dbg_frame <= 48)
                 $display("OPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
                           dbg_frame, optrace_pc, optrace_op, optrace_tstates, optrace_interrupted, cpu_a);
             optrace_pc          <= cpu_a;
