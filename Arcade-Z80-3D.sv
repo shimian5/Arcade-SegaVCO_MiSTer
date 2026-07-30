@@ -60,18 +60,30 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"-;",
+	// Every option below is listed so that the FIRST entry (status bit(s) =
+	// 0, which is what MiSTer boots with) is the FACTORY DIP setting, i.e.
+	// DSW1 = 0xC0 and DSW2 = 0x92 -- the PORT_DIPNAME defaults in
+	// buckrog's INPUT_PORTS_START (docs/reference/turbo.cpp). Where the
+	// factory setting is a 1 bit, the bit is INVERTED in the dsw1/dsw2
+	// assembly below rather than by reordering the labels, so each label
+	// keeps meaning what it says. Do not reorder these lists without
+	// flipping the matching inversion.
 	"P1,Dip Switches;",
+	"P1-,DSW1;",
 	"P1O[27:25],Coin A,1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C;",
 	"P1O[30:28],Coin B,1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C;",
-	"P1O[31],DSW1 SW1:7 (Unknown),On,Off;",
-	"P1O[32],DSW1 SW1:8 (Unknown),On,Off;",
+	"P1O[31],DSW1 SW1:7 (Unknown),Off,On;",
+	"P1O[32],DSW1 SW1:8 (Unknown),Off,On;",
+	"P1-,DSW2;",
 	"P1O[33],Collisions,On,Off (Cheat);",
-	"P1O[34],Accel By,Pedal,Button;",
+	"P1O[34],Accel By,Button,Pedal;",
 	"P1O[35],Best 5 Scores,On,Off;",
 	"P1O[36],Score Display,Off,On;",
-	"P1O[37],Difficulty,Hard,Normal;",
+	"P1O[37],Difficulty,Normal,Hard;",
 	"P1O[39:38],Lives,3,4,5,6;",
-	"P1O[40],Cabinet,Cockpit,Upright;",
+	"P1O[40],Cabinet,Upright,Cockpit;",
+	"-;",
+	"J1,Fire,Accel Fast,Accel Slow,Unused,Start 1P,Start 2P,Coin 1,Coin 2,Service;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -123,13 +135,37 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 // [8]=Start1 [9]=Start2 [10]=Coin1 [11]=Coin2 [12]=Service1 (the
 // start/coin/service extension bits used by other MiSTer arcade cores in
 // this style, e.g. the Donkey Kong core T80 was vendored from). All
-// active-low (idle = 1), matching MAME's ACTIVE_LOW convention -- pedal
-// (accel-by-pedal DSW mode) is not wired yet, only the button-accel bits.
+// active-low (idle = 1), matching MAME's ACTIVE_LOW convention.
+//
+// in0[5:4] are ACC.LO/ACC.HI (schematic sheet 4, PDF p32: two discrete
+// opto-isolated lines on the control connector). The same two wires serve
+// both accel modes -- SW2:2 only selects how the GAME reads them: fast/slow
+// buttons in Button mode (the factory setting, wired here), or an inverted
+// 2-bit Gray code from the pedal's opto pair in Pedal mode. No analog pedal
+// source is wired, so selecting Pedal in the OSD leaves the throttle dead.
 wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5], ~joystick_1[8], 3'b111};
-wire [7:0] in1 = {~joystick_0[10], ~joystick_0[11], ~joystick_0[12], 1'b1, ~joystick_0[8], ~joystick_0[4], ~joystick_0[1], ~joystick_0[0]};
+// NOTE in1[1:0]: MAME's IN1 is bit 0x01 = JOYSTICK_LEFT, bit 0x02 =
+// JOYSTICK_RIGHT (turbo.cpp INPUT_PORTS_START(buckrog)), which is the
+// OPPOSITE order from the MiSTer joystick convention above ([0]=Right,
+// [1]=Left). These two bits were previously wired straight through in
+// index order, which transposed the steering axis -- the ship (and with
+// it the starfield's lateral sweep) banked the wrong way for a given
+// stick direction. Cross them explicitly; do not "simplify" this back to
+// [1],[0] order.
+wire [7:0] in1 = {~joystick_0[10], ~joystick_0[11], ~joystick_0[12], 1'b1, ~joystick_0[8], ~joystick_0[4], ~joystick_0[0], ~joystick_0[1]};
 
-wire [7:0] dsw1 = {status[32], status[31], status[30:28], status[27:25]};
-wire [7:0] dsw2 = {status[40], status[39:38], status[37], status[36], status[35], status[34], status[33]};
+// DSW assembly. Bit positions are buckrog's DSW1/DSW2 as read through
+// port_2_r/port_3_r (the 4-bit bitswaps live in rtl/z80_3d.v, not here).
+//
+// SW1:7, SW1:8, "Accel by", "Difficulty" and "Cabinet" are INVERTED: their
+// factory setting is a 1 bit (DSW1 = 0xC0, DSW2 = 0x92 per
+// docs/reference/turbo.cpp), and MiSTer boots every status bit at 0. Without
+// the inversion the core came up as SW1:7/8=On, Accel by Pedal, Difficulty
+// HARD and Cabinet Cockpit -- three of them non-factory, and the Hard
+// default in particular made the game materially harder than the same ROM
+// in MAME. See docs/INVESTIGATION_sect2_reachability.md.
+wire [7:0] dsw1 = {~status[32], ~status[31], status[30:28], status[27:25]};
+wire [7:0] dsw2 = {~status[40], status[39:38], ~status[37], status[36], status[35], ~status[34], status[33]};
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
@@ -156,7 +192,23 @@ pll pll
 // download over HPS still works since it's independent of core reset, but
 // the CPU never executes) -- see docs/PLAN.md. Isolating the variable here
 // until that's confirmed one way or the other.
-wire reset = RESET | status[0] | buttons[1];
+// ioctl_download MUST be part of reset: the HPS streams the ROM blob into
+// the CPUs' program ROM/RAM arrays over many thousands of cycles, and
+// without holding the core in reset for that whole window both Z80s
+// free-run executing partially-written memory, then are never reset once
+// the download completes -- they simply continue from whatever arbitrary
+// state they reached. That produces nondeterministic, boot-to-boot-varying
+// corruption on real hardware (garbage sub-CPU state => wrong starfield
+// direction//placement) which is structurally INVISIBLE in simulation,
+// because sim/tb_z80_3d.cpp holds reset asserted across the entire
+// download and releases it afterwards. Keep this in sync with that
+// testbench behavior.
+//
+// (Distinct from the pll_locked experiment noted in docs/PLAN.md, which was
+// removed because a never-locking PLL would hold the core in reset forever.
+// ioctl_download is self-clearing when the transfer ends, so it cannot
+// wedge the core the same way.)
+wire reset = RESET | status[0] | buttons[1] | ioctl_download;
 
 wire HBlank;
 wire HSync;

@@ -1,5 +1,95 @@
 # Sega Z80-3D MiSTer Core — Implementation Plan
 
+## Status — 2026-07-30: T80 removed, TV80 is now the only CPU core
+
+A fresh hardware build (session after the 2026-07-29 video-pipeline fixes)
+showed stars scattered across the whole play-field on real DE10-Nano
+hardware, not confined to the sky band as in MAME — this is "Symptom 1" from
+`docs/INVESTIGATION_title_logo_garbling.md` (flagged session 4, never
+root-caused). That doc's standing caveat was that **every simulation result
+in this whole investigation, including all the CPU/game-state divergence
+work, only ever exercised TV80** — `rtl/cpu_z80.v` hard-split on
+`` `ifdef VERILATOR_SIM ``, with real Quartus synthesis always building T80
+(VHDL) instead, a path that had never been simulated or cross-checked against
+MAME even once. That gap made it structurally impossible to tell whether a
+hardware-only discrepancy was a T80 bug/divergence or something else.
+
+Rather than stand up a second (ModelSim) simulation path just to be able to
+compare T80 against TV80, removed T80 entirely: `rtl/cpu_z80.v` now always
+instantiates `tv80_core` (no `` `ifdef `` branch), `rtl/T80/` (all 17 VHDL
+files) is deleted, and both `Arcade-Z80-3D.qsf`/`files.qip` point Quartus at
+`rtl/tv80/rtl/core/{tv80_core,tv80_alu,tv80_mcode,tv80_reg}.v` instead of the
+T80 VHDL file set. One CPU core for both sim and synthesis means every sim
+result is now real evidence about hardware behavior, with no more "unexercised
+path" caveat to carry forward. Verified: Verilator sim rebuilds and runs clean
+(`RASTER ALIGNMENT: 0/69273600` deviations, unchanged from before — sim
+already ran TV80, so no behavior change expected there), and a synthesis-only
+`quartus_map` pass succeeds 0 errors (1415 RAM segments, vs. 1372 with T80 —
+an expected shift from swapping cores, not an error). Not yet re-tested on
+real DE10-Nano hardware; that's the step that will actually tell us whether
+this closes out the star-extent symptom or whether it was a game-state/content
+bug independent of which CPU core runs it.
+
+**UPDATE 2026-07-30, same day: hardware retest with TV80 fixed the star
+overflow but surfaced two new hardware-only symptoms.** A fresh TV80
+bitstream on the DE10-Nano no longer shows stars below the sky band (the
+original fix goal), but (1) the game now runs measurably faster than MAME —
+stars scroll at what the user described as "warp speed" — and stars now
+overflow onto the title screen; and (2) attract-mode demo play rarely
+advances to the second attract sector (MAME's demo reaches `SECT.2`, hardware
+stays on `SECT.1`).
+
+**Speed issue — investigated, not reproduced in sim, cause still open.**
+Checked and ruled out:
+- **Timing closure**: a full clean `quartus_sh --flow compile` (synth + fit
+  + assembler + TimeQuest) with the TV80-only project shows positive slack
+  on every setup/hold/recovery/removal/pulse-width check — no negative-slack
+  paths. TV80's bigger combinational logic is not failing to close timing at
+  39.936 MHz.
+- **`cen` generation**: `rtl/z80_3d.v`'s `ce_z80` (the Z80 clock enable both
+  CPUs share) is an unconditional free-running `/8` counter gated only by
+  `reset` — no dependency on CPU bus signals (`wait_n`/`busak_n`/etc), so it
+  delivers the identical pulse rate regardless of which CPU core is behind
+  it. Not a plausible source of a CPU-specific speed difference.
+- **RTL/CPU logic bug**: ran sim 900 frames deep (~15 real seconds, far
+  beyond anything tested before — every prior TV80 audit only covered the
+  first ~45 frames) with the exact same TV80 RTL now on hardware. Result:
+  clean gameplay throughout, stars stay confined to the sky at every frame
+  checked (420/500/600/700/800/899), game naturally reaches GAME OVER with
+  no overflow onto text, no runaway speed. **The symptom does not reproduce
+  in sim** despite sim and hardware now running byte-identical CPU RTL —
+  meaning this is very unlikely to be a CPU/RTL logic bug.
+
+Two remaining hypotheses, neither yet checked: (a) the two hardware
+screenshots this session were captured through a WebRTC stream showing
+different client-side frame rates ("30 dyn.fps" vs "61 dyn.fps" between the
+two captures) — a variable/higher capture rate could make fixed 60Hz core
+output look faster without any core-side bug; (b) if the board is genuinely
+running fast independent of capture, that points at PLL/clock-generation
+hardware (untouched by the T80→TV80 change), not CPU logic. Next step:
+confirm whether the speed issue is visible watching the MiSTer directly on a
+display (not through the WebRTC capture) to distinguish (a) from (b).
+
+**Second attract-sector issue — investigated, one defect fixed, one thread
+open.** See `docs/INVESTIGATION_sect2_reachability.md`. Independent of the
+speed issue. The core's OSD DIP defaults were three notches off factory
+(`Arcade-Z80-3D.sv` listed every option non-factory-first, so `status[] = 0`
+gave DSW1/DSW2 = `00/00` against the factory `C0/92`): Difficulty shipped as
+**Hard**, Cabinet as **Cockpit**, and Accel-by as **Pedal** — the last of
+which leaves the accel buttons wired to a mode where the game reads them as
+pedal Gray-code transitions instead of a throttle. Fixed by inverting the
+affected bits in the `dsw1`/`dsw2` assembly (labels keep their meaning) and
+adding the missing `J1,...` control-definition line so buttons are mappable
+at all. DIP bit order and the IN0/IN1 assignment were re-verified pin-by-pin
+against schematic sheet 4 (PDF p32) and were already correct in RTL.
+Measured, no player input, 1400 frames: at factory `C0/92` sim and MAME agree
+closely (deaths 473/683 vs 451/745); Difficulty=Hard alone moves MAME's own
+game-over from 915 to 801. **Still open:** at `00/00` the two engines
+genuinely diverge (sim game-over 1271, three lives lost; MAME loses one and
+survives past 1400) on identical DIP bytes — the fix removes the config that
+exposes it rather than explaining it.
+bug independent of which CPU core runs it.
+
 ## Status — 2026-07-28
 
 **Phase 0 done. Phase 1a done** (Buck Rogers `buckrogn` attract-mode text +
@@ -53,10 +143,18 @@ stubs), i8279 (`d800-d801`), real IN0/IN1/DSW reads (`e800-e803`, wired from
 `Arcade-Z80-3D.sv`'s hps_io joystick/OSD machinery), a registered-read
 `bgcolorrom` BRAM off the shared road/bgcolor download slot, and the mixer's
 remaining two branches (star, bgcolor) plus the real fg-tier-2 gate. The
-main↔sub protocol is exactly the plan's three-step version (command register
-= PPI0 port A, `/INT` = PPI0 port C bit 7 directly, ACK = a dedicated flag
-overriding port C bit 6's readback) — MAME's `delayed_i8255_w`/600 Hz-quantum
-scheduling was **not** reproduced, per the plan (no hardware analogue).
+main↔sub protocol was originally implemented as the plan's three-step version
+(command register = PPI0 port A, `/INT` = PPI0 port C bit 7 as a plain data
+latch, ACK = a dedicated flag overriding port C bit 6's readback). **That was
+wrong and has been replaced** — the plan's reading of it was mode-0 shaped,
+but the game programs PPI0 with control word `0xC0`, i.e. 8255 **group-A mode
+2**, where PC7 is the `/OBF` handshake output the chip asserts by itself on a
+port-A write and PC6 is the `/ACK` input from the sub CPU's `/IORQ`. Under the
+mode-0 model a command write never raised `/INT` at all and the sub CPU missed
+~92% of its commands. `rtl/io/i8255.v` now implements the mode-2 output
+handshake and the `ack_reg` override is gone. MAME's `delayed_i8255_w`/600 Hz-
+quantum scheduling is still **not** reproduced (that part genuinely has no
+hardware analogue). See `docs/INVESTIGATION_starfield_2x_speed.md`.
 Verified in `sim/`: `tb_z80_3d.cpp` now drives real IN0/IN1 and pulses
 coin-in then start1; the core boots, coins up, and reaches actual gameplay
 (HUD "TIME LEFT"/"UFO COUNT" bars, an enemy ship, the road scrolling) with a
@@ -433,9 +531,8 @@ the root cause of the garbling is still open — see
 | `docs/schematics/` | sound sheets 1-3 + assembly drawing rendered at 400 dpi |
 | `mra/{buckrogn,buckrog,turbo}.mra` | done — `tools/gen_mra.py`, all CRCs verified byte-for-byte against the real MAME zips |
 | MiSTer template scaffolding (`sys/`, `Arcade-Z80-3D.{sv,qpf,qsf,sdc,srf}`, `files.qip`) | done — pulled as-is from `C:\MiSTerDev\Template_MiSTer`; `sys/` untouched |
-| `rtl/T80/` | done — Sorgelig's T80 v350, vendored (plain files, not a submodule) from `Arcade-DonkeyKong_MiSTer`, for real synthesis |
-| `rtl/tv80/` | done — hutch31/tv80 (pure Verilog Z80), vendored from `SuperOffRoad_MiSTer`, **simulation only** |
-| `rtl/cpu_z80.v` | done — wraps T80 (synthesis) / TV80 (Verilator sim) behind one interface |
+| `rtl/tv80/` | done — hutch31/tv80 (pure Verilog Z80), vendored from `SuperOffRoad_MiSTer`; now the **only** CPU core (synthesis and Verilator sim both), see 2026-07-30 status entry above |
+| `rtl/cpu_z80.v` | done — wraps `tv80_core` behind one interface; `rtl/T80/` (VHDL) removed 2026-07-30 |
 | `rtl/rom_download.v`, `rtl/video/video_timing.v`, `rtl/video/fg_tilemap.v`, `rtl/z80_3d.v` | done — phase 1a scope (see below) |
 | `rtl/video/sprite_engine.v` | done in sim (phase 1b) — see above; **synthesizes clean** as of 2026-07-29 (see the build note below) |
 | `rtl/io/i8255.v`, `rtl/io/i8279.v` | done (phase 1c) — see above |
