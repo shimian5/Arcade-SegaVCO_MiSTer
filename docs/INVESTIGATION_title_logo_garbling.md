@@ -434,3 +434,72 @@ upper band while hardware's has them all the way down to the wall — i.e. the
 star-density work was validated in sim against TV80; hardware runs **T80**, a
 CPU path no simulation result in this document has ever exercised. Treat it as a
 separate thread.
+
+### Raw evidence for the session-4 measurement, and the instruments
+
+Both instruments are committed, so this is reproducible rather than a one-off
+scrape. Neither existed before this session, and their absence is why the bug
+survived four sessions.
+
+**`tools/mame/dump_vram.lua`** — dumps `c000-c7ff` (32x32 tile codes),
+`e400-e47f` (16 sprite slots) and `e000-e0ff` (sprite-position RAM) off the main
+CPU at a chosen frame. Frame 60 is the attract "GAME OVER / INSERT COIN" state.
+Output at that frame, rows 6-23, is unambiguous — the tunnel is in the tilemap:
+
+```
+row  6: b0 b1 80 80 ... 80 80 ae af
+row 10: 98 9a 99 98 9b 9c 9b 9c b6 b7 80 ... 80 a8 a9 96 97 96 97 98 99 9a 98
+row 14: 98 9a 99 98 9b 9c 9b 9c 9d 9d 9e 9f a0 a1 a2 be bf 90 91 92 93 94 95 95 96 97 96 97 98 99 9a 98
+row 22: e0 e0 e0 e0 e0 e0 e0 e3 e0 ... e0 ec e0 e0 e0 e0 e0 e0
+```
+
+0x80 is the blank/sky tile, the 0x90-0xcf run is the striped wall art (note the
+mirrored left/right flanks, and repeating pairs like `9b 9c` / `96 97`), 0xe0 is
+the floor fill. Sprite RAM at the same frame holds only the UFO, the ship, the
+explosion and the HUD bars — nothing wall-shaped.
+
+**`tools/measure_wall_profile.py`** — normalises any capture (hardware photo,
+MAME PPM, `sim/out/*.ppm`) onto the native 512x224 output grid and prints the
+first wall scanline per output column, then flags columns that jump *backwards*
+against the local trend. On the DE10-Nano capture, columns 0-79:
+
+```
+top :  -- 49 49 49 49 49 49 51 51 51 51 51 52 52 52 [49 49] 53 53 53 54 54 54 55 55 55 55 55 56 56 56 [53 53]
+       57 57 57 58 58 58 59 59 59 59 59 60 60 60 [57 57] 61 61 61 62 62 62 63 63 63 63 63 64 64 64 [61 61] 65 ...
+cls :   -  G  G  G  G  G  G  G  G  G  G  G  G  G  G   G  G   T  T  T  T ...
+
+backward notches at x = [15, 31, 47, 63, 79]
+  x mod 16 = [15, 15, 15, 15, 15]
+  spacing  = [16, 16, 16, 16]
+```
+
+Read that carefully, because every number in it is load-bearing:
+
+- The ramp advances **4 scanlines per 16 output pixels** — the cornice diagonal.
+- Each bracketed notch jumps back to **exactly the value the ramp held 16 output
+  pixels earlier** (x=31 reads 53, which is the x=17-19 value; x=47 reads 57,
+  the x=33-35 value; x=63 reads 61, the x=49-51 value). It is not noise and it
+  is not a rounding artifact of the capture: it is one specific neighbouring
+  tile column's art, reproduced exactly.
+- Notch **spacing 16 output pixels = one 8-pixel tile column**; notch **width 2
+  output pixels = one native pixel**.
+- The notches straddle the boundary (x ≡ 15, 0 mod 16), i.e. the last sub-pixel
+  of one native pixel and the first of the next — which is what a 3-clk skew
+  inside an 8-clk native pixel produces, and is *not* what a whole-pixel layer
+  offset would produce.
+- The notches occur at tile boundaries **regardless of whether the stripe colour
+  changes there** (x=31 and x=47 are both interior to the teal run), so this is
+  a fetch-geometry error, not a colour-table or opacity error.
+
+Run the same tool on a MAME capture of the same state as the control: the
+profile is monotonic, no notches.
+
+### One caveat to carry forward: hardware runs T80, simulation runs TV80
+
+Every simulation result in this document comes from TV80 (`rtl/cpu_z80.v`'s
+`VERILATOR_SIM` path); the DE10-Nano bitstream builds T80. That path has never
+been simulated and never cross-checked. It does not affect the video-pipeline
+theory above — that defect is in RTL that both builds share, is independent of
+the CPU, and should reproduce in sim the moment a wall-bearing frame is diffed
+(confirmation step 3). But it is the obvious first suspect for symptom 1, and it
+means "sim is clean" is a weaker statement about hardware than it looks.
