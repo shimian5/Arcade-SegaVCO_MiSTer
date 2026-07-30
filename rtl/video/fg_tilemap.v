@@ -9,13 +9,20 @@
 // PIPELINE: VRAM/tile-ROM/PROM reads are registered (synchronous, one clk of
 // latency each) so Quartus infers real M10K block RAM instead of a giant
 // combinational mux. That gives foreraw a fixed 4-clk latency behind xx/y.
-// This is safe without any Z80-style wait-state handling because xx/y are
-// only fed by the 2x-scale video pipeline, which holds each native (xx,y)
-// pair stable for 8 clk cycles (2 output pixels x 4 clk/pixel) -- comfortably
-// longer than this 4-stage fetch. z80_3d.v delay-matches hblank/vblank/hsync
-// /vsync/ce_pix by the same total pipeline depth (this module's 4, plus its
-// own color-table and palette lookups) so the sync bundle stays aligned with
-// the pixel data it describes. See FG_TILEMAP_LATENCY below.
+// xx/y are only fed by the 2x-scale video pipeline, which holds each native
+// (xx,y) pair stable for 8 clk cycles (2 output pixels x 4 clk/pixel) --
+// comfortably longer than this 4-stage fetch, BUT each stage below samples a
+// different field of the *live* xx/y a clock apart (col from xx[7:3] at t,
+// row from y[7:3] at t+1, row-within-tile from y[2:0] at t+2, pixel-within-
+// tile from xx[2:0] at t+3). For 3 of every 8 clk phases -- i.e. at every
+// native-pixel boundary -- those fields disagree by one native pixel, which
+// renders the leftmost pixel of the wrong (neighbouring) tile column. To
+// avoid that, xx/y are captured once at stage 1 and threaded through a delay
+// chain so every stage consumes the SAME (xx,y) sample. z80_3d.v
+// delay-matches hblank/vblank/hsync/vsync/ce_pix by the same total pipeline
+// depth (this module's 4, plus its own color-table and palette lookups) so
+// the sync bundle stays aligned with the pixel data it describes. See
+// FG_TILEMAP_LATENCY below.
 module fg_tilemap
 (
     input  wire        clk,
@@ -55,19 +62,31 @@ module fg_tilemap
         cpu_rdata <= vram[cpu_addr];
     end
 
+    // Coordinate delay chain: every stage below must consume the SAME
+    // (xx,y) sample that stage 1 used, not whatever xx/y is live on the
+    // stage's own clock. Capture xx/y once here and re-time each field by
+    // exactly the number of stages it lags behind stage 1.
+    reg [7:0] xx_d1, xx_d2, xx_d3;
+    reg [7:0] y_d1, y_d2;
+    always @(posedge clk) begin
+        xx_d1 <= xx;    xx_d2 <= xx_d1;    xx_d3 <= xx_d2;
+        y_d1  <= y;     y_d2  <= y_d1;
+    end
+
     // Stage 1: X-shift PROM lookup -> tile column
     wire [4:0] col_raw = xx[7:3] - 5'd1;          // (xx>>3)-1, wraps mod 32
     reg  [7:0] xshift_dout;
     always @(posedge clk) xshift_dout <= xshift_rom[col_raw];
 
-    // Stage 2: VRAM lookup -> tile code
+    // Stage 2: VRAM lookup -> tile code (y delayed 1 to match stage 1's xx sample)
     wire [4:0] col   = xshift_dout[4:0];
-    wire [9:0] vaddr = {y[7:3], col};             // row*32 + col
+    wire [9:0] vaddr = {y_d1[7:3], col};          // row*32 + col
     reg  [7:0] vram_dout;
     always @(posedge clk) vram_dout <= vram[vaddr];
 
     // Stage 3: tile ROM lookup (both planes) -> pixel planes + latched code
-    wire [10:0] rom_row = {vram_dout, y[2:0]};    // code*8 + py
+    // (y delayed 2 to match stage 1's xx sample)
+    wire [10:0] rom_row = {vram_dout, y_d2[2:0]}; // code*8 + py
     reg  [7:0]  plane0_dout, plane1_dout, code_dout;
     always @(posedge clk) begin
         plane0_dout <= tile_rom[rom_row];
@@ -76,8 +95,9 @@ module fg_tilemap
     end
 
     // Stage 4: bit-select + pack (color*4 + pixel)
-    wire       bit0  = plane0_dout[3'd7 - xx[2:0]];
-    wire       bit1  = plane1_dout[3'd7 - xx[2:0]];
+    // (xx delayed 3 to match stage 1's xx sample)
+    wire       bit0  = plane0_dout[3'd7 - xx_d3[2:0]];
+    wire       bit1  = plane1_dout[3'd7 - xx_d3[2:0]];
     wire [5:0] color = code_dout[7:2];
     reg  [7:0] foreraw_reg;
     always @(posedge clk) foreraw_reg <= {color, bit1, bit0};

@@ -443,7 +443,31 @@ module sprite_engine
     genvar lvl;
     generate
         for (lvl = 0; lvl < 8; lvl = lvl + 1) begin : levels
-            assign rom_raddr[lvl] = offset_reg[lvl][ROM_ADDR_BITS:1];
+            // rom_raddr must be driven from a REGISTER captured at fire time
+            // (fetch_addr_reg), not combinationally off the live offset_reg.
+            // offset_reg[lvl] advances to its POST-increment value at the
+            // very same edge as the fire that's supposed to fetch the
+            // PRE-increment byte -- if rom_raddr tracked offset_reg live, it
+            // would follow that same-edge increment and re-address the ROM
+            // to the NEXT offset starting the very next clock, well before
+            // fire_pending consumes the result a full active_pix period
+            // later. That consumption would then see the *next* generation's
+            // byte instead of the one this fire actually meant to fetch --
+            // not an occasional race, but the steady-state behaviour any
+            // time two fires are more than 1 clock apart (i.e. always,
+            // since a period is 4 clocks and X-scale never fires that
+          // fast). Net effect: every level's displayed sprite data runs a
+            // fixed, whole-generation ahead of MAME's reference timing --
+            // confirmed empirically as a constant 2-native-pixel-early
+            // reveal via an exhaustive shift search against
+            // sim/golden_buckrog.py (session 6 continuation, see
+            // docs/INVESTIGATION_title_logo_garbling.md). Freezing the
+            // fetch address at fire time (like sprite-position RAM's own
+            // pos_prefetch_addr latch) keeps rom_raddr -- and hence
+            // rom_dout -- stable for the entire period until the NEXT fire,
+            // so consumption always sees the byte this fire actually meant.
+            reg [ROM_ADDR_BITS-1:0] fetch_addr_reg;
+            assign rom_raddr[lvl] = fetch_addr_reg;
 
             wire        live     = lst_eff[lvl];
             wire [32:0] frac_sum = {1'b0, frac_reg[lvl]} + {1'b0, step_reg[lvl]};
@@ -460,9 +484,22 @@ module sprite_engine
             // so Quartus sees a single driver per register.
             wire commit_now = commit_pulse && (commit_level == lvl[2:0]);
 
+            // offset_next: the post-increment offset a fire this cycle commits
+            // to offset_reg[lvl], for the FOLLOWING fire to fetch from.
+            // THIS fire's own fetch uses the current (pre-increment)
+            // offset_reg[lvl] -- captured into fetch_addr_reg/
+            // nibble_sel_pending below -- matching sim/golden_buckrog.py's
+            // `get_sprite_bits` (turbo_v.cpp), which fetches with `offs =
+            // st["offset"]` and only increments afterward.
+            wire [OFFSET_WIDTH-1:0] offset_next =
+                offset_reg[lvl] + (offset_reg[lvl][OFFSET_WIDTH-1] ?
+                                    {OFFSET_WIDTH{1'b1}} :
+                                    {{(OFFSET_WIDTH-1){1'b0}}, 1'b1});
+
             always @(posedge clk) begin
                 if (commit_now) begin
                     offset_reg[lvl]  <= commit_offset;
+                    fetch_addr_reg   <= commit_offset[ROM_ADDR_BITS:1];
                     step_reg[lvl]    <= commit_step;
                     frac_reg[lvl]    <= 32'd0;
                     latched_reg[lvl] <= 32'd0;
@@ -472,10 +509,8 @@ module sprite_engine
                     if (live) begin
                         frac_reg[lvl] <= fire ? (frac_sum[31:0] - XSCALE_THRESHOLD) : frac_sum[31:0];
                         if (fire) begin
-                            offset_reg[lvl]         <= offset_reg[lvl] +
-                                                        (offset_reg[lvl][OFFSET_WIDTH-1] ?
-                                                         {OFFSET_WIDTH{1'b1}} :
-                                                         {{(OFFSET_WIDTH-1){1'b0}}, 1'b1});
+                            offset_reg[lvl]         <= offset_next;
+                            fetch_addr_reg          <= offset_reg[lvl][ROM_ADDR_BITS:1];
                             nibble_sel_pending[lvl] <= ~offset_reg[lvl][0];
                             fire_pending[lvl]       <= 1'b1;
                         end else begin
@@ -492,7 +527,23 @@ module sprite_engine
                 end
             end
 
-            assign latched_masked[lvl] = lst_eff[lvl] ? latched_reg[lvl] : 32'd0;
+            // Gate the OUTPUT on lst_active (registered), not lst_eff (which
+            // is lst_active | he_or_mask, and he_or_mask is combinationally
+            // nonzero for exactly the ix0 clock of the column boundary
+            // itself -- i.e. lst_eff answers "true a level's enable window
+            // opens" one whole active_pix period BEFORE lst_active latches
+            // that fact). golden_buckrog.py's model has no such distinction
+            // (`lst |= he` and its consumption are the same software step),
+            // so gating sprbits/plb on lst_eff shows freshly-activated
+            // levels' data one period earlier than MAME's reference timing
+            // -- empirically confirmed as a constant, exact 2-native-pixel
+            // early reveal for every fire once a level is live (sim session
+            // 6 continuation, docs/INVESTIGATION_title_logo_garbling.md).
+            // `live` (the fire-gating condition, above) intentionally keeps
+            // using lst_eff -- fire cadence was independently confirmed
+            // bit-exact against golden with that in place, so only the
+            // display path needed correcting.
+            assign latched_masked[lvl] = lst_active[lvl] ? latched_reg[lvl] : 32'd0;
         end
     endgenerate
 
@@ -508,7 +559,7 @@ module sprite_engine
 
     assign sprbits = latched_masked[0] | latched_masked[1] | latched_masked[2] | latched_masked[3] |
                       latched_masked[4] | latched_masked[5] | latched_masked[6] | latched_masked[7];
-    assign plb     = lst_eff & plb_bit_reg;
+    assign plb     = lst_active & plb_bit_reg;
 
     // ------------------------------------------------------------------
     // VERILATOR_SIM debug instrumentation (see prompt for phase0-1a sprite

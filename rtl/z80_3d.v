@@ -539,18 +539,26 @@ module z80_3d
     always @(posedge clk) forebits_reg <= color_table[color_addr];
 
     // sprbits/plb are real-time (0-latency vs. hpos/vpos, see
-    // sprite_engine.v's header) -- delay by 5 clk to land on the same
-    // pipeline stage as forebits_reg (fg_tilemap's 4 + this module's
-    // color_table stage = 5).
-    localparam SPR_TO_MIX_DELAY = 5;
+    // sprite_engine.v's header). forebits_reg lands on foreraw's stage +1
+    // (fg_tilemap's 4 + this module's color_table stage = 5), but that total
+    // is 1.25 output pixels (ce_pix = clk/4): every input feeding the final
+    // palbits mux must land on the SAME whole number of pixels from a common
+    // origin cycle, or the mixer combines a stale layer with a fresh one for
+    // 1 clk out of every 4 -- exactly the sub-pixel skew that garbles
+    // multi-colour sprites while leaving solid-colour ones untouched (no
+    // interior pixel boundary to get wrong). Delay by 7 clk (an extra 2
+    // beyond the 5 needed to just reach forebits_reg's stage) so this path's
+    // total -- 7 + this module's sprcolor_table stage = 8 clk = 2 whole
+    // pixels -- matches the fg-tier path once it's also re-timed to 8 below.
+    localparam SPR_TO_MIX_DELAY = 7;
     reg [39:0] spr_pipe [0:SPR_TO_MIX_DELAY-1];
     integer si;
     always @(posedge clk) begin
         spr_pipe[0] <= {sprbits, spr_plb};
         for (si = 1; si < SPR_TO_MIX_DELAY; si = si + 1) spr_pipe[si] <= spr_pipe[si-1];
     end
-    wire [31:0] sprbits_d5 = spr_pipe[SPR_TO_MIX_DELAY-1][39:8];
-    wire [7:0]  plb_d5     = spr_pipe[SPR_TO_MIX_DELAY-1][7:0];
+    wire [31:0] sprbits_d7 = spr_pipe[SPR_TO_MIX_DELAY-1][39:8];
+    wire [7:0]  plb_d7     = spr_pipe[SPR_TO_MIX_DELAY-1][7:0];
 
     // LS148 priority encoder: index of the lowest-numbered set bit in plb
     // (0-7), or 4'hf if plb==0 -- equivalent to MAME's
@@ -573,49 +581,56 @@ module z80_3d
         end
     endfunction
 
-    wire [3:0]  mux             = find_lsb(plb_d5);
-    wire [31:0] sprbits_shifted = sprbits_d5 >> mux[2:0];
+    wire [3:0]  mux             = find_lsb(plb_d7);
+    wire [31:0] sprbits_shifted = sprbits_d7 >> mux[2:0];
     wire [3:0]  cd              = {sprbits_shifted[24], sprbits_shifted[16], sprbits_shifted[8], sprbits_shifted[0]};
 
     reg [7:0] sprcolor_dout;
     always @(posedge clk) sprcolor_dout <= sprcolor_table[{obch, mux[2:0], cd}];
 
     // One more register stage on the fg-tier-1 path + mux so both operands
-    // of the final select land on sprcolor_dout's cycle (+6: the +5 above,
-    // plus this module's own sprcolor_table read).
-    reg [7:0] forebits_reg2;
+    // of the final select land on sprcolor_dout's cycle (+8: the +7 above,
+    // plus this module's own sprcolor_table read). forebits_reg is only 5
+    // clk deep (fg_tilemap's 4 + color_table's 1), so it needs 3 more
+    // register hops -- not 1 -- to reach the same 8-clk/2-pixel total; the
+    // extra 2 are forebits_reg3/forebits_reg4 below.
+    reg [7:0] forebits_reg2, forebits_reg3, forebits_reg4;
     reg [3:0] mux_reg;
     always @(posedge clk) begin
         forebits_reg2 <= forebits_reg;
+        forebits_reg3 <= forebits_reg2;
+        forebits_reg4 <= forebits_reg3;
         mux_reg       <= mux;
     end
 
     // Star (bitmap RAM) / bgcolor branches: both are addressed from
     // xx_native/y_native directly (like fg_tilemap's stage-0 input), not
     // from foreraw, so they need their own delay chain to land on the same
-    // pipeline stage (stage6, aligned with forebits_reg2/sprcolor_dout/
+    // pipeline stage (stage8, aligned with forebits_reg4/sprcolor_dout/
     // mux_reg above) as everything else feeding the final palbits mux.
-    // COORD_DELAY (5 regs) + the bitmap_ram/bgcolorrom read itself (1 reg)
-    // = 6 register hops from xx_native/y_native, matching forebits_reg2's
-    // 6 hops (fg_tilemap's 4 + color_table's 1 + forebits_reg2's 1) and
-    // sprcolor_dout/mux_reg's 6 hops (spr_pipe's 5 + 1) -- so this resolves
-    // within the existing 7-stage total pipeline depth without needing to
-    // bump VIDEO_PIPE_LATENCY.
-    localparam COORD_DELAY = 5;
+    // COORD_DELAY (7 regs) + the bitmap_ram/bgcolorrom read itself (1 reg)
+    // = 8 register hops from xx_native/y_native, matching forebits_reg4's
+    // 8 hops (fg_tilemap's 4 + color_table's 1 + forebits_reg2/3/4's 3) and
+    // sprcolor_dout/mux_reg's 8 hops (spr_pipe's 7 + 1). 8 clk = 2 whole
+    // output pixels (ce_pix = clk/4), so every input to the final palbits
+    // mux is pixel-aligned, not just clock-count-aligned -- see
+    // SPR_TO_MIX_DELAY's comment for why that distinction matters. This
+    // bumps VIDEO_PIPE_LATENCY below from 7 to 9 (8 + palette_rom's 1).
+    localparam COORD_DELAY = 7;
     reg [15:0] coord_pipe [0:COORD_DELAY-1];
     integer ci;
     always @(posedge clk) begin
         coord_pipe[0] <= {y_native, xx_native};
         for (ci = 1; ci < COORD_DELAY; ci = ci + 1) coord_pipe[ci] <= coord_pipe[ci-1];
     end
-    wire [7:0] y_d5  = coord_pipe[COORD_DELAY-1][15:8];
-    wire [7:0] xx_d5 = coord_pipe[COORD_DELAY-1][7:0];
+    wire [7:0] y_d7  = coord_pipe[COORD_DELAY-1][15:8];
+    wire [7:0] xx_d7 = coord_pipe[COORD_DELAY-1][7:0];
 
     reg star_bit;
-    always @(posedge clk) star_bit <= bitmap_ram[{y_d5, xx_d5}];
+    always @(posedge clk) star_bit <= bitmap_ram[{y_d7, xx_d7}];
 
     reg [7:0] bgcolor_reg;
-    always @(posedge clk) bgcolor_reg <= bgcolorrom[{mov[4:0], y_d5}];
+    always @(posedge clk) bgcolor_reg <= bgcolorrom[{mov[4:0], y_d7}];
 
     function [7:0] repack;
         input [7:0] f;
@@ -635,10 +650,10 @@ module z80_3d
         repack_bg = ({2'b00, p} & 10'h0c0) | (({2'b00, p} & 10'h030) << 4) | (({2'b00, p} & 10'h00f) << 2);
     endfunction
 
-    wire [9:0] palbits_fg = {2'b00, repack(forebits_reg2)};
-    wire [9:0] palbits = (!forebits_reg2[7]) ? palbits_fg :             // fg tier 1
+    wire [9:0] palbits_fg = {2'b00, repack(forebits_reg4)};
+    wire [9:0] palbits = (!forebits_reg4[7]) ? palbits_fg :             // fg tier 1
                           (!mux_reg[3])       ? {2'b00, sprcolor_dout} : // sprite
-                          (!forebits_reg2[6]) ? palbits_fg :             // fg tier 2
+                          (!forebits_reg4[6]) ? palbits_fg :             // fg tier 2
                           star_bit             ? 10'h0ff :                // bitmap/star
                                                   repack_bg(bgcolor_reg);  // bgcolor
 
@@ -655,12 +670,13 @@ module z80_3d
     // ------------------------------------------------------------------
     // Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with
     // the pipeline latency above (fg_tilemap's 4 + color_table's 1 +
-    // sprcolor_table's 1 + palette_rom's 1 = 7; the star/bgcolor branches
-    // resolve within this same depth, see COORD_DELAY comment above), so
-    // the sync signals output alongside rgb_reg describe the same original
-    // hpos/vpos that produced it.
+    // forebits_reg2/3/4's 3 = 8 clk = 2 whole output pixels, matching
+    // sprcolor_dout/mux_reg's and the star/bgcolor branches' 8 hops, see
+    // SPR_TO_MIX_DELAY/COORD_DELAY comments above; + palette_rom's 1 = 9),
+    // so the sync signals output alongside rgb_reg describe the same
+    // original hpos/vpos that produced it.
     // ------------------------------------------------------------------
-    localparam VIDEO_PIPE_LATENCY = 7;
+    localparam VIDEO_PIPE_LATENCY = 9;
 
     reg [VIDEO_PIPE_LATENCY-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
     always @(posedge clk) begin
@@ -702,9 +718,9 @@ module z80_3d
     end
     always @(posedge clk) begin
         if (ce_pix_pipe[VIDEO_PIPE_LATENCY-1] && !vblank_pipe[VIDEO_PIPE_LATENCY-1] && !hblank_pipe[VIDEO_PIPE_LATENCY-1]) begin
-            if (!forebits_reg2[7])      dbg_tier1  = dbg_tier1 + 1;
+            if (!forebits_reg4[7])      dbg_tier1  = dbg_tier1 + 1;
             else if (!mux_reg[3])       dbg_sprite = dbg_sprite + 1;
-            else if (!forebits_reg2[6]) dbg_tier2  = dbg_tier2 + 1;
+            else if (!forebits_reg4[6]) dbg_tier2  = dbg_tier2 + 1;
             else if (star_bit)          dbg_star   = dbg_star + 1;
             else                        dbg_bg     = dbg_bg + 1;
         end

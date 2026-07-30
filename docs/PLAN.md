@@ -266,20 +266,37 @@ authoritative status and it changes the prime suspect.** Summary:
   flagged contradiction that `CW0` appears wired straight to ROM `A0`; and
   the LS109 gating/VCO-phase-reset semantics (§8.2). Exact next-step crop
   commands are recorded in §7.4, §7.5, §7.6 and §8.2 of that doc.
-- ~~**Cosmetic/latent, fix after the real bug:**~~ **PROMOTED TO PRIME SUSPECT
-  2026-07-29 (session 4) — this classification was wrong.** `rtl/z80_3d.v:521-632`
-  mixer pipeline free-runs on `clk` not `ce_pix`, so `SPR_TO_MIX_DELAY`/
-  `COORD_DELAY`/`VIDEO_PIPE_LATENCY` are core clocks, not pixels. The dismissal
-  ("depths mutually consistent, so sub-pixel offset only") does not follow:
-  mutually consistent *core-clock* depths are not consistent *pixel* depths when
-  the pixel is 4 clocks wide and the delays are 5/6/7. The same defect class in
-  `rtl/video/fg_tilemap.v` (stage 1 samples `xx[7:3]`, stage 4 samples `xx[2:0]`,
-  three clocks apart, while `xx` advances every eight) has now been **measured on
-  a DE10-Nano capture**: a 1-native-pixel error at every tile column boundary,
-  which is the tunnel wall's ragged top edge. It also explains the logo/ship
-  garbling and, crucially, why a solid-colour sprite renders perfectly while
-  multi-colour artwork does not. See the last section of
+- ~~**Cosmetic/latent, fix after the real bug**~~ ~~**PROMOTED TO PRIME
+  SUSPECT**~~ **PARTIALLY FIXED 2026-07-29 (session 5) — background layer only,
+  sprite layer still garbled.** `rtl/video/fg_tilemap.v`'s four pipeline
+  stages now consume a single delay-chained `(xx,y)` sample instead of each
+  grabbing a different field of the live coordinate. `rtl/z80_3d.v`'s mixer
+  paths (`SPR_TO_MIX_DELAY`, `COORD_DELAY`, the fg-tier `forebits_reg2/3/4`
+  chain, `VIDEO_PIPE_LATENCY`) were re-timed from a 6-clk/1.5-pixel common
+  depth to an 8-clk/2-pixel one so every input to the final `palbits` mux
+  lands on the same whole output pixel. Verified with
+  `tools/measure_wall_profile.py` against a Verilator render of frame 60: the
+  tile-boundary notches previously at x=15,31,47,63,79 are gone, profile is
+  monotonic — **the tunnel-wall tearing and the star layer are both
+  confirmed fixed** (visually reviewed with the user against rendered sim
+  frames). Full `make -C sim run` (410 frames) reports
+  `RASTER ALIGNMENT: 0/69273600` deviations. **But the title logo (frame 150)
+  and the multi-colour UFO/ship sprites (frames 60, 155) are still visibly
+  torn** — same visual signature as before the fix, reviewed against rendered
+  sim frames, not just inferred. The session-4 theory (sub-pixel skew between
+  fg-tier and sprite-tier mixer inputs) evidently explains the *background*
+  tile-boundary defect but does not fully explain the *sprite*-layer one —
+  **revisit the sprite path next session**: either `sprite_engine.v` has its
+  own internal skew of the same class (a stage sampling a live coordinate
+  field instead of a captured one, analogous to the `fg_tilemap.v` bug just
+  fixed), or the mixer re-timing here still isn't landing the sprite layer on
+  the right pixel. Don't assume the fix here is relevant — check
+  `sprite_engine.v`'s internal pipeline fresh. See the last section of
   `docs/INVESTIGATION_title_logo_garbling.md` and `tools/measure_wall_profile.py`.
+  **Also not yet re-verified on real DE10-Nano hardware** for the part that
+  is fixed — the original defect was measured on a hardware capture, and the
+  sim fix should be confirmed against new hardware output before closing that
+  part out.
 - Genuinely cosmetic: `tools/gen_tables.py` R4 is silkscreened 3.9K, MAME
   hardcodes 3.8e3.
 
@@ -616,17 +633,30 @@ to leave in, off by default.
 
 **Next step:** phase 1c is done in sim (see above) but not yet hardware-
 hardened or fully bit-exact. Star density and the TV80 clocking bug are
-now fixed (2026-07-29, see above); a new sprite/mixer corruption bug
-(garbled title logo) was found while re-verifying visuals post-fix. Before
-starting phase 1d, in rough priority order:
+fixed; the tunnel-wall tile-boundary tearing and the star layer are now also
+fixed (2026-07-29 session 5, intra-pipeline coordinate skew — see above). The
+title-logo and UFO/ship sprite corruption is **fixed as of session 6**
+(2026-07-29): root cause was a one-fire-generation mismatch between the ROM
+nibble-select bit and the ROM byte address in `sprite_engine.v`'s
+`get_sprite_bits` path — `nibble_sel_pending` was derived from the
+pre-increment offset while the actual ROM fetch it paired with landed one
+clock later, always describing the post-increment offset; since offsets
+always alternate parity on each fire, this selected the wrong nibble half of
+the byte on every fetch, invisible only when both nibbles of a byte
+happened to match (flat-colour art) — see
+`docs/INVESTIGATION_title_logo_garbling.md`'s session-6 update for the full
+derivation and the (also real, separately fixed) sprite-dump instrument bug
+that had to be resolved first to see this clearly. Confirmed by re-rendering
+the logo (frame 150) and the UFO/ship (frames 60/155) sim frames: all three
+are now visually clean, with no regression to the session-5 wall/star fix.
+A small residual (~2-native-pixel-early turn-on at some sprite-region
+leading edges, not a colour-correctness issue) remains open — see the
+investigation doc's "Remaining open item". Before starting phase 1d, in
+rough priority order:
 
-1. **Root-cause and fix the garbled title-logo sprite bug** (new, see
-   above) — multi-color/multi-level sprite compositing is suspect
-   (`sprite_engine.v` and/or `mixer_buckrog.v`); a simple solid-color
-   sprite (HUD bar) renders correctly, so this isn't a wholesale sprite-
-   engine failure. Also re-check the previously-reported UFO/ship sprite
-   distortion once this is understood (that report predates the clocking
-   fix, may be the same bug or may already be resolved).
+1. Close out the residual sprite leading-edge timing item above (low
+   priority — visually clean already, but blocks calling the sprite path
+   bit-exact against MAME).
 2. Build real frame-diff tooling (`sim/*.ppm` vs. `mame buckrogn -snapshot`,
    pixel-diffed, not eyeballed) and get the sprite engine (phase 1b) and
    full mixer (phase 1c) to bit-exact, not just visually-plausible-and-

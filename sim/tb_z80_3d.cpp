@@ -128,26 +128,39 @@ int main(int argc, char **argv)
     // dbg_hpos/dbg_vpos ports every ce_pix. See the RASTER ALIGNMENT report
     // printed at the end of the run.
     //
-    // MEASURED (not assumed) relationship, established by dumping
-    // (tick, tbx, tby, hpos, vpos) for the first ~700 ce_pix ticks of a run
-    // (spanning the x=639->0 wrap and the following hpos=639->0 wrap) and
-    // reading the pattern off directly:
-    //   - hpos/vpos is a raster-order-delayed replica of the tb's own (x,y),
-    //     lagging by a CONSTANT 4 ce_pix ticks -- i.e. the whole (x,y) pair
-    //     is shifted, not just one axis. Confirmed across the x wrap: tbx
-    //     wraps 639->0 (tby 0->1) at tick 2543, and hpos independently wraps
-    //     639->0 (vpos 0->1) exactly 4 ticks later at tick 2559 -- the same
-    //     4-tick lag holds through the wrap, so this is one delay line over
-    //     the coordinate pair, not two independent per-axis offsets.
+    // MEASURED (not assumed) relationship: `top->ce_pix` is z80_3d.v's
+    // *delayed* ce_pix (ce_pix_pipe[VIDEO_PIPE_LATENCY-1], deliberately
+    // re-timed to line up with rgb_reg), and this tb's x/y only advance when
+    // that delayed pulse fires -- so the lag between tb's (x,y) and the RTL's
+    // raw dbg_hpos/dbg_vpos is purely a simulation-harness artifact of that
+    // choice, not a hardware timing fact from the schematic. It tracks
+    // VIDEO_PIPE_LATENCY, but NOT by a simple additive delta: it was 4
+    // ce_pix ticks when VIDEO_PIPE_LATENCY was 7 (fg_tilemap's 4 +
+    // color_table's 1 + sprcolor_table's 1 + palette_rom's 1), confirmed by
+    // dumping (tick, tbx, tby, hpos, vpos) for the first ~700 ce_pix ticks of
+    // a run (spanning the x=639->0 wrap and the following hpos=639->0 wrap):
+    // tbx wraps 639->0 (tby 0->1) at tick 2543, hpos wraps 639->0 (vpos 0->1)
+    // exactly 4 ticks later at tick 2559, and that 4-tick lag holds through
+    // the wrap (one delay line over the coordinate pair, not two independent
+    // per-axis offsets). VIDEO_PIPE_LATENCY became 9 when the fg-tier/
+    // sprite/star-bg mixer paths were re-timed from a 6-clk/1.5-pixel common
+    // depth to an 8-clk/2-pixel one (see z80_3d.v's SPR_TO_MIX_DELAY
+    // comment) -- naively that predicts lag 4+(9-7)=6, but re-measuring the
+    // same way gives 5, not 6 (RASTER_ALIGNMENT confirms 0/N deviations at
+    // 5). Re-derive by measurement, don't extrapolate, whenever
+    // VIDEO_PIPE_LATENCY changes, or every tick will appear to fail this
+    // check even though the raster phase is genuinely constant -- as
+    // happened here.
     //   - There is a short startup transient right after reset (the first
-    //     ~7 ce_pix ticks), during which the lag climbs from -1 up to the
-    //     steady 4 rather than being constant from tick 0 -- consistent with
-    //     the RTL's ce_pix/pipeline generator filling after reset deasserts,
-    //     not a genuine phase defect. The check below skips this window.
-    // The check maintains a 4-deep history of (x,y) and compares hpos/vpos
-    // against the entry from 4 ce_pix ticks back; any deviation once past
-    // the startup window means a real phase glitch.
-    static const int RASTER_LAG = 4;
+    //     ~7-9 ce_pix ticks), during which the lag climbs from -1 up to the
+    //     steady value rather than being constant from tick 0 -- consistent
+    //     with the RTL's ce_pix/pipeline generator filling after reset
+    //     deasserts, not a genuine phase defect. The check below
+    //     (RASTER_SKIP=16) skips this window.
+    // The check maintains a RASTER_LAG-deep history of (x,y) and compares
+    // hpos/vpos against the entry from RASTER_LAG ce_pix ticks back; any
+    // deviation once past the startup window means a real phase glitch.
+    static const int RASTER_LAG = 5;
     static const int RASTER_SKIP = 16; // past the startup transient, comfortably
     int hist_x[RASTER_LAG] = {0}, hist_y[RASTER_LAG] = {0};
     long align_checked = 0, align_bad = 0;
@@ -158,6 +171,21 @@ int main(int argc, char **argv)
         dbg_spr_f = fopen("sim/out/dbg_rtl_spr.bin", "wb");
         if (!dbg_spr_f) fprintf(stderr, "cannot open sim/out/dbg_rtl_spr.bin for write\n");
     }
+    // dbg_rtl_spr.bin must be indexed by the RTL's own RAW dbg_hpos/dbg_vpos
+    // (sprite_engine.v's sprbits/plb are explicitly 0-latency vs raw
+    // hpos/vpos, see its header) -- NOT by this testbench's (x,y), which only
+    // advances on the mixer-delayed top->ce_pix and is therefore a constant
+    // RASTER_LAG ticks ahead of dbg_hpos/dbg_vpos (see the raster-alignment
+    // comment above). Sampling on top->ce_pix and indexing by (x,y), as this
+    // used to do, silently wrote each pixel's real-time sprite data under the
+    // WRONG raster address (off by RASTER_LAG in the 640-wide raw domain,
+    // which straddles the 512/640 visible/blanking split unevenly and so
+    // does not reduce to a simple in-visible-window shift) -- an instrument
+    // bug, not evidence of a sprite_engine defect. Fixed by sampling on every
+    // RAW hpos/vpos change instead, indexed by that same raw position
+    // (which is already 0..511/0..223 for the visible region, per
+    // video_timing.v's HBSTART=512/VBSTART=224 -- no translation needed).
+    int prev_dbg_hpos = -1, prev_dbg_vpos = -1;
 
     while (frame < frames && tick_count < max_ticks) {
         // Coin1 (IN1 bit 7) pulsed frames 90-99; Start1 (IN1 bit 3) pulsed
@@ -173,6 +201,27 @@ int main(int argc, char **argv)
 
         tick(top);
         tick_count++;
+
+        {
+            int rhp = (int)top->dbg_hpos, rvp = (int)top->dbg_vpos;
+            if ((rhp != prev_dbg_hpos || rvp != prev_dbg_vpos) &&
+                dbg_spr_f && frame == dumpframe &&
+                rhp < ACTIVE_W && rvp < ACTIVE_H) {
+                unsigned char rec[5];
+                vluint32_t sb = top->dbg_sprbits;
+                rec[0] = (unsigned char)(sb & 0xFF);
+                rec[1] = (unsigned char)((sb >> 8) & 0xFF);
+                rec[2] = (unsigned char)((sb >> 16) & 0xFF);
+                rec[3] = (unsigned char)((sb >> 24) & 0xFF);
+                rec[4] = (unsigned char)(top->dbg_plb & 0xFF);
+                long idx = ((long)rvp * ACTIVE_W + rhp) * 5;
+                fseek(dbg_spr_f, idx, SEEK_SET);
+                fwrite(rec, 1, 5, dbg_spr_f);
+            }
+            prev_dbg_hpos = rhp;
+            prev_dbg_vpos = rvp;
+        }
+
         if (top->ce_pix) {
             // Raster alignment check (see note above): hpos/vpos is the tb's
             // own (x,y) delayed by a constant RASTER_LAG (4) ce_pix ticks.
@@ -207,17 +256,6 @@ int main(int argc, char **argv)
                 fb[idx + 0] = top->video_r;
                 fb[idx + 1] = top->video_g;
                 fb[idx + 2] = top->video_b;
-
-                if (dbg_spr_f && frame == dumpframe) {
-                    unsigned char rec[5];
-                    vluint32_t sb = top->dbg_sprbits;
-                    rec[0] = (unsigned char)(sb & 0xFF);
-                    rec[1] = (unsigned char)((sb >> 8) & 0xFF);
-                    rec[2] = (unsigned char)((sb >> 16) & 0xFF);
-                    rec[3] = (unsigned char)((sb >> 24) & 0xFF);
-                    rec[4] = (unsigned char)(top->dbg_plb & 0xFF);
-                    fwrite(rec, 1, 5, dbg_spr_f);
-                }
             }
             x++;
             if (x == HTOTAL) {

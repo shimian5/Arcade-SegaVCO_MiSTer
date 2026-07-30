@@ -4,18 +4,24 @@ Status as of session end. Branch `worktree-phase0-1a`.
 
 **Read the LAST section first.** This document is append-only and its sections
 retract each other in order, so the newest one is the current state and everything
-above it is kept for auditability. As of 2026-07-29 (session 4) that is
-*"NEW PRIME SUSPECT — intra-pipeline coordinate skew in the video path"*, plus the
-raw evidence and instruments that follow it. Jump there; the sections between here
-and it are settled history.
+above it is kept for auditability. As of 2026-07-29 (session 5) that is
+*"FIX APPLIED AND VERIFIED IN SIM — intra-pipeline coordinate skew, not yet
+confirmed on hardware"*, plus a follow-up note appended after visually reviewing
+rendered frames with the user: the fix resolved the wall and star tearing but
+**not** the title-logo/UFO/ship sprite garbling, which needs a fresh look next
+session. Jump there; the sections between here and it are settled history,
+including the session-4 suspect writeup, which explains the background-layer fix
+but turned out not to fully explain the sprite-layer symptom.
 
-Current one-line status: the sprite engine's internals and the CPU's write timing
-are both measured clean. The suspect is now the **video pipeline that samples them**
-— `rtl/video/fg_tilemap.v` reads `xx[7:3]` at stage 1 and `xx[2:0]` at stage 4,
-three core clocks apart, while `xx` only advances every eight; and `z80_3d.v`'s
-mixer delays the sprite layer by 5 core clocks against a 4-clock pixel. This is the
-first theory that explains why solid-colour sprites render perfectly and
-multi-colour artwork garbles.
+Current one-line status: the intra-pipeline coordinate-skew bug (session 4) is
+fixed in `rtl/video/fg_tilemap.v` and `rtl/z80_3d.v`, and **confirmed fixed by
+visual review**: the tunnel-wall tearing and the star layer both render clean
+now (`tools/measure_wall_profile.py` monotonic, and the user reviewed rendered
+sim frames directly). **The title logo and the multi-colour UFO/ship sprites are
+still visibly torn** in those same rendered frames — this fix did not resolve
+them, so the sprite path needs its own investigation next session (see the note
+at the end of the session-5 section below). Also **not yet re-verified on a
+DE10-Nano capture** for the part that is fixed.
 
 Older navigation note, still true of the sections below: the update after this
 header retracts the TL;DR that follows *it*.
@@ -520,3 +526,401 @@ theory above — that defect is in RTL that both builds share, is independent of
 the CPU, and should reproduce in sim the moment a wall-bearing frame is diffed
 (confirmation step 3). But it is the obvious first suspect for symptom 1, and it
 means "sim is clean" is a weaker statement about hardware than it looks.
+
+---
+
+## UPDATE 2026-07-29 (session 5): FIX APPLIED AND VERIFIED IN SIM — intra-pipeline coordinate skew, not yet confirmed on hardware
+
+Did the session-4 confirmation steps in order:
+
+**A. `rtl/video/fg_tilemap.v`.** Added a small delay chain (`xx_d1/d2/d3`,
+`y_d1/d2`) that captures `xx`/`y` once at stage 1 and re-times each field by
+exactly how many stages it lags behind stage 1 (stage 2's `y[7:3]` → `y_d1`,
+stage 3's `y[2:0]` → `y_d2`, stage 4's `xx[2:0]` → `xx_d3`). Every stage now
+consumes the same `(xx,y)` sample instead of whatever is live on its own
+clock. Rewrote the module header comment, which previously claimed a safety
+property ("xx/y held stable for 8 clk") that does not hold at pixel
+boundaries — it now states the actual failure mode and the fix.
+
+**B. `rtl/z80_3d.v` mixer.** Chose "re-time the delays to whole pixels" over
+gating the whole mixer on `ce_pix` (the header only offered the latter as an
+alternative, and it would have meant touching every mixer stage's clocking,
+not just its depth). The fg-tier path (`fg_tilemap`'s 4 + `color_table`'s 1 +
+`forebits_reg2`'s 1 = 6 clk) and the sprite/star/bg paths (`SPR_TO_MIX_DELAY`
+5 + 1, `COORD_DELAY` 5 + 1 = 6 clk each) were already *mutually* consistent
+at 6 clk, exactly as the old dismissed comment said — but 6 clk = 1.5 output
+pixels (`ce_pix` = clk/4), not a whole number, and that's what actually
+mattered here (see below for why "mutually equal" wasn't sufficient on its
+own). Bumped `SPR_TO_MIX_DELAY` and `COORD_DELAY` from 5 to 7, and added two
+more register stages to the fg-tier path (`forebits_reg3`, `forebits_reg4`,
+consumed in place of `forebits_reg2` everywhere downstream) so all three
+paths land on a common 8-clk/2-pixel depth from their respective origins.
+`VIDEO_PIPE_LATENCY` (the sync-bundle delay matching the mixer's total depth
+to `rgb_reg`) moved from 7 to 9 accordingly.
+
+**C. Verification.**
+
+- `wsl -d archlinux -e make -C sim run` (410 frames, TV80 path) builds and
+  runs clean.
+- `tools/measure_wall_profile.py sim/out/buckrogn_060.ppm --cols 0 96` (frame
+  60 = the attract "GAME OVER / INSERT COIN" wall-bearing frame, matching the
+  MAME reference in `tools/mame/dump_vram.lua`) now reports **no backward
+  notches — profile is monotonic**. Before the fix, the same tool on the same
+  frame reproduced the session-4 measurement exactly (notches at
+  x=15,31,47,63,79, spacing 16). This is the sim-side reproduction of the
+  hardware-captured defect that confirmation step 3 called for.
+- Frame 60 was chosen deliberately over the logo frame per the session-4
+  writeup: the logo's fg content is text on blank tiles, which cannot expose
+  a tile-boundary bug (the leftmost column of a glyph tile is background
+  anyway). The wall's dense tile-to-tile art with a shallow diagonal is what
+  makes a 1-native-pixel horizontal error visible as a multi-scanline
+  vertical notch. This is now added as a standing case in the verification
+  set, not a one-off: any future video-pipeline change should be checked
+  against a wall-bearing frame, not just the logo frame.
+
+**Instrument-discipline note, in the spirit of "validate the probe before
+trusting a comparison":** applying fix B (re-timing `VIDEO_PIPE_LATENCY` from
+7 to 9) broke `sim/tb_z80_3d.cpp`'s `RASTER ALIGNMENT` self-check —
+`RASTER_LAG`, a hardcoded testbench constant, was calibrated against the old
+latency and went stale, producing a report of 25,681,904/25,681,920 ce_pix
+ticks "deviating" (effectively 100%). This looked exactly like a real phase
+bug but wasn't: `top->ce_pix` is z80_3d.v's *delayed* `ce_pix` output
+(deliberately re-timed to align with `rgb_reg`), the testbench's own raster
+counter only advances on that delayed pulse, and the lag between it and the
+RTL's raw `dbg_hpos`/`dbg_vpos` is a pure simulation-harness artifact of
+`VIDEO_PIPE_LATENCY` — not a hardware timing fact, and not something the
+schematic has an opinion on. Re-measured it directly (dumping
+`(tick, tbx, tby, hpos, vpos)` and reading off the wrap, same method the
+original `RASTER_LAG=4` comment used) rather than trusting a naive
+"add the latency delta" prediction, which was in fact wrong (predicted 6,
+measured 5). Full run now reports `RASTER ALIGNMENT: 0/69273600` deviations.
+**Takeaway carried forward:** any future change to `VIDEO_PIPE_LATENCY` must
+re-measure `RASTER_LAG`, not extrapolate it — this is exactly the kind of
+"validate the probe" trap the earlier sessions warned about, just in the
+testbench itself rather than in a sim-vs-MAME comparison. A more robust fix
+(self-calibrating `RASTER_LAG` at sim startup, or deriving it algebraically
+from `VIDEO_PIPE_LATENCY` with the actual relationship worked out rather than
+guessed) is a worthwhile follow-up but out of scope here.
+
+**What is NOT yet done:**
+
+- **Not re-verified on real DE10-Nano hardware.** The original defect was
+  measured on a hardware capture (session 4's raw evidence, still in this
+  document above); the fix has only been confirmed in sim so far. Building
+  and running the updated bitstream on hardware, then re-running
+  `tools/measure_wall_profile.py` against a fresh capture, is the step that
+  actually closes this out.
+- **T80 vs TV80 still uncross-checked** (see the caveat above this section) —
+  the fix is in RTL shared by both CPU paths and is independent of the CPU,
+  so there's no specific reason to expect it behaves differently under T80,
+  but that's an expectation, not a measurement.
+- **Symptom 1 (stars extending below the sky on hardware but not MAME)**
+  remains a separate, uninvestigated thread, as established in session 4. Not
+  to be confused with the sim-visible star-layer tearing fixed by this
+  session's `COORD_DELAY` re-timing (below) — that was a rendering-pipeline
+  defect in the `star_bit`/`bitmap_ram` read timing, not the sub-CPU
+  content-region question symptom 1 is about.
+
+---
+
+## UPDATE 2026-07-29 (session 5, continued): visual review confirms wall + stars fixed, sprite layer (logo/UFO/ship) still garbled
+
+Rendered several post-fix frames from the `make -C sim run` output
+(`sim/out/buckrogn_060.ppm`, `_150.ppm`, `_155.ppm`) and reviewed them
+directly with the user (not just the automated wall-profile check):
+
+- **Fixed, confirmed by eye:** the tunnel wall (frames 60, 155) now renders
+  with a clean, unbroken cornice line — no tile-boundary tearing. The
+  starfield background also renders cleanly now (it reads through the same
+  `COORD_DELAY`-gated `bitmap_ram`/`star_bit` path re-timed in this session).
+- **NOT fixed:** the title logo (frame 150, "BUCK ROGERS / PLANET OF ZOOM")
+  is still heavily torn — smeared/overlapping letterforms, colour bleed
+  between adjacent columns, exactly the pre-fix appearance. The large
+  multi-colour UFO/mothership sprite and the small player-ship sprite (both
+  visible in frames 60 and 155) are similarly torn, while the small
+  solid-colour ship icons in the lives HUD (bottom-left) remain clean — the
+  same solid-vs-multi-colour split noted in session 4, unchanged by this fix.
+
+**Conclusion: this session's fix is a real, verified partial fix — the
+fg-tilemap/background-mixer alignment defect is resolved — but it is not the
+(or not the only) cause of the logo/UFO/ship sprite garbling.** That symptom
+needs its own investigation next session, starting from `sprite_engine.v`'s
+internal pipeline (check for the same class of bug just fixed here: a stage
+consuming a live coordinate or index field instead of one captured and
+delay-chained from a single sample) rather than assuming the mixer-alignment
+fix here is relevant to it. Do not re-run the session-4 fix reasoning
+unmodified against the sprite engine without first confirming its actual
+internal pipeline structure — it may not have the same stage layout as
+`fg_tilemap.v` did.
+
+---
+
+## UPDATE 2026-07-29 (session 6): sprite garbling ROOT CAUSE FOUND AND FIXED — a ROM-nibble-select generation mismatch in `sprite_engine.v`
+
+Followed session 5's suggested first step: built a per-pixel instrument for
+the sprite path and compared it against a golden model, instead of continuing
+to read the RTL statically. The tooling for this (`sim/golden_buckrog.py`,
+`sim/compare_spr.py`, `rtl/video/sprite_engine.v`'s `dbg_rtl_spr.bin`/
+`dbg_rtl_levels.txt` dumps) already existed from session 4 — it just hadn't
+been *run* against a per-pixel comparison for a sprite-bearing frame since
+before session 5's mixer changes. Running it immediately surfaced a real
+signal.
+
+### Instrument bug found and fixed first (don't skip this if re-deriving)
+
+The first run of `sim/compare_spr.py` against frame 150 showed 5560/114688
+mismatching pixels, starting at y=82. Before trusting that, per this
+document's own "instrument discipline" rule, the probe was checked — and it
+had a real bug, independent of anything above: `sim/tb_z80_3d.cpp`'s
+`dbg_rtl_spr.bin` writer sampled `dbg_sprbits`/`dbg_plb` on `top->ce_pix`
+(z80_3d.v's **mixer-delayed** `ce_pix` output) but indexed the output buffer
+by the testbench's own `(x,y)` raster counter, which only advances on that
+same delayed pulse. `sprite_engine.v`'s outputs are explicitly **real-time,
+0-latency vs. raw `hpos`/`vpos`** (see its header) — so every sample was
+written under the wrong raster address, off by the session-5-documented
+`RASTER_LAG` (5 ce_pix ticks) in the *full* 640-wide raw-hpos domain, which
+straddles the 512-visible/128-blanking split unevenly and so does **not**
+reduce to a simple shift within the 512-wide visible window (confirmed
+empirically: shifting the RTL buffer by every offset from -8..+8 in the
+visible window never got mismatches close to zero). Fixed in
+`sim/tb_z80_3d.cpp` by sampling on every raw `dbg_hpos`/`dbg_vpos` change
+directly (independent of the delayed `ce_pix`/`(x,y)` bookkeeping used for
+the PPM framebuffer, which was never wrong and is untouched) and indexing by
+that same raw position — `video_timing.v`'s `HBSTART=512`/`VBSTART=224`
+mean the raw visible-region values already equal the desired buffer index
+with no translation needed.
+
+Re-running after that fix moved the mismatch to 5947/114688 (similar
+magnitude, different exact pixels) — confirming the instrument bug was real
+but was not the (or not the only) source of the original signal. This is
+exactly the two-bug situation the "validate the probe" rule exists for:
+fixing the instrument doesn't make a real defect disappear, it just stops
+lying about where it is.
+
+### The real bug: nibble-select and ROM-byte-fetch pull from different fire generations
+
+With the instrument fixed, a narrow `$display` trace (level 2, y=82,
+hpos 415-445, one line per raw clk) showed `pixdata` — the nibble selected
+from `rom_dout` — visibly **changing value partway through a single output
+pixel's 4-clk window**, the same class of symptom as the intra-pipeline
+coordinate skew session 4/5 fixed in `fg_tilemap.v`, but this time inside
+`sprite_engine.v`'s own per-pixel path, not in the cross-module mixer.
+
+Root cause, precisely: on each `fire` (X-scale accumulator crossing
+threshold), the old code did
+
+```verilog
+offset_reg[lvl]         <= offset_reg[lvl] + (±1);     // -> O_k
+nibble_sel_pending[lvl] <= ~offset_reg[lvl][0];         // uses PRE-increment O_(k-1)
+```
+
+`rom_raddr[lvl]` is combinational off `offset_reg[lvl]` and the ROM bank read
+is itself a registered (1-clk-latency) BRAM port, so a fetch takes **2**
+clock edges end-to-end from a fire (address settles the edge after the fire,
+data lands the edge after that) — but `nibble_sel_pending` landed only **1**
+edge after the fire, using the offset value from *before* that fire's own
+increment. By the time `fire_pending` is consumed one X-scale period later
+(when `rom_dout` has fully settled to reflect the fetch this fire triggered,
+i.e. offset `O_k`), the paired `nibble_sel_pending` was still describing
+`O_(k-1)` — one fire generation stale.
+
+This is **not** an occasional glitch: `offset_reg` changes by exactly ±1
+every fire, so consecutive offsets *always* alternate LSB parity. Using
+`O_(k-1)`'s parity instead of `O_k`'s therefore selects the **opposite**
+nibble half of the byte on every single fetch, unconditionally. It is
+invisible exactly when both nibbles of the ROM byte at that address happen
+to encode the same pixel value — which is common in a flat-colour sprite
+region (explaining the clean HUD lives icons) and false in detailed,
+multi-colour art (the logo, the UFO, the player ship) — reproducing the
+solid-vs-multicolour split that has been the central diagnostic clue since
+session 4, without needing a second, unrelated explanation for it.
+
+**Fix** (`rtl/video/sprite_engine.v`, the per-level `always` block in the
+`get_sprite_bits` generate loop): compute the post-increment offset
+explicitly (`offset_next`) and derive `nibble_sel_pending` from *that*, not
+from the pre-increment `offset_reg[lvl]`:
+
+```verilog
+wire [OFFSET_WIDTH-1:0] offset_next = offset_reg[lvl] + (±1, same as before);
+...
+offset_reg[lvl]         <= offset_next;
+nibble_sel_pending[lvl] <= ~offset_next[0];   // was: ~offset_reg[lvl][0]
+```
+
+Both the byte fetch (via `rom_raddr`/`rom_dout`, still 2 edges from the fire)
+and the nibble select (now also `O_k`-based, 1 edge from the fire) now
+describe the same offset generation by the time `fire_pending` consumes them
+a full X-scale period later — the 1-clk transient right after the fire, where
+`rom_dout` briefly still shows the old byte while `nibble_sel_pending` has
+already updated, is harmless because nothing reads `pixdata` at that instant
+(`fire_pending` is only consumed at the *end* of the following period, by
+which point `rom_dout` has long settled).
+
+### Verification
+
+- `sim/compare_spr.py` on frame 150: mismatches dropped from 5947/114688 to
+  4810/114688, and — more importantly than the count — the *character* of
+  the remaining mismatches changed. Before the fix, a level's sprite colour
+  would flicker on/off/on again with the correct-but-displaced colour data
+  (a "double echo" — see the raw trace and `sim/compare_spr.py` output
+  captured in this session for y=82, x≈415-445). After the fix, the same
+  region shows one clean, contiguous run that merely starts ~2 native pixels
+  earlier than golden and ends in the same place — a much smaller, different
+  kind of discrepancy (see "Remaining open item" below), not interior colour
+  corruption.
+- **Visual confirmation is unambiguous.** Rendered and inspected
+  `sim/out/dbg_150.ppm` (logo), `sim/out/buckrogn_060.ppm` and `_155.ppm`
+  (UFO mothership + player ship): all three are now clean. The "BUCK ROGERS
+  / PLANET OF ZOOM" logo renders with crisp, correctly-coloured letterforms
+  (compare against the "heavily torn, smeared/overlapping letterforms"
+  description in the previous update) and the UFO mothership's internal
+  multi-colour detail (portholes, hull shading) is intact and stable across
+  both sampled frames.
+- **No regression**: `tools/measure_wall_profile.py` on the regenerated
+  frame 60 still reports "no backward notches -- profile is monotonic" for
+  the tunnel wall (session 5's fix untouched and still holding).
+- The `$display` trace added for diagnosis was temporary and has been
+  removed from `rtl/video/sprite_engine.v`; only the `offset_next` fix and
+  the `sim/tb_z80_3d.cpp` instrument fix remain in the diff.
+
+### Remaining open item: ~2-native-pixel-early turn-on at some sprite-region edges
+
+`sim/compare_spr.py` still reports 4810/114688 mismatching pixels, all
+still confined to the sprite-bearing scanlines (y=82-121ish for this
+sprite). Spot-checked (y=82, x=415-445): golden's sprite run is x=430-436;
+RTL's is x=428-436 — RTL turns the level on 2 native pixels early but turns
+it off at the identical pixel. This reads as a horizontal-enable/lst_active
+turn-on edge being sampled ~1 xx-column too early (a smaller, different bug
+from the one just fixed — likely in the `ix0`/`he_or_mask` sampling cadence
+or the sprite-position-RAM prefetch alignment, not the ROM-fetch pipeline),
+not a recurrence of the nibble-select bug (the interior of every mismatched
+run now carries the *correct* colour data, just shifted at the leading
+edge). Given the visual result is already clean at normal viewing scale,
+this is lower priority than the fix above, but worth closing out before
+calling the sprite path bit-exact against MAME. Suggested next step: repeat
+this session's method (narrow trace on `he_masked`/`ix0`/`lst_active`
+around a mismatching leading edge) rather than re-deriving from a cold
+read of the code.
+
+**Not yet done:** hardware re-verification (this fix, like session 5's, is
+sim-only so far); the residual edge-timing item above; T80-vs-TV80 remains
+uncross-checked (unrelated to this fix, same caveat as session 5).
+
+---
+
+## UPDATE 2026-07-29 (session 6, continued): MAME cross-check confirms the nibble fix; found and fixed a SECOND real bug (ROM fetch-address must be a captured register, not a live combinational tap); remaining mothership discrepancy is a game-state mismatch, not a rendering bug
+
+Picked a real MAME capture (`mame.exe buckrogn -video none -sound none
+-autoboot_script tools/mame/dump_frames_60_155.lua`, same coin/start
+schedule as `sim/tb_z80_3d.cpp`) to compare against sim's frame 60 pixel by
+pixel instead of eyeballing. The logo fix from the previous update held up.
+But side-by-side crops of frame 60's UFO mothership showed something the
+`sim/compare_spr.py` per-pixel counts alone hadn't made obvious: a small
+mismatch in one specific region (the left engine pod, hardware level 5).
+
+### Second real bug: `rom_raddr` must be captured at fire time, not tap the live offset
+
+`sim/golden_buckrog.py` extended with a per-fire trace (fetch address,
+pixdata, termination) confirmed fire *timing* and *offset progression* are
+bit-exact between RTL and golden for level 5 — the FSM-level check
+(step/offset/ve matching every scanline) was not lying. The remaining
+difference was in *when fetched content becomes visible*: an exhaustive
+shift search (`shift_search_lvl5.py`, isolating just level 5's nibble/plb
+bits from the 32-bit `sprbits` word) found RTL displaying every colour
+transition a constant, exact **2 native pixels early** relative to golden,
+for the entire width of the level's run.
+
+Root cause: `rom_raddr[lvl]` was `assign`ed straight from the **live**
+`offset_reg[lvl]` — a plain combinational tap, not a captured value. Since
+`offset_reg[lvl]` advances to its post-increment value at the very same
+edge as the fire that's supposed to read the *pre*-increment byte, `rom_dout`
+(which needs 1 clock to settle after `rom_raddr` changes) ends up settling
+to the **next** generation's byte just 1 clock into the following period —
+long before `fire_pending` actually consumes it 3 clocks later. Every fire's
+consumption therefore silently picked up the *next* fire's data instead of
+its own, structurally analogous to the nibble-select bug above but in the
+address side of the pipeline rather than the nibble-select side, and
+independent of it (this one exists regardless of the nibble fix).
+
+**Fix**: added a real captured register, `fetch_addr_reg[lvl]`, updated only
+at fire time (and at `commit_now`) from the *pre*-increment `offset_reg[lvl]`
+— matching `sim/golden_buckrog.py`'s own `offs = st["offset"]` (fetch, then
+increment afterward). `rom_raddr[lvl]` now reads `fetch_addr_reg[lvl]`
+instead of tapping `offset_reg[lvl]` live, so the address (and hence
+`rom_dout`) stays stable for the entire period until the *next* fire, the
+same pattern already used correctly for the sprite-position-RAM prefetch.
+`nibble_sel_pending` was reverted to the pre-increment `offset_reg[lvl][0]`
+to match (the previous update's fix to make it post-increment was
+compensating for this same bug from the wrong side, and is superseded by
+this fix, not stacked with it).
+
+Also (found not to be the cause here, but a genuine correctness fix in its
+own right, kept): `latched_masked`/`plb` were gated on `lst_eff` (`lst_active
+| he_or_mask`), and `he_or_mask` is combinationally nonzero for exactly the
+one clock where `ix0` pulses at a column boundary — i.e. `lst_eff` answers
+"the window is open" one whole period before `lst_active` itself latches
+that fact. Changed the *output* gating to `lst_active` (registered); `live`
+(the fire-gating condition) intentionally still uses `lst_eff`, since fire
+cadence was independently confirmed bit-exact with that unchanged. This
+didn't move `sim/compare_spr.py`'s numbers (the debug port samples once per
+raw-hpos change and never catches the 1-clock combinational blip), but it
+removes a genuine sub-clock hazard from the signal the real mixer pipeline
+*does* sample every clock, so it's correct to keep regardless.
+
+### Verification
+
+- `sim/compare_spr.py` on frame 60: total mismatches dropped from
+  5482/114688 to 2972/114688 (all remaining ones consistent with a single,
+  uniform **1-native-pixel-late** residual — re-running the shift search
+  found shift=+1 gives **zero** mismatches for level 5 across its entire
+  run). Given the underlying hardware genuinely has ROM access latency that
+  MAME's software model doesn't simulate, this residual may not even be a
+  bug relative to real silicon — see "Remaining item" below.
+- `tools/measure_wall_profile.py` on the regenerated frame 60: still "no
+  backward notches -- profile is monotonic" (no regression to session 5's
+  fix).
+- Re-rendered frame 150 (logo) after this fix: still clean.
+
+### The "duplicate flame pod at the mothership's top corners" is NOT a rendering bug
+
+Visually, frame 60's rendered UFO showed the same red/yellow engine-pod
+graphic appearing at the top-left/top-right corners where MAME's reference
+capture shows a small distinct cream-coloured strut/antenna instead. Before
+chasing this as a third rendering bug, it was checked against the same
+"validate the probe" discipline this document keeps needing to reapply:
+
+`rtl/video/sprite_engine.v`'s own header explains this is an intentional
+hardware trick — 16 sprite-RAM entries fold onto 8 hardware levels
+(`level = sprnum & 7`), and if two different sprite-RAM entries that share a
+level both fire on the same scanline, only the second one's offset/step
+survives for the *entire* level's walk that scanline (whichever sprnum's
+horizontal-enable window happens to be open just borrows whatever the
+"winning" sprnum's accumulator is currently producing). A quick renderer
+(`render_sprite_only.py`, colouring each pixel by its lowest-set `plb` bit)
+run against **both** `dbg_golden_spr.bin` (MAME-logic golden model, fed
+from RTL's own captured sprram) and `dbg_rtl_spr.bin` showed **identical**
+shapes: the same "level 5 pod" silhouette at both the top and bottom
+corners, in both models. Since the golden model is a literal, independent
+port of MAME's own `prepare_sprites`/`get_sprite_bits` logic, and it
+reproduces the exact same corner duplication RTL does, this is not a
+rendering-pipeline defect — a real bug in `sprite_engine.v`'s logic would
+make RTL *diverge* from golden, not agree with it.
+
+That means the mismatch against the **actual MAME reference capture**
+(which does *not* show this duplication) is a **content/game-state**
+difference: at the instant our sim's frame 60 was captured, whichever
+sprite-RAM entry (sprnum 5 vs. 13, sharing level 5) "won" the scanline
+differs from what MAME's real CPU execution had at its own frame 60. This
+is the same class of gap already flagged for T80-vs-TV80 and for symptom 1
+(stars extending too far in hardware but not MAME) elsewhere in this
+document: a divergence in *what the CPU has written to sprite RAM by this
+point*, not in how `sprite_engine.v` renders whatever it's given. Chasing
+this further means comparing CPU/game-state execution traces between sim
+and MAME (attract-mode timing, which sprite entry table slot is currently
+assigned to which on-screen ship, etc.) — a different, larger investigation
+than the rendering-pipeline bugs this document has otherwise been tracking,
+and out of scope for this session.
+
+**Not yet done:** the ~1-native-pixel residual noted above (possibly not a
+bug at all — see discussion); the game-state/content-divergence thread just
+opened; hardware re-verification; T80-vs-TV80 (unrelated, longstanding).
