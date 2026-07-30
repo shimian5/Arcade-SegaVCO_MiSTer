@@ -83,7 +83,13 @@ localparam CONF_STR = {
 	"P1O[39:38],Lives,3,4,5,6;",
 	"P1O[40],Cabinet,Upright,Cockpit;",
 	"-;",
-	"J1,Fire,Accel Fast,Accel Slow,Unused,Start 1P,Start 2P,Coin 1,Coin 2,Service;",
+	// Only the buttons the game actually has -- no placeholder entries. Turbo
+	// (phase 3) adds its own inputs; those get declared when that core arrives
+	// rather than being reserved here as dead names. Start/Coin are the last
+	// two by convention, and P2 takes its own controller's copies of the SAME
+	// bit positions (joystick_1[7]/[8]), so P2 start and P2 coin never land on
+	// P1's pad. Names must match <buttons names="..."> in mra/*.mra.
+	"J1,Fire,Accel Fast,Accel Slow,Start,Coin;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -131,11 +137,20 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 // IN0/IN1/DSW1/DSW2 -- docs/PLAN.md phase 1 CPU/memory table, buckrog
 // INPUT_PORTS_START in docs/reference/turbo.cpp. Joystick bit convention:
-// [0]=Right [1]=Left [2]=Down [3]=Up [4]=Fire1 [5]=Fire2 [6]=Fire3
-// [8]=Start1 [9]=Start2 [10]=Coin1 [11]=Coin2 [12]=Service1 (the
-// start/coin/service extension bits used by other MiSTer arcade cores in
-// this style, e.g. the Donkey Kong core T80 was vendored from). All
-// active-low (idle = 1), matching MAME's ACTIVE_LOW convention.
+// [0]=Right [1]=Left [2]=Down [3]=Up are MiSTer's standard D-pad bits; the
+// named buttons then start at [4] in "J1,..." order, so [4]=Fire,
+// [5]=Accel Fast, [6]=Accel Slow, [7]=Start, [8]=Coin. All active-low
+// (idle = 1), matching MAME's ACTIVE_LOW convention.
+//
+// P2's start and coin are read from joystick_1 at the SAME bit positions as
+// P1's, which is the MiSTer convention -- taking them from spare joystick_0
+// bits instead would put P2's start and coin on P1's controller.
+//
+// SERVICE1 (IN1 bit 5) and the TEST/service-mode line (IN1 bit 4) are tied
+// inactive on purpose: neither had any observable effect in play, and a
+// mapped button that does nothing is worse than no button. They are real
+// hardware inputs (schematic sheet 4: I15=SERVICE, I14=TEST) and can be
+// wired later if a use for them turns up.
 //
 // in0[5:4] are ACC.LO/ACC.HI (schematic sheet 4, PDF p32: two discrete
 // opto-isolated lines on the control connector). The same two wires serve
@@ -143,7 +158,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 // buttons in Button mode (the factory setting, wired here), or an inverted
 // 2-bit Gray code from the pedal's opto pair in Pedal mode. No analog pedal
 // source is wired, so selecting Pedal in the OSD leaves the throttle dead.
-wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5], ~joystick_1[8], 3'b111};
+wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5], ~joystick_1[7], 3'b111};
 // NOTE in1[1:0]: MAME's IN1 is bit 0x01 = JOYSTICK_LEFT, bit 0x02 =
 // JOYSTICK_RIGHT (turbo.cpp INPUT_PORTS_START(buckrog)), which is the
 // OPPOSITE order from the MiSTer joystick convention above ([0]=Right,
@@ -152,7 +167,7 @@ wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5]
 // it the starfield's lateral sweep) banked the wrong way for a given
 // stick direction. Cross them explicitly; do not "simplify" this back to
 // [1],[0] order.
-wire [7:0] in1 = {~joystick_0[10], ~joystick_0[11], ~joystick_0[12], 1'b1, ~joystick_0[8], ~joystick_0[4], ~joystick_0[0], ~joystick_0[1]};
+wire [7:0] in1 = {~joystick_0[8], ~joystick_1[8], 1'b1, 1'b1, ~joystick_0[7], ~joystick_0[4], ~joystick_0[0], ~joystick_0[1]};
 
 // DSW assembly. Bit positions are buckrog's DSW1/DSW2 as read through
 // port_2_r/port_3_r (the 4-bit bitswaps live in rtl/z80_3d.v, not here).

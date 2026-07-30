@@ -48,4 +48,18 @@
     <part repeat="8192">FF</part>
   </rom>
 
+  <!--
+    Button names, in "J1,..." order from Arcade-Z80-3D.sv: the named buttons
+    start at joystick bit [4], so [4]=Fire, [5]=Accel Fast, [6]=Accel Slow,
+    [7]=Start, [8]=Coin. Start and Coin are last by convention, and P2 reads
+    its own controller's copies of those same two positions.
+
+    Five names only, exactly the inputs buckrog has. Turbo's extra controls
+    are deliberately NOT reserved here; they get declared in turbo.mra when
+    that core lands, rather than shipping dead names now. "default" is
+    deliberately not set, since supplying it would rewrite existing gamepad
+    bindings.
+  -->
+  <buttons names="Fire,Accel Fast,Accel Slow,Start,Coin"></buttons>
+
 </misterromdescription>
