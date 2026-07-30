@@ -45,6 +45,21 @@ int main(int argc, char **argv)
     // hpos/vpos wraps sprite_engine.v's dbg_cur_frame counts, so the two are
     // directly comparable by index.
     int dumpframe = -1;
+    // Star-motion investigation: dump the raw bitmap_ram (star layer) for
+    // frames 420-459 (same window as tools/mame/dump_bitmap_ram.lua) to
+    // sim/out/rtl_bitmap_NNN.bin, one byte-per-bit (0/1), 57344 bytes each,
+    // same y*256+x addressing as the MAME memory_share -- so the two can be
+    // fed through the identical star-trajectory tracker with no rendering/
+    // capture step in between.
+    bool dumpbitmap = false;
+    // Star-motion investigation: dump the sub CPU's work RAM (0xe000-0xe7ff,
+    // 2048 bytes) every frame from frame 1 through --workramframes (default
+    // 250, covering boot/attract through well past coin+start) to
+    // sim/out/rtl_workram_NNN.bin, for a per-frame byte diff against MAME's
+    // subcpu program-space read of the same addresses -- finds the earliest
+    // frame/byte offset the two engines' sub-CPU state actually disagrees.
+    bool dumpworkram = false;
+    int workramframes = 250;
     // Now that cpu_z80.v drives TV80 with a real cen (see rtl/cpu_z80.v),
     // both CPUs run at the correct core_clk/8 rate in sim, same as real
     // hardware -- so frame counts here are directly comparable to real
@@ -52,6 +67,32 @@ int main(int argc, char **argv)
     // as tools/mame/dump_frames.lua's reference capture at frame 400 (see
     // docs/PLAN.md phase 1c notes).
     int frames = 410;
+    // SECT-2 investigation. --hudtrace FILE writes one line per frame with
+    // the HUD cells read straight out of the fg tilemap VRAM (RD: digit,
+    // SECT: digit, the lives-icon row) plus a whole-tilemap checksum, in
+    // exactly the format tools/mame/hud_trace.lua emits -- so a sim run and
+    // a MAME run of the same input phase can be diffed line-for-line.
+    // --noppm suppresses the per-frame PPM writes, which dominate runtime on
+    // the multi-thousand-frame runs a full game needs.
+    // --coin/--start move the input phase; the whole point of the sweep is
+    // that both engines are deterministic, so the only knob that produces a
+    // distribution is where the coin/start pulses land.
+    std::string hudtrace_path;
+    bool noppm = false;
+    int coin_frame = 90, start_frame = 150;
+    // --vramrange LO HI dumps the full 2KB fg tilemap to
+    // sim/out/rtl_vram_NNN.bin for every frame in [LO,HI], matching
+    // tools/mame/dump_vram_range.lua byte-for-byte.
+    int vramlo = -1, vramhi = -1;
+    // Factory DIP settings: DSW1 = 0xC0, DSW2 = 0x92 -- the PORT_DIPNAME
+    // defaults in buckrog's INPUT_PORTS_START (docs/reference/turbo.cpp),
+    // with the DSW1/DSW2 bit numbering confirmed against the schematic
+    // (sheet 4, PDF p32: the two 8-position DIP packages feed I20-I27 and
+    // I30-I37 through the LS253 muxes, which is exactly the 6,4,3,0 /
+    // 7,5,2,1 bitswap pair). Previously 0x00/0x80, i.e. Difficulty HARD and
+    // Accel-by-Pedal, which made the sim harder than the same ROM in MAME
+    // and made every sim-vs-MAME game-state comparison invalid.
+    int dsw1v = 0xC0, dsw2v = 0x92;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -59,6 +100,22 @@ int main(int argc, char **argv)
         else if (a == "--frames" && i + 1 < argc) frames = atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) out_prefix = argv[++i];
         else if (a == "--dumpframe" && i + 1 < argc) dumpframe = atoi(argv[++i]);
+        else if (a == "--dumpbitmap") dumpbitmap = true;
+        else if (a == "--dumpworkram") dumpworkram = true;
+        else if (a == "--workramframes" && i + 1 < argc) workramframes = atoi(argv[++i]);
+        else if (a == "--hudtrace" && i + 1 < argc) hudtrace_path = argv[++i];
+        else if (a == "--noppm") noppm = true;
+        else if (a == "--coin" && i + 1 < argc) coin_frame = atoi(argv[++i]);
+        else if (a == "--start" && i + 1 < argc) start_frame = atoi(argv[++i]);
+        else if (a == "--vramrange" && i + 2 < argc) { vramlo = atoi(argv[++i]); vramhi = atoi(argv[++i]); }
+        else if (a == "--dsw1" && i + 1 < argc) dsw1v = (int)strtol(argv[++i], nullptr, 0);
+        else if (a == "--dsw2" && i + 1 < argc) dsw2v = (int)strtol(argv[++i], nullptr, 0);
+    }
+
+    FILE *hudf = nullptr;
+    if (!hudtrace_path.empty()) {
+        hudf = fopen(hudtrace_path.c_str(), "w");
+        if (!hudf) { fprintf(stderr, "cannot write %s\n", hudtrace_path.c_str()); return 1; }
     }
 
     // Forward --dumpframe to the RTL side as a Verilator plusarg
@@ -96,8 +153,8 @@ int main(int argc, char **argv)
     top->ioctl_dout = 0;
     top->in0 = 0xFF;
     top->in1 = 0xFF;
-    top->dsw1 = 0x00;
-    top->dsw2 = 0x80;
+    top->dsw1 = (vluint8_t)dsw1v;
+    top->dsw2 = (vluint8_t)dsw2v;
     for (int i = 0; i < 32; i++) tick(top);
 
     // Load ROM blob
@@ -192,8 +249,8 @@ int main(int argc, char **argv)
         // frames 150-159 -- matches tools/mame/dump_frames.lua's schedule
         // exactly, so sim and MAME reference frames are directly comparable
         // by frame index now that both CPUs run at real-hardware speed.
-        bool coin_active  = (frame >= 90 && frame < 100);
-        bool start_active = (frame >= 150 && frame < 160);
+        bool coin_active  = (frame >= coin_frame  && frame < coin_frame  + 10);
+        bool start_active = (frame >= start_frame && frame < start_frame + 10);
         unsigned char in1v = 0xFF;
         if (coin_active)  in1v &= ~(1 << 7);
         if (start_active) in1v &= ~(1 << 3);
@@ -263,18 +320,91 @@ int main(int argc, char **argv)
                 y++;
                 if (y == VTOTAL) {
                     y = 0;
-                    char path[512];
-                    snprintf(path, sizeof(path), "%s%03d.ppm", out_prefix.c_str(), frame);
-                    FILE *pf = fopen(path, "wb");
-                    if (pf) {
-                        fprintf(pf, "P6\n%d %d\n255\n", ACTIVE_W, ACTIVE_H);
-                        fwrite(fb.data(), 1, fb.size(), pf);
-                        fclose(pf);
-                        printf("wrote %s\n", path);
-                    } else {
-                        fprintf(stderr, "cannot write %s\n", path);
+                    if (!noppm) {
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s%03d.ppm", out_prefix.c_str(), frame);
+                        FILE *pf = fopen(path, "wb");
+                        if (pf) {
+                            fprintf(pf, "P6\n%d %d\n255\n", ACTIVE_W, ACTIVE_H);
+                            fwrite(fb.data(), 1, fb.size(), pf);
+                            fclose(pf);
+                            printf("wrote %s\n", path);
+                        } else {
+                            fprintf(stderr, "cannot write %s\n", path);
+                        }
                     }
                     frame++;
+
+                    // HUD trace: same fields, same order, same formatting as
+                    // tools/mame/hud_trace.lua, so the two traces diff
+                    // directly. VRAM addresses are tilemap-relative
+                    // (0xc000 + row*32 + col).
+                    if (hudf) {
+                        auto rd = [&](int off) -> unsigned {
+                            top->dbg_vram_addr = (vluint32_t)off;
+                            top->eval();
+                            return (unsigned)top->dbg_vram_data;
+                        };
+                        unsigned sect = rd(2 * 32 + 30);
+                        unsigned rdno = rd(1 * 32 + 30);
+                        unsigned sum = 0;
+                        for (int a = 0; a < 2048; a++)
+                            sum = (sum + rd(a) * (unsigned)(((0xc000 + a) & 0xff) | 1)) & 0xffffff;
+                        char bar[80], timer[80];
+                        for (int c = 0; c < 32; c++)
+                            snprintf(bar + c * 2, 3, "%02x", rd(25 * 32 + c));
+                        // TIME LEFT gauge: row 1, cols 1..23.
+                        for (int c = 0; c < 23; c++)
+                            snprintf(timer + c * 2, 3, "%02x", rd(1 * 32 + 1 + c));
+                        fprintf(hudf, "f=%d sect=%02x rd=%02x sum=%06x bar=%s timer=%s\n",
+                                frame, sect, rdno, sum, bar, timer);
+                        fflush(hudf);
+                    }
+
+                    if (vramlo >= 0 && frame >= vramlo && frame <= vramhi) {
+                        std::vector<unsigned char> vr(2048);
+                        for (int a = 0; a < 2048; a++) {
+                            top->dbg_vram_addr = (vluint32_t)a;
+                            top->eval();
+                            vr[a] = (unsigned char)top->dbg_vram_data;
+                        }
+                        char vpath[512];
+                        snprintf(vpath, sizeof(vpath), "sim/out/rtl_vram_%04d.bin", frame);
+                        FILE *vf = fopen(vpath, "wb");
+                        if (vf) { fwrite(vr.data(), 1, vr.size(), vf); fclose(vf); }
+                    }
+
+                    if (dumpworkram && frame >= 1 && frame <= workramframes) {
+                        std::vector<unsigned char> wr(2048);
+                        for (int a = 0; a < 2048; a++) {
+                            top->dbg_workram_addr = (vluint32_t)a;
+                            top->eval();
+                            wr[a] = (unsigned char)top->dbg_workram_data;
+                        }
+                        char wpath[512];
+                        snprintf(wpath, sizeof(wpath), "sim/out/rtl_workram_%03d.bin", frame);
+                        FILE *wf = fopen(wpath, "wb");
+                        if (wf) {
+                            fwrite(wr.data(), 1, wr.size(), wf);
+                            fclose(wf);
+                        }
+                    }
+
+                    if (dumpbitmap && frame >= 420 && frame <= 459) {
+                        std::vector<unsigned char> bm(57344);
+                        for (int a = 0; a < 57344; a++) {
+                            top->dbg_bitmap_addr = (vluint32_t)a;
+                            top->eval();
+                            bm[a] = top->dbg_bitmap_bit ? 1 : 0;
+                        }
+                        char bpath[512];
+                        snprintf(bpath, sizeof(bpath), "sim/out/rtl_bitmap_%03d.bin", frame);
+                        FILE *bf = fopen(bpath, "wb");
+                        if (bf) {
+                            fwrite(bm.data(), 1, bm.size(), bf);
+                            fclose(bf);
+                        }
+                    }
                 }
             }
         }
@@ -296,6 +426,8 @@ int main(int argc, char **argv)
         fclose(dbg_spr_f);
         printf("wrote sim/out/dbg_rtl_spr.bin (frame %d)\n", dumpframe);
     }
+
+    if (hudf) fclose(hudf);
 
     top->final();
     delete top;

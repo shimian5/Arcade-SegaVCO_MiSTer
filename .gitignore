@@ -21,9 +21,11 @@ greybox_tmp/
 build_id.v
 jtag.cdf
 c5_pin_model_dump.txt
+cr_ie_info.json
 
 # Verilator / sim output
 sim/obj_dir/
+sim/obj_dir_trace/
 sim/out/
 *.vcd
 *.ppm

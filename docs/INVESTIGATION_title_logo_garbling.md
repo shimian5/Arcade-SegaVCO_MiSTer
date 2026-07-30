@@ -1837,3 +1837,39 @@ method did) rather than frame-index or T-state alignment, since this session
 establishes that frame/T-state alignment between any two independent boots
 of this hardware — real or emulated — is not expected to agree in the first
 place.
+
+---
+
+## UPDATE 2026-07-30 (session 8): T80 removed — the "hardware runs T80,
+## sim runs TV80" caveat that shadowed this whole investigation no longer
+## applies
+
+A fresh hardware build surfaced exactly the kind of discrepancy the closing
+note above anticipated: stars scattered across the whole play-field on real
+DE10-Nano hardware during actual gameplay, not confined to the sky band the
+way MAME (and every sim capture in this document) shows them. This is
+**Symptom 1** from the session-4 update above, never root-caused: "the
+sub CPU is drawing/erasing a different region... hardware runs **T80**, a
+CPU path no simulation result in this document has ever exercised."
+
+That caveat — repeated at "One caveat to carry forward" (session 4) and
+again in session 5's "Not yet done" list — applied to *every* finding in this
+document, including the seven-session CPU/game-state divergence chase that
+just closed above. All of it was TV80-only evidence about a T80-driven board.
+
+Rather than build a second (ModelSim) simulation path to actually cross-check
+T80 against TV80/MAME, removed T80 from the project outright: `rtl/cpu_z80.v`
+now unconditionally instantiates `tv80_core`, `rtl/T80/` is deleted, and the
+Quartus project (`Arcade-Z80-3D.qsf`/`files.qip`) builds TV80's Verilog
+sources instead of T80's VHDL. See `docs/PLAN.md`'s 2026-07-30 status entry
+for the full change and verification (sim rebuilds/runs clean, synthesis-only
+`quartus_map` still 0 errors). This makes every sim result in this document,
+past and future, a true statement about what the hardware runs — the
+"unexercised path" caveat is gone, not just documented as a risk.
+
+**Not yet done:** a fresh hardware build with this change hasn't been tested
+on the DE10-Nano yet. That test is what will actually tell us whether the
+star-extent symptom was T80-specific (and is now fixed) or a game-state/
+content bug independent of which CPU core runs it (and will reproduce under
+TV80 on hardware too) — this removal makes that determination possible, but
+doesn't by itself prove which one it was.

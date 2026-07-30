@@ -1,9 +1,7 @@
-set_global_assignment -name VHDL_FILE rtl/T80/T80_Pack.vhd
-set_global_assignment -name VHDL_FILE rtl/T80/T80_Reg.vhd
-set_global_assignment -name VHDL_FILE rtl/T80/T80_ALU.vhd
-set_global_assignment -name VHDL_FILE rtl/T80/T80_MCode.vhd
-set_global_assignment -name VHDL_FILE rtl/T80/T80.vhd
-set_global_assignment -name VHDL_FILE rtl/T80/T80s.vhd
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_core.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_alu.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_mcode.v
+set_global_assignment -name VERILOG_FILE rtl/tv80/rtl/core/tv80_reg.v
 
 set_global_assignment -name VERILOG_FILE rtl/cpu_z80.v
 set_global_assignment -name VERILOG_FILE rtl/rom_download.v

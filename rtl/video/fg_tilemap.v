@@ -47,6 +47,15 @@ module fg_tilemap
     input  wire [7:0]   xx,   // 0..255
     input  wire [7:0]   y,    // 0..255 (0..223 visible)
     output wire [7:0]   foreraw
+`ifdef VERILATOR_SIM
+    // SECT-2 investigation: combinational read port on the fg tilemap VRAM,
+    // so the HUD (RD:/SECT: digits at rows 1-2, the lives icons on row 25)
+    // can be sampled once per frame and compared cell-for-cell against
+    // MAME's maincpu-space read of 0xc000-0xc7ff. Value comparison, not a
+    // counter -- see docs/PLAN.md on degenerate instruments.
+    , input  wire [10:0] dbg_vram_addr
+    , output wire [7:0]  dbg_vram_data
+`endif
 );
 
     localparam FG_TILEMAP_LATENCY = 4;
@@ -54,6 +63,10 @@ module fg_tilemap
     reg [7:0] vram[0:2047];       // 2KB (c000-c7ff)
     reg [7:0] tile_rom[0:4095];   // 4KB: plane0 @ 0x000, plane1 @ 0x800, each code*8+py
     reg [7:0] xshift_rom[0:31];   // pr-5194
+
+`ifdef VERILATOR_SIM
+    assign dbg_vram_data = vram[dbg_vram_addr];
+`endif
 
     always @(posedge clk) begin
         if (cpu_we)    vram[cpu_addr]          <= cpu_wdata;

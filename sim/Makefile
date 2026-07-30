@@ -4,9 +4,8 @@
 # WSL distro; there is no Windows-native Verilator in this environment).
 # Run via: wsl -d archlinux -e make -C /mnt/c/.../sim
 #
-# T80 (VHDL) is not part of this build -- Verilator can't compile VHDL.
-# cpu_z80.v selects TV80 (pure Verilog) instead when VERILATOR_SIM is
-# defined; see rtl/cpu_z80.v.
+# cpu_z80.v always instantiates TV80 (pure Verilog) -- T80 (VHDL) has been
+# removed from the project entirely; see rtl/cpu_z80.v.
 
 VERILATOR ?= verilator
 TOP = z80_3d
@@ -27,8 +26,13 @@ SOURCES = \
 	$(RTL_DIR)/tv80/rtl/core/tv80_mcode.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_reg.v
 
+# TV80_REFRESH: real Z80 I/R (memory-refresh) register behavior -- must
+# match the Quartus build (Arcade-Z80-3D.qsf's VERILOG_MACRO) so sim results
+# stay representative of hardware. See Arcade-Z80-3D.qsf's comment: without
+# this, `LD A,R` is hardcoded to 0, which broke Buck Rogers' sub-CPU
+# star-field LFSR (it seeds from R).
 VFLAGS = --cc --exe --build -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-CASEINCOMPLETE \
-	+define+VERILATOR_SIM -Mdir obj_dir --top-module $(TOP) -O2
+	+define+VERILATOR_SIM +define+TV80_REFRESH -Mdir obj_dir --top-module $(TOP) -O2
 
 all: obj_dir/V$(TOP)
 

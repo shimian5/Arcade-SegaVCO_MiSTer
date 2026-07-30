@@ -1,13 +1,17 @@
-// Z80 CPU wrapper: T80 (VHDL) for real synthesis, TV80 (plain Verilog) for
-// simulation with the open-source Verilator tool, which cannot compile VHDL.
+// Z80 CPU wrapper: TV80 (plain Verilog), used for both real synthesis and
+// sim (Verilator). T80 (VHDL) has been removed -- it was never
+// simulated or cross-checked against MAME even once (see
+// docs/INVESTIGATION_title_logo_garbling.md's T80-vs-TV80 caveat), and the
+// hardware/MAME star-region divergence this replacement was made to close
+// out was consistent with exactly that untested path. A single CPU core
+// means sim results are now real evidence about what the hardware runs.
 //
-// TV80's tv80s.v wrapper ties its internal `cen` permanently to 1 (confirmed
+// tv80s.v's wrapper ties its internal `cen` permanently to 1 (confirmed
 // against the tv80 repo's own tb_top.v, which drives tv80s from a single
 // free-running clock with no gating at all) -- it has no usable
-// clock-enable input. Instantiating it directly would run the sim CPU at
-// the full core clock rate, undivided, i.e. ~8x faster relative to video
-// than real hardware (core_clk vs. core_clk/8) -- wrong for cycle-accurate
-// MAME frame-diffing (see docs/PLAN.md). Fixed by instantiating tv80_core
+// clock-enable input. Instantiating it directly would run the CPU at the
+// full core clock rate, undivided, i.e. ~8x faster relative to video than
+// intended (core_clk vs. core_clk/8). Fixed by instantiating tv80_core
 // directly instead of tv80s and driving its `cen` port from this module's
 // own `cen` input -- tv80_core's FSM genuinely gates its state updates on
 // `cen` internally (`ClkEn = cen && ~BusAck`, tv80_core.v). The
@@ -16,13 +20,10 @@
 // no_read); it runs unconditionally every `clk` edge, but since those
 // inputs only change on `cen` pulses (gated inside tv80_core), the decode
 // naturally holds steady between enables and needs no gating of its own.
-//
-// T80s (real synthesis target) is unaffected: it takes a genuine
-// clock-enable on CEN and needs no such workaround.
 module cpu_z80
 (
     input  wire        clk,       // core clock (39.936 MHz)
-    input  wire        cen,       // Z80 clock enable (4.992 MHz strobe on clk) -- T80s only, see above
+    input  wire        cen,       // Z80 clock enable (4.992 MHz strobe on clk)
     input  wire        reset_n,
     input  wire        wait_n,
     input  wire        int_n,
@@ -41,13 +42,12 @@ module cpu_z80
     output wire [7:0]  dout
 );
 
-`ifdef VERILATOR_SIM
-
     // tv80s.v with a real `cen` wired in, in place of its hardcoded
     // `assign cen = 1`. See header comment above.
     reg        mreq_n_r, iorq_n_r, rd_n_r, wr_n_r;
     wire       intcycle_n_w, no_read_w, write_w, iorq_w;
     reg [7:0]  di_reg;
+    reg        ts3_d;
     wire [6:0] mcycle_w, tstate_w;
 
     assign mreq_n = mreq_n_r;
@@ -89,6 +89,7 @@ module cpu_z80
             iorq_n_r <= 1'b1;
             mreq_n_r <= 1'b1;
             di_reg   <= 8'h00;
+            ts3_d    <= 1'b0;
         end else begin
             rd_n_r   <= 1'b1;
             wr_n_r   <= 1'b1;
@@ -112,35 +113,17 @@ module cpu_z80
                     mreq_n_r <= iorq_w;
                 end
             end
-            if (tstate_w[2] && wait_n == 1'b1 && !write_w && !no_read_w)
+            // EXPERIMENT (root-cause confirmation, see investigation notes):
+            // sample di only on the FIRST core clock of T3, which is what
+            // the ungated tv80s does (there T3 is one clock). Under `cen`
+            // T3 lasts 8 core clocks and this ran on all of them, so
+            // last-write-wins latched di long after iorq_n_r had been
+            // driven back high -- i.e. after z80_3d.v's
+            // `~sub_iorq_n ? ppi0_pa : memory` mux reverted to memory.
+            if (tstate_w[2] && !ts3_d && wait_n == 1'b1 && !write_w && !no_read_w)
                 di_reg <= di;
+            ts3_d <= tstate_w[2];
         end
     end
-
-`else
-
-    T80s cpu
-    (
-        .RESET_n (reset_n),
-        .CLK     (clk),
-        .CEN     (cen),
-        .WAIT_n  (wait_n),
-        .INT_n   (int_n),
-        .NMI_n   (nmi_n),
-        .BUSRQ_n (busrq_n),
-        .M1_n    (m1_n),
-        .MREQ_n  (mreq_n),
-        .IORQ_n  (iorq_n),
-        .RD_n    (rd_n),
-        .WR_n    (wr_n),
-        .RFSH_n  (rfsh_n),
-        .HALT_n  (halt_n),
-        .BUSAK_n (busak_n),
-        .A       (a),
-        .DI      (di),
-        .DO      (dout)
-    );
-
-`endif
 
 endmodule

@@ -53,6 +53,31 @@ module z80_3d
     , output wire [7:0]  dbg_plb
     , output wire [9:0]  dbg_hpos
     , output wire [8:0]  dbg_vpos
+    // Star-motion investigation: direct combinational read of bitmap_ram
+    // (the sub-CPU-written star layer), addressed the same way as the
+    // mixer's read (y*256+x). Lets the testbench dump the raw star bitmap
+    // once per frame for trajectory analysis against MAME's bitmap_ram
+    // memory_share, with no rendering/palette/capture step in between.
+    , input  wire [15:0] dbg_bitmap_addr
+    , output wire        dbg_bitmap_bit
+    // Star-motion investigation: direct combinational read of the sub CPU's
+    // work RAM (0xe000-0xe7ff, per docs/reference/turbo.cpp sub_prg_map --
+    // the star-position/velocity table almost certainly lives here), for a
+    // per-frame state diff against MAME's subcpu program-space read of the
+    // same addresses (no MAME named memory_share exists for this RAM -- it's
+    // a plain `.ram()` -- so the comparison is done via address, not tag).
+    , input  wire [10:0] dbg_workram_addr
+    , output wire [7:0]  dbg_workram_data
+    // SECT-2 investigation: fg tilemap VRAM (0xc000-0xc7ff) read port. The
+    // HUD lives here in plain ASCII tile codes, so "did this run reach
+    // SECT 2, and how did it end?" is answerable identically in sim and in
+    // MAME without guessing at a RAM variable.
+    , input  wire [10:0] dbg_vram_addr
+    , output wire [7:0]  dbg_vram_data
+    // Main CPU work RAM (0xf800-0xffff) read port, for locating the
+    // lives/timer/sector game-state variables behind the HUD.
+    , input  wire [10:0] dbg_mainram_addr
+    , output wire [7:0]  dbg_mainram_data
 `endif
 );
 
@@ -261,7 +286,13 @@ module z80_3d
         .dout    (sub_do)
     );
 
-    wire sub_write   = ~sub_mreq_n && ~sub_wr_n;
+    // Same trailing-edge, one-clock write strobe as the main CPU's -- see
+    // the cpu_write comment below for why. sub_io_read stays a level: it is
+    // a read, and reads have no data-capture edge on this side.
+    wire sub_write_lvl = ~sub_mreq_n && ~sub_wr_n;
+    reg  sub_write_d;
+    always @(posedge clk) sub_write_d <= sub_write_lvl;
+    wire sub_write   = sub_write_d && !sub_write_lvl;
     wire sub_io_read = ~sub_iorq_n && ~sub_rd_n;
 
     // sub_prg_map (docs/reference/turbo.cpp buckrog_state::sub_prg_map):
@@ -298,38 +329,60 @@ module z80_3d
                      (sub_a < 16'h2000) ? sub_rom_dout : sub_workram_dout;
 
     // ------------------------------------------------------------------
-    // Main<->sub protocol (docs/PLAN.md "Main<->sub protocol"). Trivially
-    // a register (ppi0_pa, the command latch) plus two flags in RTL --
-    // MAME's delayed_i8255_w/600Hz-quantum machinery is a pure emulator
-    // scheduling artifact with no hardware analogue and is NOT reproduced
-    // here.
-    //   1. Main writes PPI0 port A -> 8-bit command register (= ppi0_pa).
-    //   2. Main writes PPI0 port C bit 7 -> sub /INT directly (level, not
-    //      edge-latched: real hardware ties /INT straight to the 8255's
-    //      output pin).
-    //   3. Sub executes any IN -> reads command, clears PPI0 PC6 (ACK,
-    //      readable by main). Implemented as a dedicated ack_reg overriding
-    //      bit 6 of the CPU-visible port-C readback (see "Support chips" in
-    //      docs/PLAN.md: "PPI0 additionally needs port C bit 6 as a
-    //      readable input driven by the sub-CPU ACK" -- the i8255 model
-    //      itself is generic mode-0 with per-port direction, so the mixed
-    //      per-bit override for just this one bit is handled here instead
-    //      of inside i8255.v).
+    // Main<->sub protocol (docs/PLAN.md "Main<->sub protocol"). This is
+    // NOT a software protocol: it is the 8255's own group-A mode-2 output
+    // handshake, entirely inside u_ppi0. The game programs PPI0 with
+    // control word 0xC0 once at boot, and after that:
+    //   1. Main writes PPI0 port A -> command latch (= ppi0_pa), and the
+    //      8255 itself drives PC7 (/OBF) low. PC7 is wired straight to the
+    //      sub CPU's /INT (834-5120 sheet 5: IC90 pin 10 -> IC50 pin 16,
+    //      no gating), so the command write *is* the interrupt.
+    //   2. The sub CPU's /IORQ is wired straight back to PC6 (/ACK)
+    //      (IC90 pin 11 <- IC50 pin 20). It pulses on the interrupt-
+    //      acknowledge cycle and again on the ISR's IN, and the first of
+    //      those raises /OBF, deasserting /INT. Nothing in software ever
+    //      clears it.
+    //   3. Main polls port C bit 7 to see the command was consumed.
+    // MAME clears the handshake one machine cycle later (on the IN, via
+    // subcpu_command_r's pc6_w) and its delayed_i8255_w/600Hz-quantum
+    // machinery is a pure emulator scheduling artifact; neither is
+    // reproduced here -- the schematic wins. See
+    // docs/INVESTIGATION_starfield_2x_speed.md.
     // ------------------------------------------------------------------
-    wire sub_int_n = ppi0_pc[7];
-
-    reg ack_reg;
-    wire ppi0_portc_write = sel_ppi0 && cpu_write && (cpu_a[1:0] == 2'd2);
-    always @(posedge clk) begin
-        if (reset) ack_reg <= 1'b1;
-        else if (sub_io_read)        ack_reg <= 1'b0;
-        else if (ppi0_portc_write)   ack_reg <= cpu_do[6];
-    end
+    wire sub_int_n = ppi0_pc[7];   // = /OBF, driven by u_ppi0 in mode 2
 
     // ------------------------------------------------------------------
     // Memory decode (main_prg_map, docs/PLAN.md phase 1)
     // ------------------------------------------------------------------
-    wire cpu_write = ~cpu_mreq_n && ~cpu_wr_n;
+    // WRITE STROBES ARE TRAILING-EDGE, ONE CORE CLOCK WIDE.
+    //
+    // cpu_z80.v registers mreq_n/wr_n on every posedge clk, ungated by
+    // `cen`, while the CPU's data bus changes on the `cen` edge. Measured
+    // on a real write (docs/INVESTIGATION_starfield_2x_speed.md 6b), the
+    // raw ~mreq_n & ~wr_n window is 8 core clocks wide but only its LAST
+    // clock carries the byte being written -- the first 7 still hold the
+    // previous bus value:
+    //
+    //   7 clks:  mreq_n=0 wr_n=0  do=01   <- stale
+    //   1 clk :  mreq_n=0 wr_n=0  do=b9   <- the actual byte
+    //
+    // Latching on every clock of that window happens to end up with the
+    // right value (last write wins), which is why the RAMs were never
+    // visibly wrong. But any consumer whose latched value is used
+    // COMBINATIONALLY sees a 7-clock excursion to a garbage value -- e.g.
+    // PPI0 port C, whose bits drive fchg (a live video register) and, in
+    // mode 0, once drove the sub CPU's /INT as a runt pulse.
+    //
+    // Deriving a single-cycle strobe from the TRAILING edge fixes this: at
+    // that point wr_n has just risen while cpu_a/cpu_do still hold the
+    // write's address and data (they persist for many more clocks), so
+    // every consumer latches exactly the byte the RAMs were already
+    // getting, exactly once. Do NOT qualify with ce_z80 instead -- the cen
+    // pulse lands mid-window, where the data is still stale.
+    wire cpu_write_lvl = ~cpu_mreq_n && ~cpu_wr_n;
+    reg  cpu_write_d;
+    always @(posedge clk) cpu_write_d <= cpu_write_lvl;
+    wire cpu_write = cpu_write_d && !cpu_write_lvl;
 
     wire sel_rom     = (cpu_a < 16'h8000);
     wire sel_vram    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
@@ -358,6 +411,10 @@ module z80_3d
         .xx           (xx_native),
         .y            (y_native),
         .foreraw      (foreraw)
+`ifdef VERILATOR_SIM
+        , .dbg_vram_addr (dbg_vram_addr)
+        , .dbg_vram_data (dbg_vram_data)
+`endif
     );
 
     // pr-5196 (Y-scale, 512B @ proms offset 0x100) and pr-5199 (sprite
@@ -382,6 +439,169 @@ module z80_3d
     assign dbg_plb      = spr_plb;
     assign dbg_hpos      = hpos;
     assign dbg_vpos      = vpos;
+    assign dbg_bitmap_bit = bitmap_ram[dbg_bitmap_addr];
+    assign dbg_workram_data  = sub_workram[dbg_workram_addr];
+    assign dbg_mainram_data  = work_ram[dbg_mainram_addr];
+
+    // Star-motion investigation: per-video-frame census of sub-CPU interrupt
+    // activity. Enabled with +subintcount (no rebuild-time define needed) so
+    // it can be turned on without dragging in the whole SIM_DEBUG_TRACE
+    // firehose. One line per frame:
+    //   intack   -- sub-CPU interrupt ACCEPTANCES (M1 & IORQ rises)
+    //   ioread   -- sub-CPU IN instructions (command-latch reads / ACK)
+    //   bmwr     -- bitmap_ram writes (star plotting work)
+    //   intlow   -- ce_z80 ticks with /INT asserted (how long it is held)
+    //   pcwr     -- main-CPU writes to PPI0 port C
+    integer si_intack = 0, si_ioread = 0, si_bmwr = 0, si_intlow = 0, si_pcwr = 0;
+    integer si_frame = 0;
+    reg     si_enabled = 0;
+    reg     si_intack_d = 0, si_ioread_d = 0, si_bmwr_d = 0;
+    reg [15:0] si_bmwr_a = 0;
+    reg [7:0]  si_bmwr_do = 0;
+    integer si_loop = 0, si_iter = 0, si_pawr = 0;
+    integer si_tick = 0;
+    reg        si_p0_d = 0;
+    reg [1:0]  si_p0_a = 0;
+    reg [7:0]  si_p0_first = 0, si_p0_last = 0;
+    reg        si_p0rd_d = 0;
+    reg [1:0]  si_p0rd_a = 0;
+    wire       si_p0rd_now = sel_ppi0 && ~cpu_mreq_n && ~cpu_rd_n;
+    reg si_int_d = 1;
+    reg si_iorq_d = 1;
+    integer si_iorq_clks = 0, si_iorq_cens = 0;
+    wire    si_intack_now = ~sub_m1_n && ~sub_iorq_n;
+    integer si_bmw_lo = -1, si_bmw_hi = -1;
+    initial begin
+        si_enabled = $test$plusargs("subintcount");
+        if (!$value$plusargs("bmwrtrace_lo=%d", si_bmw_lo)) si_bmw_lo = -1;
+        if (!$value$plusargs("bmwrtrace_hi=%d", si_bmw_hi)) si_bmw_hi = -1;
+    end
+    // Address of the most recent sub-CPU opcode fetch, so BMWR lines carry a
+    // PC comparable to MAME's tap-side subcpu PC.
+    reg [15:0] si_last_pc = 0;
+    reg [15:0] si_main_pc = 0;
+    reg        si_mm1_d = 0;
+    wire       si_mm1_now = ~cpu_m1_n && ~cpu_mreq_n && ~cpu_rd_n;
+    reg        si_m1_d = 0;
+    wire       si_m1_now = ~sub_m1_n && ~sub_mreq_n && ~sub_rd_n;
+    always @(posedge clk) begin
+        si_m1_d <= si_m1_now;
+        if (si_m1_now && !si_m1_d) si_last_pc <= sub_a;
+        si_mm1_d <= si_mm1_now;
+        if (si_mm1_now && !si_mm1_d) si_main_pc <= cpu_a;
+    end
+
+    always @(posedge clk) begin
+        si_intack_d <= si_intack_now;
+        si_ioread_d <= sub_io_read;
+        si_bmwr_d   <= sub_bitmap_we;
+        if (sub_bitmap_we) begin si_bmwr_a <= sub_a; si_bmwr_do <= sub_do; end
+        // Star-loop invocations and per-star iterations: sub ROM $030B is the
+        // top of buckrogn's star updater (LD A,($F40B) = star count; the loop
+        // body starts at $0310 and runs once per star).
+        if (si_m1_now && !si_m1_d && sub_a == 16'h030B) si_loop = si_loop + 1;
+        if (si_m1_now && !si_m1_d && sub_a == 16'h0310) si_iter = si_iter + 1;
+        if (si_intack_now && !si_intack_d) si_intack = si_intack + 1;
+        if (sub_io_read   && !si_ioread_d) si_ioread = si_ioread + 1;
+        if (sub_bitmap_we && !si_bmwr_d)   si_bmwr   = si_bmwr + 1;
+        if (ce_z80 && !sub_int_n)          si_intlow = si_intlow + 1;
+        if (sel_ppi0 && cpu_write && (cpu_a[1:0] == 2'd2)) si_pcwr = si_pcwr + 1;
+        // Commands the main CPU OFFERS (port A writes) vs commands the sub
+        // CPU actually TAKES (intack). Equal => the mode-2 handshake is
+        // lossless; pawr > intack => bytes are being overwritten before the
+        // sub CPU services them.
+        if (sel_ppi0 && cpu_write && (cpu_a[1:0] == 2'd0)) si_pawr = si_pawr + 1;
+        // Per-write trace of the star plotting itself: address + bit value.
+        // Bitmap addressing is addr == y*256+x, so the address delta between
+        // the clear of a star's old cell and the set of its new one IS the
+        // per-frame step. Bounded by +bmwrtrace_lo=N +bmwrtrace_hi=N.
+        // Sample at the END of the write strobe (the value bitmap_ram
+        // actually keeps), not the first cycle -- sub_do is still settling
+        // on the leading edge and a leading-edge sample reads garbage.
+        if (si_bmwr_d && !sub_bitmap_we &&
+            si_frame >= si_bmw_lo && si_frame <= si_bmw_hi)
+            $display("BMWR frame=%0d addr=%04x d=%0d do=%02x pc=%04x",
+                      si_frame, si_bmwr_a, si_bmwr_do[0], si_bmwr_do, si_last_pc);
+        // /INT waveform + every PPI0 write, over the +bmwrtrace window. The
+        // sub CPU's whole command channel is its ISR ($0038: IN A,($00) ->
+        // $F600+nibble), so how long PC7 is held low decides how many
+        // commands ever reach it.
+        si_tick <= si_tick + (ce_z80 ? 1 : 0);
+        si_p0_d <= sel_ppi0 && cpu_write;
+        if (sel_ppi0 && cpu_write) begin
+            si_p0_a    <= cpu_a[1:0];
+            si_p0_last <= cpu_do;
+            if (!si_p0_d) si_p0_first <= cpu_do;
+        end
+        si_int_d <= sub_int_n;
+        si_iorq_d <= sub_iorq_n;
+        if (!sub_iorq_n) begin
+            si_iorq_clks <= si_iorq_d ? 1 : si_iorq_clks + 1;
+            si_iorq_cens <= si_iorq_d ? (ce_z80 ? 1 : 0)
+                                      : si_iorq_cens + (ce_z80 ? 1 : 0);
+        end
+        si_p0rd_d <= si_p0rd_now;
+        if (si_p0rd_now) si_p0rd_a <= cpu_a[1:0];
+        if (si_frame >= si_bmw_lo && si_frame <= si_bmw_hi) begin
+            if (si_int_d != sub_int_n)
+                $display("INTEDGE frame=%0d tick=%0d int_n=%0b", si_frame, si_tick, sub_int_n);
+            // Print once per PPI0 write, at the END of the strobe, showing
+            // BOTH the value present on the first cycle of the strobe and
+            // the value present on the last -- if they differ, the i8255
+            // latches the wrong byte.
+            if (si_p0_d && !(sel_ppi0 && cpu_write))
+                $display("PPI0WR frame=%0d tick=%0d addr=%0d first=%02x last=%02x pc=%04x",
+                          si_frame, si_tick, si_p0_a, si_p0_first, si_p0_last, si_main_pc);
+            // Main-CPU READS of PPI0. The command loop polls port C for
+            // /OBF, so what it sees there decides when (and how often) it
+            // writes the next command. Printed at the end of the read
+            // strobe, where ppi0_dout has settled.
+            if (si_p0rd_d && !si_p0rd_now)
+                $display("PPI0RD frame=%0d tick=%0d addr=%0d data=%02x pc=%04x",
+                          si_frame, si_tick, si_p0rd_a, ppi0_dout, si_main_pc);
+            // What the SUB CPU actually latches. `subdi` is the byte on its
+            // data bus during the IN; `pa` is the command latch at that
+            // instant. If they differ, the sub_di mux is wrong; if `pa` has
+            // already moved on, the main CPU overwrote the command.
+            if (sub_io_read && !si_ioread_d)
+                $display("SUBIN  frame=%0d tick=%0d subpc=%04x suba=%04x subdi=%02x pa=%02x",
+                          si_frame, si_tick, si_last_pc, sub_a, sub_di, ppi0_pa);
+            // Width of the sub CPU's /IORQ pulse -- this net IS the 8255's
+            // /ACK on the real board, so its width is a hardware-fidelity
+            // quantity (8255-5 spec has a minimum /ACK pulse width).
+            if (si_iorq_d && sub_iorq_n)
+                $display("IORQW  frame=%0d clks=%0d cens=%0d",
+                          si_frame, si_iorq_clks, si_iorq_cens);
+            if (si_intack_now && !si_intack_d)
+                $display("SUBACK frame=%0d tick=%0d subdi=%02x pa=%02x",
+                          si_frame, si_tick, sub_di, ppi0_pa);
+            // Sub-CPU stores into the $F600 command block -- the ground
+            // truth for "which command byte the ISR decided it saw".
+            if (sub_write && sub_a[15:12] >= 4'he && sub_a[11:0] >= 12'h600
+                          && sub_a[11:0] <= 12'h60f)
+                $display("F600WR frame=%0d tick=%0d addr=%04x data=%02x subpc=%04x",
+                          si_frame, si_tick, sub_a, sub_do, si_last_pc);
+        end
+        if (vblank_rise) begin
+            if (si_enabled)
+                // dx/dy/nstars/horizon are the sub CPU's own star-motion
+                // state: $F402 = per-frame X step, $F403 = Y step,
+                // $F40B = number of stars processed, $F410 = row limit
+                // above which a star is not plotted.
+                $display("SUBINT frame=%0d intack=%0d pawr=%0d ioread=%0d bmwr=%0d intlow=%0d pcwr=%0d loop=%0d iter=%0d dx=%02x dy=%02x nstars=%02x horiz=%02x f600=%02x%02x%02x%02x%02x%02x%02x%02x",
+                          si_frame, si_intack, si_pawr, si_ioread, si_bmwr, si_intlow, si_pcwr,
+                          si_loop, si_iter,
+                          sub_workram[11'h402], sub_workram[11'h403],
+                          sub_workram[11'h40b], sub_workram[11'h410],
+                          sub_workram[11'h600], sub_workram[11'h601],
+                          sub_workram[11'h602], sub_workram[11'h603],
+                          sub_workram[11'h604], sub_workram[11'h605],
+                          sub_workram[11'h606], sub_workram[11'h607]);
+            si_frame = si_frame + 1;
+            si_intack = 0; si_ioread = 0; si_bmwr = 0; si_intlow = 0; si_pcwr = 0;
+            si_loop = 0; si_iter = 0; si_pawr = 0;
+        end
+    end
 `endif
     sprite_engine u_sprites
     (
@@ -432,15 +652,13 @@ module z80_3d
         .cs    (sel_ppi0), .we (cpu_write), .addr (cpu_a[1:0]),
         .din   (cpu_do), .dout (ppi0_dout),
         .in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+        // PC6 (/ACK) is the sub CPU's /IORQ, wired straight through on the
+        // real board -- ungated, so it also fires on the sub CPU's
+        // interrupt-acknowledge cycle. See "Main<->sub protocol" above.
+        .ack_n (sub_iorq_n),
         .pa    (ppi0_pa), .pb (ppi0_pb), .pc (ppi0_pc),
         .pa_wr (), .pb_wr (), .pc_wr (ppi0_pc_wr)
     );
-
-    // Port-C bit 6 readback is overridden with the sub-CPU ACK flag (see
-    // "Main<->sub protocol" above); all other bits reflect the PPI's own
-    // latched output register.
-    wire [7:0] ppi0_dout_ovr = (cpu_a[1:0] == 2'd2) ?
-                               {ppi0_dout[7], ack_reg, ppi0_dout[5:0]} : ppi0_dout;
 
     // PPI1: buckrog_state's out_pc_callback is ppi1c_w (docs/reference/
     // turbo.cpp lines 393-405) -- OBCH0-2, coin meters (bits 4/5), start
@@ -455,6 +673,7 @@ module z80_3d
         .cs    (sel_ppi1), .we (cpu_write), .addr (cpu_a[1:0]),
         .din   (cpu_do), .dout (ppi1_dout),
         .in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+        .ack_n (1'b1),                 // PPI1 is mode 0 only
         .pa    (ppi1_pa), .pb (ppi1_pb), .pc (ppi1_pc),
         .pa_wr (), .pb_wr (), .pc_wr ()
     );
@@ -510,7 +729,7 @@ module z80_3d
 
     assign cpu_di = sel_rom     ? maincpu_dout   :
                      sel_vram   ? vram_rdata     :
-                     sel_ppi0   ? ppi0_dout_ovr  :
+                     sel_ppi0   ? ppi0_dout      :
                      sel_ppi1   ? ppi1_dout      :
                      sel_i8279  ? i8279_dout     :
                      sel_sprram ? sprram_rdata   :
@@ -859,6 +1078,47 @@ module z80_3d
         if (int_ack_rise) optrace_interrupted <= 1'b1;
     end
 
+    // Star-motion investigation: same OPTRACE technique as the main-CPU
+    // audit above (PC/opcode/T-states/interrupted-flag per instruction),
+    // applied to the SUB CPU instead -- the star-position math lives
+    // entirely in its program, which the earlier main-CPU-focused T-state
+    // audit never exercised. Bounded to SUBOPTRACE_FRAME (set via
+    // $value$plusargs, default off) to keep the log a manageable size; one
+    // frame is ~5-15k sub-CPU instructions at 4.992 MHz/60 Hz.
+    integer subtrace_frame_lo = -1, subtrace_frame_hi = -1;
+    initial begin
+        if (!$value$plusargs("suboptrace_lo=%d", subtrace_frame_lo)) subtrace_frame_lo = -1;
+        if (!$value$plusargs("suboptrace_hi=%d", subtrace_frame_hi)) subtrace_frame_hi = -1;
+    end
+    reg         sub_m1_fetch_d;
+    wire        sub_m1_fetch      = ~sub_m1_n && ~sub_mreq_n && ~sub_rd_n;
+    wire        sub_m1_fetch_rise = sub_m1_fetch && !sub_m1_fetch_d;
+    wire        sub_int_ack       = ~sub_m1_n && ~sub_iorq_n;
+    reg         sub_int_ack_d;
+    wire        sub_int_ack_rise  = sub_int_ack && !sub_int_ack_d;
+    reg  [15:0] subtrace_pc;
+    reg  [7:0]  subtrace_op;
+    integer     subtrace_tstates;
+    reg         subtrace_interrupted;
+    reg         subtrace_valid;
+    always @(posedge clk) begin
+        sub_m1_fetch_d <= sub_m1_fetch;
+        sub_int_ack_d  <= sub_int_ack;
+        if (sub_m1_fetch_rise) begin
+            if (subtrace_valid && dbg_frame >= subtrace_frame_lo && dbg_frame <= subtrace_frame_hi)
+                $display("SUBOPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
+                          dbg_frame, subtrace_pc, subtrace_op, subtrace_tstates, subtrace_interrupted, sub_a);
+            subtrace_pc          <= sub_a;
+            subtrace_op          <= sub_di;
+            subtrace_tstates     <= 0;
+            subtrace_interrupted <= 1'b0;
+            subtrace_valid       <= 1'b1;
+        end else if (ce_z80) begin
+            subtrace_tstates <= subtrace_tstates + 1;
+        end
+        if (sub_int_ack_rise) subtrace_interrupted <= 1'b1;
+    end
+
     integer trace_count = 0;
     always @(posedge clk) begin
         if (!reset && trace_count < 400) begin
@@ -906,9 +1166,9 @@ module z80_3d
         if (~sub_m1_n && ~sub_mreq_n) dbg_sub_fetch = dbg_sub_fetch + 1;
         if (sub_bitmap_we) dbg_bitmap_wr = dbg_bitmap_wr + 1;
         if (vblank_rise) begin
-            $display("[%0t] FRAME %0d: vram_wr=%0d sprram_wr=%0d sprpos_wr=%0d ppi0_wr=%0d ppi1_wr=%0d i8279_wr=%0d sub_fetch=%0d bitmap_wr=%0d ppi0_pa=%02x ppi0_pb=%02x ppi0_pc=%02x ppi1_pc=%02x ack=%b sub_a=%04x sub_int_n=%b cpu_a=%04x",
+            $display("[%0t] FRAME %0d: vram_wr=%0d sprram_wr=%0d sprpos_wr=%0d ppi0_wr=%0d ppi1_wr=%0d i8279_wr=%0d sub_fetch=%0d bitmap_wr=%0d ppi0_pa=%02x ppi0_pb=%02x ppi0_pc=%02x ppi1_pc=%02x sub_a=%04x sub_int_n=%b cpu_a=%04x",
                       $time, dbg_frame, dbg_vram_wr, dbg_sprram_wr, dbg_sprpos_wr, dbg_ppi0_wr, dbg_ppi1_wr, dbg_i8279_wr, dbg_sub_fetch, dbg_bitmap_wr,
-                      ppi0_pa, ppi0_pb, ppi0_pc, ppi1_pc, ack_reg, sub_a, sub_int_n, cpu_a);
+                      ppi0_pa, ppi0_pb, ppi0_pc, ppi1_pc, sub_a, sub_int_n, cpu_a);
             dbg_frame = dbg_frame + 1;
             dbg_vram_wr = 0; dbg_sprram_wr = 0; dbg_sprpos_wr = 0;
             dbg_ppi0_wr = 0; dbg_ppi1_wr = 0; dbg_i8279_wr = 0;
