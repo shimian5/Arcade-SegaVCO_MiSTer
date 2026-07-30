@@ -752,6 +752,27 @@ module z80_3d
         end
     end
 
+    // Session-7 follow-up: the full-instruction-trace diff (see doc UPDATE
+    // 2026-07-30) found the FIRST real sim/MAME PC divergence at frame 11,
+    // inside a plain DEC-HL/JR-NZ delay loop with no data-dependent branch --
+    // sim takes the vblank interrupt one loop iteration later than MAME. The
+    // next scoped question: is that because sim's vblank interrupt is
+    // asserted/recognized at a different absolute T-state-since-reset than
+    // MAME's, or because the two harnesses' CPUs already carry a small
+    // T-state offset from a different reset-to-first-fetch startup latency?
+    // Free-running T-state counter, gated only by `reset` (never re-armed),
+    // logged at every int_ack -- gives the absolute T-state-since-reset of
+    // each interrupt-accept event directly comparable against a MAME-side
+    // measurement of the same quantity (see tools/mame/dump_intack_cycles.lua).
+    // Counts from simulation t=0 (not gated by `reset`) so it is directly
+    // comparable to MAME's `machine.time` (also measured from t=0), sidestepping
+    // any difference in how long each harness's own reset pulse lasts.
+    integer reset_tstate_count = 0;
+    always @(posedge clk) begin
+        if (ce_z80) reset_tstate_count <= reset_tstate_count + 1;
+        if (int_ack_rise) $display("[%0t] INTACK_ABS_TSTATE frame=%0d abs_tstate=%0d", $time, dbg_frame, reset_tstate_count);
+    end
+
     // Session-6-continued-yet-further: with interrupt-acceptance cost
     // proven spec-exact (above), the ISR at 0x0e56 (reached via 0x0038's
     // JP) branches on three work-RAM flags (0xf834/0xf835/0xf836,
@@ -824,7 +845,7 @@ module z80_3d
     reg         optrace_valid;
     always @(posedge clk) begin
         if (main_m1_fetch_rise) begin
-            if (optrace_valid && dbg_frame >= 5 && dbg_frame <= 48)
+            if (optrace_valid && dbg_frame <= 48)
                 $display("OPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
                           dbg_frame, optrace_pc, optrace_op, optrace_tstates, optrace_interrupted, cpu_a);
             optrace_pc          <= cpu_a;

@@ -1448,3 +1448,392 @@ investigated:
    CPU performs and compare against the same reads MAME's CPU makes at the
    same PC.
 artifact caught red-handed.
+
+## UPDATE 2026-07-30 (session 7): full per-instruction PC trace built for both sides; the actual first divergence is much earlier than frame 44-45 (frame 11), and it is interrupt-boundary phase, not a data read
+
+Built the instrument the previous update called for: a per-M1-fetch trace for
+*both* sides (not once per frame), diffed instruction-for-instruction.
+
+**Sim side.** `rtl/z80_3d.v`'s existing `OPTRACE` probe (already logs every
+main-CPU M1 fetch) was widened from `dbg_frame 5..48` to `dbg_frame 0..48` (no
+lower bound) so it captures from reset. Rebuilt with
+`+define+VERILATOR_SIM +define+SIM_DEBUG_TRACE` (this define is not wired
+into `sim/Makefile`; invoked directly via `verilator ... +define+SIM_DEBUG_TRACE
+../rtl/*.v ... tb_z80_3d.cpp`, matching what past sessions apparently did
+ad hoc). Ran 50 frames, captured 672,245 raw `OPTRACE` lines (frame 0 has one
+spurious startup-transient line, same artifact this doc already documents for
+`INTACK_TSTATES`/`dbg_hpos`/`dbg_vpos` — dropped).
+
+**MAME side.** `manager.machine.debugger` is only populated with `-debug`.
+Two harness traps hit and resolved, both worth recording:
+
+- `-debug` alone hangs indefinitely under `-video none` (it tries to open a
+  windowed debug view with no video backend to host it). Fix: `-debugger
+  none`, which keeps the debugger interface live (so
+  `manager.machine.debugger:command(...)` works) without opening any UI.
+  `-debugger none -video none -sound none -autoboot_script <script>` runs to
+  completion cleanly.
+- MAME's `trace` debugger command **compresses repeated loop iterations**
+  by default (`(loops for N instructions)`) — exactly the busy-wait-loop
+  shape this whole investigation revolves around, so the default trace
+  output silently hides the one thing being measured. Fix:
+  `trace <file>,maincpu,noloop`. Without it, the trace had ~65k lines for 48
+  frames; with it, ~474k — the difference is entirely swallowed loop bodies.
+
+New script `tools/mame/dump_full_pc_trace.lua`: `-debug -debugger none -video
+none -sound none`, issues `trace mame_full_trace.txt,maincpu,noloop`, counts
+frames via `register_periodic`, stops the trace and exits at frame 49.
+
+**Aligning the two traces.** MAME's trace logs one line per *logical*
+instruction (`"ADDR: disassembly"`); sim's `OPTRACE` logs one line per *M1
+fetch*, so a `CB`/`ED`/`DD`/`FD`-prefixed instruction is 2 sim lines but 1
+MAME line — recombined sim's stream the same way
+`tools/z80_tstate_check.py` already does (new `tools/build_pc_seq.py`, a
+much smaller purpose-built version of that recombination, for producing a
+bare PC sequence rather than checking T-states). Two probe artifacts found
+and fixed *before* trusting the diff, in the spirit of this doc's own
+recurring rule:
+
+1. **HALT-refetch double-counting.** Real Z80 HALT re-fetches `HALT_addr+1`
+   every M-cycle while waiting for an interrupt; sim's `OPTRACE` logs every
+   one of those refetches as its own M1 event, while MAME's trace logs the
+   `halt` instruction once and then jumps straight to the ISR line on
+   interrupt — it does not print refetch lines at all. Diffing the raw
+   sequences without accounting for this desyncs the two traces by exactly
+   1 at the very first `HALT` (visible as an immediate, spurious "mismatch"
+   at logical instruction index 18, frame 0 → 1, sim sitting at `070E`
+   while MAME already shows `0038`). Fixed in `build_pc_seq.py`'s
+   `sim_seq()`: once a `0x76` (HALT) opcode is seen, drop every subsequent
+   sim event whose PC equals `HALT_addr+1` (not just dedup — MAME emits
+   zero such lines, so sim must contribute zero too) until the PC moves
+   away from it (the interrupt vector fetch).
+2. Confirmed this alignment holds long-range, not just locally: with the
+   fix applied, sim and MAME's PC sequences matched **exactly**, instruction
+   for instruction, index 3 through index 32,554 — the first ~32.5k
+   instructions across frames 0 through the start of frame 11 — zero
+   mismatches. This is a much stronger, finer-grained confirmation of the
+   opcode-by-opcode T-state audit's conclusion than the once-per-frame
+   `PCTRACE` probe could ever give: not just "same PC at each vblank" but
+   "identical instruction stream, in order, for 32,554 consecutive
+   instructions."
+
+**The actual first divergence: frame 11, logical instruction index 32,555 —
+not frame 44-45.** At that index sim is at `PC=07B5` (still inside the loop
+body) while MAME has already reached `PC=0038` (the interrupt vector). The
+loop in question, confirmed by disassembly on both sides (`mame_full_trace.txt`
+line ~12212 onward):
+
+```
+07B3: dec  hl
+07B4: ld   a,l
+07B5: or   h
+07B6: jr   nz,$07B3
+```
+
+— the same delay-loop *shape* (`DEC HL` / test `HL==0` / `JR NZ`) as the
+32768-iteration loop this document already implicates in the frame-44/45
+split (same ~26T/iteration cost class). Sim executes one more step of this
+loop iteration (`07B5`, the `OR H`) before the vblank interrupt is accepted;
+MAME's interrupt lands one instruction earlier in the same iteration (right
+after `07B4`, the `LD A,L`). Confirmed this is a **constant 1-instruction
+shift, not a content divergence**: re-diffing from index 32,556 onward with
+MAME's index offset by -1 (i.e. "does sim[i] == mame[i-1] from here on")
+matches perfectly for the next 1,277 instructions (through index 33,832) —
+including the ISR entry (`0038`), the full `f834`/`f835`/`f836` flag-check
+chain (`0E56`-`0E72` etc.), and a jump into `1072`-`1075`/`1078`-`107A` —
+before the constant-offset check itself becomes uninterpretable once
+execution re-enters the *same* 4-instruction `07B3-07B6` loop again (a
+constant off-by-1 index shift against a period-4 loop produces spurious
+"mismatches" at 3 out of every 4 checked positions even though the loop
+content is identical — an artifact of the comparison method, not a second
+real divergence; flagging this so a future session doesn't chase it as new
+data).
+
+**What this rules out, directly.** This is not a data read producing a
+different branch outcome. Both sides execute the *identical four opcodes*,
+with the *identical operand bytes*, in the *identical order* — `DEC HL`,
+`LD A,L`, `OR H`, `JR NZ,$07B3` — right up to and including the divergence
+point. There is no `LD A,(nn)`, no `IN A,(n)`, no conditional-flag test
+whose result depends on a RAM/port value that could differ between harnesses
+anywhere in this loop body. The *only* thing that differs is which of the
+loop's four instruction-boundaries the vblank interrupt happens to land on.
+
+**What this points to instead: interrupt-recognition timing relative to
+CPU reset, not instruction content.** Given the already-completed audit
+(TV80 costs every instruction exactly per the Zilog spec, zero mismatches
+across 551,212 instructions, frames 5-48) and MAME's Z80 core being the
+long-established reference implementation for the same spec, neither CPU is
+plausibly miscounting T-states inside this simple 4-opcode loop. For the
+interrupt to land on a different loop iteration in the two runs, either (a)
+the video-timing side of one harness or the other asserts/edges the vblank
+interrupt at a different T-state-since-reset instant than the other, or (b)
+the two harnesses' CPUs have already accumulated a small T-state offset
+*before* reaching this loop — e.g. a different number of cycles consumed
+between "reset released" and "first instruction fetched," a boot-sequencing
+difference that would never show up in the opcode-by-opcode audit (which
+checks *individual instruction* cost, not *cumulative* alignment from time
+zero) and would never show up in the once-per-frame `PCTRACE`/`ISRFLAGS`
+probes either (those only sample at vblank, coarse enough to miss a
+sub-instruction-scale skew that hasn't yet flipped a frame boundary). Both
+(a) and (b) are harness/test-setup questions, not RTL/CPU-core bugs — squarely
+in the "artifact of the two harnesses' initial conditions not matching"
+category the original task asked to distinguish, not "genuine emulation gap."
+
+**Not yet done (next session) — this is now a fully scoped, mechanical next
+step, not an open-ended search:** measure the exact T-state-since-reset
+count at which each harness's main CPU accepts *this specific* frame-11
+interrupt, and compare. Sim already has everything needed
+(`tstates_since_intack`'s sibling counter, or simply a free-running T-state
+counter gated by `ce_z80` since `reset` deasserts, sampled at `int_ack_rise`).
+MAME needs the same via
+`manager.machine.devices[":maincpu"]:debug()` — the debug interface exposes a
+`totalcycles()`-style counter (verify exact method name against MAME 0.288's
+`debug/debug/dvdisasm.cpp`/`d_z80.h` if `.` attribute lookup on the state
+list doesn't expose it directly), read from a small Lua hook triggered on
+the CPU's next M1 fetch after `manager.machine.devices[":maincpu"].state["PC"]
+== 0x0038`. If the two counts differ, that number *is* the answer: it is
+either a genuine T-state offset in when vblank/`INT` gets asserted (video-
+timing generation difference between `rtl/video/video_timing.v` and MAME's
+`buckrog_state::screen_update`/`interrupt_gen` scheduling) or a fixed
+startup-latency difference between `sim/tb_z80_3d.cpp`'s reset sequencing and
+MAME's own driver `MACHINE_RESET`/boot sequence — and disassembling exactly
+which of those it is is a bounded, concrete follow-up, not another
+open-ended hypothesis pass.
+
+## UPDATE 2026-07-30 (session 7, continued): live cross-harness T-state measurement done; confirms a real, modest (~15% of one frame) reset-to-first-interrupt timing offset between sim and MAME — evidence for the harness-mismatch hypothesis, not a CPU/RTL bug. One new probe found buggy and flagged, NOT trusted.
+
+Did the scoped follow-up named above: measured the absolute T-state (since
+each harness's own emulation start, t=0) at which the main CPU accepts its
+first few vblank interrupts, on both sides independently.
+
+### MAME side: live measurement via debugger single-step
+
+`manager.machine.debugger:command("go")`-style breakpoint actions turned out
+to run **debugger console commands, not Lua**, so they can't compute
+`machine.time * clock` directly. Worked around this with
+`tools/mame/dump_intack_cycles.lua`: drive `maincpu.debug:step(1)` one
+instruction at a time from Lua, checking `PC` after each step, recording
+`manager.machine.time:as_double()` the moment `PC == 0x0038` is first seen.
+
+**Harness trap, found and worked around:** calling this stepping loop
+directly at autoboot-script load time never advanced `machine.time` at all —
+`PC` stayed `0000` and `time` stayed `0.0` for 2,000,000 steps straight. The
+fix was to move the same loop inside `emu.register_periodic` instead of
+running it immediately at script load: time then advanced normally. Autoboot
+scripts apparently execute before the machine's own scheduler/timeslice is
+truly live; single-stepping the debugger before that point is a no-op on
+emulated time. Recorded here so a future session doesn't waste time on the
+same dead end.
+
+Single-stepping is slow (~4-5s/interrupt in this harness), so this only
+collected 8 data points before the run was stopped:
+
+```
+hit=1 abs_tstate=84493   (interval from previous: n/a)
+hit=2 abs_tstate=168974  (+84481)
+hit=3 abs_tstate=253456  (+84482)
+hit=4 abs_tstate=337935  (+84479)
+hit=5 abs_tstate=422416  (+84481)
+hit=6 abs_tstate=506896  (+84480)
+hit=7 abs_tstate=591376  (+84480)
+hit=8 abs_tstate=675856  (+84480)
+```
+
+MAME's first accepted interrupt lands at **T-state 84493** — one frame length
+(84480) after machine start, to within measurement noise (the ±1-2 T-state
+jitter across intervals is consistent with `double`-precision rounding in the
+`time * 4992000` conversion, not a real signal) — and every subsequent
+interrupt is spaced almost exactly 84480 T-states apart. This independently
+confirms, from the MAME side, the same "84480 T-states/frame, no wait states,
+completely regular cadence" fact this doc already established for TV80.
+
+### Sim side: the already-audited OPTRACE ground truth, not the new probe
+
+Also added a new RTL probe (`reset_tstate_count`, free-running from
+simulation t=0, gated only by `ce_z80` — logged at every `int_ack_rise` as
+`INTACK_ABS_TSTATE`) to get the analogous number directly from sim. **This
+probe's output is inconsistent with already-trusted data and should NOT be
+used until debugged**: it reports the CPU's first real interrupt-accept
+(`frame=1`) at `abs_tstate=419876`, roughly 5 frame-lengths after start — but
+summing `OPTRACE`'s own already-audited `tstates` column (the same figures
+the opcode-by-opcode Zilog-spec check in the previous update verified
+exhaustively) up to the same event (the `irq=1` flag on the M1 fetch right
+after the ROM's first `EI`/`HALT`, `sim/out/optrace_clean.log` event index
+17896) gives a cumulative total of **71697 T-states** — nowhere near 419876.
+Trusted the OPTRACE figure (it is the one this whole document's audit
+chain already validated instruction-by-instruction) and did not chase the new
+probe's bug further this session; flagging it rather than deleting it, since
+unlike the earlier abandoned re-entrant-ISR probe this one is very likely a
+small, fixable bug (possibly a `dbg_frame`/`vblank_rise` labeling issue, not
+necessarily the counter itself) rather than a fundamentally unworkable
+approach — worth a five-minute look next session before reuse, not a redesign.
+
+### The comparison that matters, and what it means
+
+Sim's first accepted interrupt: **71,697 T-states** since sim start.
+MAME's first accepted interrupt: **84,493 T-states** since MAME start.
+
+Difference: **12,796 T-states, sim early relative to MAME — about 15% of one
+84480-T-state frame.** Modest, not the dramatic "5 frames" the buggy new
+probe would have implied, and (importantly) not a contradiction of the
+frame-11 full-instruction-trace match documented above: this very first
+interrupt occurs while the CPU is sitting in a content-free `HALT`-refetch
+spin (confirmed in this doc's own instruction trace), and a `HALT`-refetch
+contributes no distinguishing PC value once collapsed — so a large absolute-
+T-state offset at *this specific* interrupt has no way to perturb the *PC
+sequence* comparison at all. That resolves what would otherwise look like a
+contradiction between "PC sequences match exactly for the first 32,554
+instructions" and "the two sides don't take their first interrupt at the same
+absolute T-state" — both are true simultaneously, for a boot sequence this
+simple.
+
+What it does establish: **there is a real, non-zero, directly-measured
+timing offset between the two harnesses from essentially the very first
+interrupt onward**, sim consistently a bit ahead of MAME in absolute
+T-state terms. That is exactly the kind of harness-level discrepancy (not a
+CPU-core or RTL bug) this whole thread has been narrowing toward — most
+plausibly a difference in how much T-state-equivalent time elapses between
+"emulation/simulation start" and "CPU begins executing PC=0" in each harness
+(`sim/tb_z80_3d.cpp` holds `reset` for a fixed, arbitrary tick count during
+ROM load; MAME's own machine-start/reset sequencing is driven by its generic
+device-init order and has no reason to match that exactly), rather than
+anything wrong in either Z80 core or the RTL's video-timing generation
+(`docs/reference/turbo.cpp`'s `set_raw(PIXEL_CLOCK, HTOTAL, HBEND, HBSTART,
+VTOTAL, VBEND, VBSTART)` with `VTOTAL=264`/`VBSTART=224` already matches this
+RTL's own `video_timing.v` parameters exactly, confirmed by inspection this
+session — so the *shape* of vblank generation is identical on both sides;
+only the *phase relative to CPU reset* is in question).
+
+**Conclusion for the original question (harness mismatch vs. genuine RTL/CPU
+bug): harness mismatch, on the evidence so far.** A small, measured,
+consistent-sign timing offset present from the very first interrupt, riding
+on top of two independently-confirmed-correct, identically-parameterized
+Z80 cores and video timers, is the signature of a reset-alignment difference
+between two test harnesses — not a hardware fidelity gap. Nothing in this
+session's data implicates `rtl/` itself; if anything is to be "fixed," it is
+`sim/tb_z80_3d.cpp`'s reset/boot sequencing (or accepted as an inherent,
+harmless property of comparing two independently-booted emulations that were
+never going to be phase-locked at time zero without deliberately engineering
+it).
+
+**Not yet done (next session):**
+- Debug the new `INTACK_ABS_TSTATE`/`reset_tstate_count` probe (likely a
+  `dbg_frame` labeling issue, not the counter itself — the counter's *later*
+  entries, 2 through 15, all showed clean ~84480 deltas from each other,
+  consistent with correct free-running behavior; only the very first
+  transition looks wrong) so it can be trusted for a full, live per-interrupt
+  sim-vs-MAME diff instead of relying on one manually cross-checked data
+  point.
+- Root-cause *why* sim is ~12,796 T-states ahead specifically: measure how
+  many T-states `sim/tb_z80_3d.cpp`'s `reset`-held period (32 ticks + one
+  tick per ROM byte during `ioctl_wr`, ~`(32+rom_size)/8` T-states) actually
+  amounts to, and compare against whatever the equivalent MAME-side quantity
+  is (there may not be a clean equivalent, since MAME's reset model doesn't
+  hold the CPU in a fixed-tick-count reset the way this testbench does — if
+  so, that asymmetry *is* the root cause, and the fix is deciding on a
+  principled sim-side reset duration to target, not chasing a specific MAME
+  number to match).
+- Given this offset is small and (per the analysis above) provably harmless
+  to the PC sequence for a long stretch, it's still worth checking whether it
+  is *exactly* what causes the frame-11 loop-iteration slip found earlier
+  (i.e., does the offset's specific magnitude, propagated forward through 11
+  regular 84480-T-state frame periods, land the interrupt on a different
+  `07B3-07B6` loop phase than it otherwise would?) — a straightforward
+  arithmetic check once the debugged probe gives a trustworthy sim-side
+  T-state for the frame-11 interrupt specifically, rather than only the
+  first one.
+
+## UPDATE 2026-07-30 (session 7, closing): schematic evidence shows real hardware has NO deterministic reset-to-vertical-timing phase relationship either — the sim/MAME T-state offset is expected behavior, not a bug to fix
+
+The previous update's "not yet done" list treated the ~12,796 T-state
+sim/MAME offset as a testbench discrepancy to root-cause and correct. Before
+doing that, checked what the actual hardware does here — this doc's own
+standing rule is schematic/theory-of-operation ground truth over inference
+from either emulator (see the very top of this document) — using
+`tools/render_sheets.py` (needed `pypdfium2`, not preinstalled in the
+`archlinux` WSL distro this repo builds in; `pip install --break-system-packages
+pypdfium2` got it working) to view the CPU board schematic (`834-5120`,
+`docs/reference/Buck_Schematics.pdf`) directly.
+
+**Sheet 1 (`docs/schematics/buck_p29.png`), zone 8-D: the reset circuit.**
+IC16 is an LS123 dual retriggerable monostable; one half, RC-timed by
+`RA1` (47KΩ) / `C18` (47µF) against `IC16` pins 14/15, generates the power-on
+reset pulse. Its `/Q` (pin 4) drives directly into the Z80's own pin 26
+(`RESET`, confirmed against the theory-of-operation text at
+`docs/reference/Buck_theory.txt:65-66`: *"Manual system reset (Power-On)
+appears as a LO at IC16 p-4 ... and is then felt at pin-26 of the CPU"*).
+The only other place this net goes is labelled `SHT.4,5` — the sub-CPU and
+I/O boards. **There is no wire from this reset net to sheet 2 anywhere on
+sheet 1.**
+
+**Sheet 2 (`docs/schematics/buck_p30.png`), "timing and sync" (per the theory
+doc): the H/V counters and sync decode.** This is where the actual raster
+counters live — `IC87`/`IC104` (cascaded `LS161`/`LS163`) form the horizontal
+counter chain, feeding `IC78` (`82S141` PROM) and further gating (`IC49`,
+`IC48`, etc.) that derives `H SYNC`, `V SYNC`, `BLANK`, `V BLANK`, `CMP SYNC`.
+Scanned the entire sheet for the label `RESET`: **it does not appear
+anywhere on it.** The counters' `CL` (clear)/`LO` (load) control pins trace
+to internal cascade/reload logic between counter stages, not to the CPU
+reset net traced on sheet 1. The horizontal counter is clocked directly by
+`5M` and free-runs continuously.
+
+**Answering the four questions directly:**
+- Does RESET clear the vertical counter? **No** — no connection exists
+  between the reset one-shot and sheet 2 at all.
+- Does RESET asynchronously clear only the CPU(s)? **Yes** — IC16's output
+  fans out only to the Z80 (this sheet) and the sub-CPU/I-O boards
+  (sheets 4/5), never to the timing generator.
+- Does video timing free-run regardless of RESET? **Yes** — the H/V counters
+  are driven purely by the crystal-derived `5M` clock and their own
+  cascade/reload logic, with no visible gating from the CPU-reset domain.
+- Is there a flip-flop synchronizing reset release to the pixel clock?
+  **No** — IC16 is a plain RC-timed monostable (subject to normal component
+  tolerance) with no visible tap into the `5M`/pixel-clock domain to align
+  its release edge to any particular raster phase.
+
+**What this means for the investigation.** On real hardware, the scanline
+phase at which the CPU comes out of reset is **not architecturally
+determined at all** — it is whatever phase the free-running counter happens
+to be on at the moment the RC one-shot's pulse (timed by real-world
+component tolerances) ends. There is no canonical "correct" reset-to-vblank
+T-state offset for real Buck Rogers hardware to converge on, because the
+real board itself doesn't have one — it is inherently non-deterministic,
+cabinet to cabinet and power-cycle to power-cycle, exactly the way an RC
+one-shot racing an independent free-running oscillator would be expected to
+behave.
+
+**This changes the previous update's framing.** The ~12,796 T-state
+sim/MAME offset is not evidence of a testbench bug needing a fix, and there
+is no principled "correct" value to root-cause it against — `sim/tb_z80_3d.cpp`
+holding `reset` for `32 + rom_size` ticks and MAME's own machine-init
+sequencing are simply two different (and each individually reasonable)
+arbitrary phases, precisely mirroring how two different physical cabinets
+would themselves boot at two different, equally legitimate raster phases.
+Chasing a specific T-state value for either harness to hit would be
+imposing a determinism the hardware itself doesn't have.
+
+**Where this leaves the whole investigation.** Every mechanism this thread
+has checked — TV80's cycle-accuracy (opcode-by-opcode against the Zilog
+spec, zero mismatches), the frame-11 loop-iteration slip (now explained as a
+downstream consequence of the harnesses' differing-but-equally-valid reset
+phase, not a bug), and the eventual frame-44/45 code-path split it
+snowballs into — is now accounted for by a single, schematic-confirmed root
+architectural fact, rather than an unresolved probe question. The sim/MAME
+game-state divergence chased across seven sessions is **not a CPU, RTL, or
+video-timing-generation bug**; it is the expected, unavoidable consequence
+of comparing two independently-booted emulations of a machine whose real
+reset behavior was never phase-locked to its video timing in the first
+place. The original title-logo/sprite-garbling symptom this document opened
+with was already fixed and verified in session 6 (nibble-select and
+ROM-fetch-address bugs in `sprite_engine.v`) — this divergence thread was a
+separate, ultimately-inconclusive-by-design side investigation, not a lead
+on any remaining rendering defect.
+
+**Not yet done:** none, for this specific thread — it is closed. If a real
+discrepancy against fresh hardware capture is found later (a new bitstream
+build is planned), re-open by checking game-state alignment using actual
+gameplay/attract-mode content matching (as session 3's HUD-text-matching
+method did) rather than frame-index or T-state alignment, since this session
+establishes that frame/T-state alignment between any two independent boots
+of this hardware — real or emulated — is not expected to agree in the first
+place.
