@@ -791,6 +791,47 @@ module z80_3d
         end
     end
 
+    // Session-6-continued-still-further: with interrupt-accept cost proven
+    // spec-exact and the game-state divergence's downstream symptom traced
+    // to (but not yet pinned down as) the frame-9-to-44 T-state drift, do
+    // the direct thing -- log every main-CPU instruction's measured T-state
+    // cost and let an offline script (tools/z80_tstate_check.py) check each
+    // one against the real Zilog Z80 timing tables. Bounded to a frame
+    // window (dbg_frame 5..30, comfortably spanning the frame-9-start of the
+    // busy-wait loop through several of its interrupts) to keep the log a
+    // manageable size -- unprefixed and CB-prefixed opcodes are both common
+    // in the code this window exercises (the ISR's 0x0e70+ chain uses CB
+    // opcodes, e.g. `cb 7e` = BIT 7,(HL)), so log the raw opcode byte
+    // un-interpreted and let the Python side decode it, rather than build a
+    // second copy of the Z80 opcode table in Verilog.
+    //
+    // Method: same "T-states between consecutive M1 fetches" technique as
+    // the ISR-length attempt above, but reporting every instruction instead
+    // of just watching for one return address, and explicitly flagging
+    // (not attempting to exclude) any instruction whose window contained an
+    // interrupt -- the offline checker skips those rather than trying to
+    // subtract out ISR execution time.
+    reg  [15:0] optrace_pc;
+    reg  [7:0]  optrace_op;
+    integer     optrace_tstates;
+    reg         optrace_interrupted;
+    reg         optrace_valid;
+    always @(posedge clk) begin
+        if (main_m1_fetch_rise) begin
+            if (optrace_valid && dbg_frame >= 5 && dbg_frame <= 30)
+                $display("OPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
+                          dbg_frame, optrace_pc, optrace_op, optrace_tstates, optrace_interrupted, cpu_a);
+            optrace_pc          <= cpu_a;
+            optrace_op          <= cpu_di;
+            optrace_tstates     <= 0;
+            optrace_interrupted <= 1'b0;
+            optrace_valid       <= 1'b1;
+        end else if (ce_z80) begin
+            optrace_tstates <= optrace_tstates + 1;
+        end
+        if (int_ack_rise) optrace_interrupted <= 1'b1;
+    end
+
     integer trace_count = 0;
     always @(posedge clk) begin
         if (!reset && trace_count < 400) begin

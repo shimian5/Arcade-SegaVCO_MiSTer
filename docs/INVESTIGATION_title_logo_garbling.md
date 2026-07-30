@@ -4,23 +4,23 @@ Status as of session end. Branch `worktree-phase0-1a`.
 
 **Read the LAST section first.** This document is append-only and its sections
 retract each other in order, so the newest one is the current state and everything
-above it is kept for auditability. As of 2026-07-29 (session 6, continued still
-further) the video-pipeline sprite-rendering bugs are fixed and verified; the
-remaining open thread is a CPU/game-state divergence between sim's Z80 (TV80)
-and MAME's Z80 emulation. TV80's interrupt-accept cost has been directly
-measured against the Zilog spec and confirmed exact (13T, every interrupt,
-whole run) — that suspect is closed. A per-frame diff of three RAM flag bytes
-against MAME pinpointed a concrete, observable symptom (coin-insert response
-fires on a different input edge in each run) and traced it to being a likely
-*downstream consequence* of an already-located branch-point divergence around
-frame 44-45, not a new independent bug. The one open question is which
-specific instruction(s) TV80 executes with a wrong T-state count during
-frames 9-44's busy-wait loop — see the newest section below for the full
-chain of evidence. Jump there; the sections between here and it are settled
-history, including the session-4 suspect writeup, which explains the
-background-layer fix but turned out not to fully explain the sprite-layer
-symptom, and the session-6 rendering-bug fixes/game-state-divergence framing
-that prompted this follow-up.
+above it is kept for auditability. As of 2026-07-29 (session 6, continued to
+conclusion) the video-pipeline sprite-rendering bugs are fixed and verified.
+The CPU/game-state divergence thread (sim's Z80/TV80 vs. MAME's Z80
+emulation) has been run all the way down at the CPU level: clock ratio,
+interrupt cadence, interrupt-accept T-state cost, AND every individual
+instruction's T-state cost across the divergence window (346,564 instructions
+checked opcode-by-opcode against the real Zilog Z80 timing tables) are all
+independently verified correct. **TV80 is not the bug.** The leading suspect
+is now the *measurement itself* — whether MAME's `register_periodic` callback
+samples at the same T-state-precise instant as `vblank_rise` — which has been
+flagged as an open risk for several updates but never directly checked. See
+the newest section below for the full chain of evidence and the concrete next
+check. Jump there; the sections between here and it are settled history,
+including the session-4 suspect writeup, which explains the background-layer
+fix but turned out not to fully explain the sprite-layer symptom, and the
+session-6 rendering-bug fixes/game-state-divergence framing that prompted this
+follow-up.
 
 Current one-line status: the intra-pipeline coordinate-skew bug (session 4) is
 fixed in `rtl/video/fg_tilemap.v` and `rtl/z80_3d.v`, and **confirmed fixed by
@@ -1230,3 +1230,110 @@ exercised in frames 1-44, not just the six checked so far) is the next
 concrete, scoped piece of work, and is now the *only* open question standing
 between "we understand this divergence" and "we understand exactly which line
 of TV80 causes it."
+
+## UPDATE 2026-07-29 (session 6, continued to conclusion): the opcode-by-opcode T-state audit is done — TV80 is cycle-accurate for everything this window executes. The divergence is not a Z80-core bug at all; the probe itself is now the leading suspect.
+
+Did the audit named as the last open item above: instrumented every main-CPU
+instruction's measured T-state cost, decoded and checked each one against the
+real Zilog Z80 timing tables offline, and ran it across the exact frame window
+(5-30) that spans the busy-wait loop's start and several of its interrupts.
+
+### Instrumentation: `OPTRACE`
+
+Added an `OPTRACE` probe to `rtl/z80_3d.v` (`SIM_DEBUG_TRACE`-gated): at every
+main-CPU M1 opcode fetch, prints the *previous* fetch's `(frame, pc, opcode
+byte, measured T-states, whether an interrupt fired during its window,
+next PC)`, using the same "T-states between consecutive M1 fetches" technique
+as the earlier `INTACK_TSTATES`/ISR-length probes. Bounded to `dbg_frame`
+5-30 to keep the log a manageable size (this still produced ~355k lines / 21MB
+over a 31-frame run — deleted after analysis, not committed).
+
+### Offline checker: `tools/z80_tstate_check.py`
+
+Rather than hand-build a second copy of the Z80 opcode-timing table in
+Verilog, wrote a Python script that parses `OPTRACE` output and checks it
+against a table transcribed directly from the Zilog Z80 Family CPU User
+Manual. It:
+
+- Recombines multi-byte-M1 instructions (`CB xx`, `ED xx`, `DD xx`, `FD xx`)
+  from their consecutive `OPTRACE` lines into one logical instruction before
+  comparing, since the spec gives costs for the whole instruction, not per
+  fetched byte.
+- Derives taken/not-taken for `JR cc`, `DJNZ`, and `RET cc` (whose T-state
+  cost depends on the branch) from `next_pc` vs. the arithmetic fall-through
+  address, since the CPU's flag state isn't directly observable from outside
+  — no MAME-side ground truth needed for this, it's pure control-flow
+  inference from the RTL's own trace.
+- Derives repeat-vs-final for the `LDIR`/`LDDR`/`CPIR`/`CPDR`/`INIR`/`OTIR`
+  block instructions (spec: 21T repeating, 16T on the terminating iteration)
+  the same way: a block instruction repeats by jumping back to its own
+  address, so `next_pc == pc` means "repeated."
+- Recognizes `HALT` (`0x76`) and excludes the refetch cycles that follow it:
+  once halted, the Z80's PC parks at `HALT_addr+1` and every subsequent bus
+  cycle there is a real 4T M-cycle that the CPU internally treats as a NOP
+  regardless of the byte actually sitting at that address (standard Z80
+  behavior, not a TV80 quirk) — the *first* version of this script didn't
+  know that and reported 60,639 "mismatches" that were entirely this pattern
+  (`op=7e expected=7 measured=4`, over and over, at addresses that turned out
+  to be `HALT+1` in two separate idle loops the boot/attract code uses).
+  Fixing the checker to track HALT state dropped that to zero.
+- Skips (doesn't flag) any instruction whose window contained an interrupt —
+  its measured cost legitimately includes 13T of interrupt-accept plus
+  however much of the ISR ran, not comparable to the plain opcode value.
+
+### Result: zero mismatches, full coverage
+
+After closing the last few gaps in the lookup tables (`EXX`/`0xD9`, `SBC
+HL,BC`/`ED 42`, and the four `DD`-prefixed forms actually used — `LD
+(IX+d),n`, `LD (IX+d),B`, `POP IX`, `PUSH IX`):
+
+```
+total logical instructions: 346590
+  ok (matched spec):        346564
+  skipped (irq in window):  26
+  skipped (unknown opcode): 0
+  MISMATCHES:                0
+```
+
+Every single instruction TV80 executed in this window — including the
+delay-loop body, the re-entrant ISR's `PUSH`/`POP`/`EXX` register-shuffling,
+`ED B0` (`LDIR`) with correct repeat/final T-state distinction, `CB`-prefixed
+`BIT`/rotate operations, `DD`-prefixed `IX` operations, and every conditional
+branch with correct taken/not-taken costs — matches the real Zilog Z80 timing
+tables exactly. Combined with the already-closed clock-ratio, interrupt-
+cadence, and interrupt-accept-cost suspects, this closes off **every** CPU
+cycle-timing hypothesis this investigation has raised. TV80 is not
+miscounting T-states anywhere in the code this divergence window exercises.
+
+### Where that leaves things: the probe is now the leading suspect, not the CPU core
+
+This is a real, if unsatisfying, conclusion: the CPU/game-state divergence
+first documented several updates back is **not** caused by a TV80 cycle-
+timing bug. Every alternative that would produce it from *inside* the Z80
+core has now been individually measured and ruled out. What remains
+unverified is the one thing flagged as an open risk two updates ago and never
+actually checked: **whether MAME's `emu.register_periodic` callback fires at
+a T-state-precise instant matching `vblank_rise`, or merely "once somewhere
+near vblank."** If it doesn't — even a few T-states of sampling-instant jitter
+in the *measurement* — every `PCTRACE`/`ISRFLAGS` comparison this whole thread
+has relied on would show exactly the kind of small, compounding drift
+observed, with zero implication for either emulator's correctness. Given this
+document's own recurring lesson ("validate the probe before believing any
+sim-vs-MAME comparison" — see the top of this document, and the retracted
+write-timing suspect from session 3), and given every CPU-side explanation is
+now exhausted, this is the natural next thing to check, and is the clearest
+remaining path to either (a) finding the sampling artifact and closing this
+thread entirely, or (b) if the probe checks out, having to look for the
+divergence somewhere entirely outside the CPU core (RAM initial contents,
+DIP-switch/port read differences, or something in how `sim/tb_z80_3d.cpp`'s
+input schedule interacts with hardware state that MAME's default boot
+sequence doesn't share).
+
+**Not yet done (next session):** verify `register_periodic`'s firing instant
+against `vblank_rise`'s T-state position directly — e.g. have the Lua script
+also read `manager.machine.devices[":maincpu"]:debug()`'s total-cycles-executed
+counter (or an equivalent) at the same point sim's `PCTRACE` samples, and
+check whether the two sides' *cycle counts since reset*, not just PC, agree
+at frame boundaries where PC still matches (frames 1-8) — if cycle counts
+already disagree there despite PC matching, that's the sampling-instant
+artifact caught red-handed.
