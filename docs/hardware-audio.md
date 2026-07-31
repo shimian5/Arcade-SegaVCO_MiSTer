@@ -366,6 +366,41 @@ assembly drawing wins:
    the 14.26 kHz nominal, comfortably inside 555 + electrolytic tolerance. **Model the
    nominal 14.26 kHz**, and treat the clock rate as the one tuning knob if it sounds off.
 
+## Reference recording of a real cabinet
+
+`docs/reference/buckrog_cabinet_recording.mp4` — 35.3 s of a **real Buck Rogers cabinet**,
+capturing SHIP, FIRE and a crash. Extract the audio with:
+
+```
+ffmpeg -y -i docs/reference/buckrog_cabinet_recording.mp4 -vn -ac 1 -ar 48000        -c:a pcm_s16le docs/reference/buckrog_cabinet_audio.wav
+```
+
+(The WAV is gitignored — it is derived, and 3.4 MB.)
+
+**Status: corroborating evidence, not primary.** It is a phone/camera capture of a cabinet
+in a room: lossy-compressed, almost certainly AGC'd, and coloured by room acoustics and the
+mic. It cannot override the schematic. But it is *far* better evidence than MAME's
+hand-made WAVs, because it is the real board through the real LA4460 and the real speaker —
+which is exactly the part of the chain we do not model yet.
+
+First-pass structure, for whoever picks this up:
+
+| t (s) | what |
+|---|---|
+| 0.4, 2.46, 11.28 | transients (2.2–3.1× rises) |
+| 0.0–2.5 | SHIP drone, low level (med RMS ~480) |
+| 2.5–7.0 | SHIP drone, high level (med ~1300) |
+| 7.0–11.2 | back to low (~420) |
+| 11.5–34.0 | sustained high (~1300) |
+| 34.0+ | drops (~690) |
+
+The stepped drone levels are the engine responding to **ACC0-3** — a ready-made reference
+for SHIP's 4066 pitch/level network.
+
+Already corroborated: FIRE is audibly a **quiet, thin, metallic** laser, which is what the
+schematic independently predicts (its attenuator × output gain is 0.218 against HIT's
+1.582 — see the level analysis in `audio-rtl-design.md`).
+
 **On the MAME samples as a comparison target** — they are a recording of one board and
 are not authoritative. Concretely, `alarm1.wav` (1885 Hz) and `alarm2.wav` (942 Hz) are
 **swapped** relative to what the schematic wires: ALARM1 is gated by 1QD (÷16 = 891 Hz)
