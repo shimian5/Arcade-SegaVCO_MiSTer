@@ -191,6 +191,121 @@ spread in the real 74LS38's V_OL. Documented rather than modelled.
 
 ---
 
+## Phase 2 — NOISE and FIRE
+
+### The MB4391 VCA — resolved
+
+The MB4391 is a Sega custom with no public datasheet, and it sets the entire shape of
+FIRE, EXP and HIT. It is **two MC3340 electronic attenuators in one 16-pin package**
+(community-established; the swap is reported to work in Monaco GP). `docs/reference/
+MC3340.pdf` is therefore the primary source, and the schematic corroborates it: our pin
+usage is 1 = input, 2 = control, 15 = output, 14 = roll-off with C19 **680 pF**, against
+the MC3340's 1 = input, 2 = control, 7 = output, 6 = roll-off with a **620 pF** cap in the
+datasheet's own figure. That also independently confirms the earlier "C19 is 680 pF, not
+680 µF" correction.
+
+Characteristics: **+13 dB** voltage gain at full open, **80 dB** attenuation range.
+The board runs it on the **12 V** rail, so use the Vcc = 12 Vdc curve of datasheet
+Figure 3, read as:
+
+| V2 (control, V) | ≤3.1 | 3.5 | 4.0 | 4.5 | 5.0 | ≥5.5 |
+|---|---|---|---|---|---|---|
+| attenuation (dB) | 0 | 20 | 40 | 60 | 80 | 90 (treat as mute) |
+
+Piecewise model:
+
+```
+A(V2) = 0                        V2 <= 3.1
+      = 50 * (V2 - 3.1)          3.1 < V2 <= 3.5      (soft knee)
+      = 20 + 40 * (V2 - 3.5)     3.5 < V2 <= 5.0      (the linear 40 dB/V region)
+      = 80 + 20 * (V2 - 5.0)     V2 > 5.0, clamped at 90
+gain  = 10^((13 - A) / 20)
+```
+
+Implement as a LUT in V2 with linear interpolation between entries, since the RTL needs
+gain, not dB. Figure 3's dashed limit curves span roughly ±0.5 V of the typical, which is
+enormous — part-to-part spread, not measurement error. **The knee position is the one
+tuning knob for all three VCA channels**; do not chase small discrepancies elsewhere first.
+
+### NOISE — MM5837 (sheet 3)
+
+17-bit LFSR, taps 17 and 14, XOR feedback. Clocked at `sample_ce` (47,999 Hz), inside the
+part's nominal 32-64 kHz and avoiding any beat against the audio rate. The real part's
+clock is notoriously variable, so this is a documented tuning knob.
+
+Raw output amplitude is **not** documented and is parameterised as `NOISE_VPP`, default
+1.0 V. Two buffered taps via IC29:
+
+| Tap | Network | Gain | Feeds |
+|---|---|---|---|
+| NOISE·A | C86 10 µF, R140 100 K in, R139 10 K fb | −0.10 | FIRE, EXP |
+| NOISE·B | C85 10 µF, R144 330 K in, R143 100 K fb | −0.303 | HIT |
+
+### FIRE — laser (sheet 3)
+
+```
+/FIRE -> IC4 74123 sec.2 (pin 9 = A trigger), R7 47K / C4 1uF
+         tw = 0.45*R*C = 21.15 ms, Q on pin 5
+      -> R6 330 pull-up, D8 -> C3 6.8uF / R4 150K to ground
+         charges within the gate; decays with tau = R4*C3 = 1.02 s
+      -> IC20 sec.1 unity buffer (10+, 9-, 8 out) = Venv
+```
+
+`Venv` peak is **3.16 V**. That is the 74123's V_OH less D8's drop, and it is confirmed
+by fire.wav: the recording holds flat for ~0.30 s before decaying, and 3.16 V is the peak
+that puts the control voltage at the MC3340 knee at exactly that moment. Two independent
+routes to the same number.
+
+`Venv` then splits two ways.
+
+**Control leg** — IC20 sec.2, inverting, R78 56 K in, R79 47 K feedback, `+` input at
+`12 * 33/(100+33)` = 2.977 V from R74/R75, C37 33 µF decoupling:
+
+```
+V2 = 2.977 * (1 + 47/56) - Venv * (47/56) = 5.475 - 0.839 * Venv
+```
+
+so V2 sweeps **2.12 V → 5.475 V** as the envelope decays: full gain, then muted. C19
+680 pF smooths the control node (negligible at audio rates; model as a wire).
+
+**Filter leg** — Tr1, base fed through R77 15 K with R76 3.3 K to ground, emitter grounded,
+collector loaded by R32 1.5 K to ground and tied through R31 100 Ω to the midpoint of
+C32/C33.
+
+**Note the topology carefully.** C32 and C33 (0.01 µF each) are in *series across* R35,
+IC12's 47 K feedback resistor, with their midpoint shunted to ground through
+R31 + (R32 ∥ Tr1). So:
+
+* Tr1 **saturated** (envelope high): midpoint near AC ground, the series arm is defeated,
+  feedback is just R35 → flat, gain −R35/R33 = **−4.7**. Bright.
+* Tr1 **off** (envelope decayed): midpoint floats behind 1.6 K, C32+C33 in series
+  (0.005 µF) sit across R35 → single-pole low-pass at
+  `1/(2π · 47K · 0.005µF)` = **677 Hz**. Dull.
+
+The laser therefore starts bright and darkens as it decays, on top of the VCA's amplitude
+decay. (An earlier revision of `hardware-audio.md` recorded this as a fixed 340 Hz corner;
+that assumed one 0.01 µF cap across R35 and missed both the series pair and the fact that
+the midpoint is modulated.)
+
+Tr1 is modelled as **piecewise-linear conduction**, not a full exponential:
+
+```
+Vbe   = Venv * R76/(R77+R76) = Venv * 0.1803
+Ic/Ib region: off below Vbe = 0.6 V, linearly increasing conductance to saturation
+gc    = 0                          Vbe <= 0.60
+      = gsat * (Vbe-0.60)/0.15     0.60 < Vbe < 0.75
+      = gsat                       Vbe >= 0.75            gsat = 1/50 ohm
+shunt R at the cap midpoint = R31 + (R32 parallel 1/gc)
+```
+
+Full Ebers-Moll would trade one undocumented parameter (the MC3340 knee) for another
+(2SC458 Is), which is not a good trade.
+
+**Output**: IC18 pin 15 → C25 2.2 µF → R69 100 K → IC25 (R142 220 K fb, `+` at 6 V)
+→ gain **−2.2** → C77 2.2 µF → FIRE MIX.
+
+Input attenuator ahead of the VCA: R67 30 K into R68 3.3 K to ground = **0.0991**.
+
 ## Mixer — why it is built whole
 
 `hardware-audio.md` establishes that R138 (200 K) sits *in series* into IC28, so the six
