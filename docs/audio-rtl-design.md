@@ -361,6 +361,90 @@ Candidates, if it is ever worth chasing:
 Not worth chasing until a second channel is built and the relative levels can be judged
 together; a systematic error would show up in EXP the same way.
 
+## Phase 3 — EXP (sheet 2)
+
+Two **parallel** VCA paths — a bright "crack" and a low "rumble" — summed at IC25 with
+different weights. Both sections of IC19 (the MB4391 = two MC3340s) are used, so the
+Phase-2 VCA model applies unchanged to both.
+
+Three corrections to the trace recorded in `hardware-audio.md`, all confirmed at high
+magnification:
+
+1. **The audio source is NOISE·B, not NOISE·A.** The label above the block on sheet 2
+   reads NOISE·B, and it is the same tap that feeds HIT.
+2. **Both one-shots are IC8, cascaded, not independently triggered.** `/EXP` triggers
+   section A; section A's **Q (pin 13)** drives section B's A input, so section B fires on
+   the *falling* edge of Q — i.e. when the crack ends. The rumble follows the crack, it
+   does not run underneath it. (The old note had NOISE·A triggering section B, which is
+   not a thing a one-shot does.)
+3. **Both envelopes are taken from Q̄, and D6/D7 point the opposite way to FIRE's D8**
+   (cathode toward the 74123). This is verified on the drawing and is the only orientation
+   that works: Q̄ idles high with the diode blocking, so the cap sits charged; the pulse
+   pulls Q̄ low, the diode conducts and the cap **discharges**; then it recovers. FIRE
+   uses Q and charges through its diode, which is why the two look inconsistent.
+
+### Envelopes
+
+```
+/EXP -> IC8 sec.A: R16 47K / C7 4.7uF   -> tw = 0.45*R*C = 99.4 ms
+        Q  (pin 13) -> IC8 sec.B A input (falling edge = crack end)
+        Q'' (pin 4)  -> D6 (cathode to pin 4) -> R11 10K -> C88 1uF
+IC8 sec.B: R17 47K / C8 22uF            -> tw = 465.3 ms
+        Q'' (pin 12) -> D7 (cathode to pin 12) -> R151 470 -> C89 2.2uF
+```
+
+Each cap sits in a divider into a unity buffer, which is also its charging path:
+
+| | discharge (gated) | recharge (idle) | buffer output |
+|---|---|---|---|
+| crack, C88 1 µF | R11 10 K, tau = **10 ms** | R10 470K + R9 470K = 940 K, tau = **0.94 s** | (5 + Vc88)/2 |
+| rumble, C89 2.2 µF | R151 470 Ω, tau = **1.03 ms** | R150 1M + R149 1M = 2 M, tau = **4.4 s** | (5 + Vc89)/2 |
+
+Both buffers are IC21 MB3614 sections wired unity (`-` tied to output), and both dividers
+are equal-valued, so the control voltage is exactly the average of 5 V and the cap. It
+therefore spans **2.9 V (full +13 dB) → 5.0 V (80 dB down)** — the right way round for the
+MC3340, with no inverting stage needed. FIRE needed one; EXP gets its inversion from the
+diode orientation instead.
+
+### Shaping filters
+
+**Crack** — IC21, R94 4.7 K in, R95 2.7 K to ground, C53 = C54 = 0.0068 µF, R98 220 K
+feedback. Both caps sit between the node and the amplifier, so DC cannot reach the
+inverting input: this is a **2-pole high-pass**.
+
+```
+f0 = 1 / (2*pi*C*sqrt((R94||R95) * R98)) = 1 / (2*pi*6.8n*sqrt(1715*220K)) = 1205 Hz
+```
+
+**Q is uncertain.** Taking the topology as textbook multiple-feedback gives Q ≈ 5.7, which
+is high enough that I do not trust the identification. Implement with **Q = 0.707**
+(Butterworth) and expose Q as a parameter. Flagged rather than guessed — a resonant crack
+and a flat one sound quite different, and this is the one place in EXP I am not certain.
+
+**Rumble** — Sallen-Key, R87 = R89 = 15 K, C51 = C52 = 0.039 µF, gain `1 + R99/R101` =
+1 + 150K/100K = **2.5**.
+
+```
+f0 = 1 / (2*pi*15K*0.039u) = 272 Hz
+Q  = 1 / (3 - K) = 1 / 0.5 = 2.0
+```
+
+That Q is deliberate and unambiguous — the designer chose a gain of 2.5 in a Sallen-Key,
+which is a resonant low-pass. The 272 Hz resonance *is* the boom.
+
+### Input attenuators and output
+
+Both VCA inputs see the same divider: 10 K into 3.3 K to ground = **0.2481**
+(crack R99/R100, rumble R73/R72).
+
+```
+crack  IC19 out pin 11 -> C28 2.2uF -> R71 220K -> IC25 (-)   gain -470/220 = -2.136
+rumble IC19 out pin 15 -> C26 2.2uF -> R70 100K -> IC25 (-)   gain -470/100 = -4.700
+IC25 R141 470K feedback, + at 6 V -> C76 2.2uF -> EXP MIX
+```
+
+The rumble is weighted **2.2× hotter** than the crack at the summing junction.
+
 ## Mixer — why it is built whole
 
 `hardware-audio.md` establishes that R138 (200 K) sits *in series* into IC28, so the six
