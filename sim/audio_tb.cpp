@@ -17,6 +17,7 @@ static const int ALARM0_PA_BIT = 6;
 static const int ALARM1_PA_BIT = 7;
 static const int ALARM2_PB_BIT = 0;
 static const int ALARM3_PB_BIT = 1;
+static const int FIRE_PB_BIT   = 2;
 
 struct Harness {
     Vaudio_top *dut;
@@ -90,6 +91,13 @@ struct Harness {
         }
     }
 
+    // /FIRE is port B bit 2 (docs/hardware-audio.md connector pinout).
+    void pulse_fire(double low_ms = 1.0) {
+        pb &= ~(1 << FIRE_PB_BIT);
+        run_ms(low_ms);
+        pb |= (1 << FIRE_PB_BIT);
+    }
+
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
             switch (w) {
@@ -144,7 +152,7 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-5>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-8>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -184,6 +192,39 @@ int main(int argc, char **argv) {
             h.run_ms(10);
             h.pulse_alarms_together({0, 2});
             h.run_ms(400 - 10);
+            break;
+        // ---- FIRE (phase 2) ----
+        case 6:
+            // one laser shot. 1.5 s of capture: the C3/R4 envelope has a
+            // 1.02 s tau, so the tail is long and the whole decay must be
+            // visible to check it against fire.wav's ~0.95 s.
+            h.run_ms(10);
+            h.pulse_fire();
+            h.run_ms(1500 - 10);
+            break;
+        case 7:
+            // rapid repeat fire, roughly the cadence the game uses. The
+            // 74123 is retriggerable, so shots should re-open the VCA
+            // rather than queueing.
+            h.run_ms(10);
+            for (int i = 0; i < 6; i++) {
+                h.pulse_fire();
+                h.run_ms(150 - 1);
+            }
+            h.run_ms(800);
+            break;
+        case 8:
+            // FIRE under a sustained ALARM0, which is what the game
+            // actually produces: the alarms are held continuously
+            // retriggered while the player keeps shooting. Exercises the
+            // passive mix node with two live channels.
+            h.run_ms(10);
+            for (int i = 0; i < 10; i++) {
+                h.pulse_alarm(0);
+                if (i % 3 == 0) h.pulse_fire();
+                h.run_ms(60 - 1);
+            }
+            h.run_ms(600);
             break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);

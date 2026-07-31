@@ -135,7 +135,34 @@ def main():
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--expect", type=float, default=None,
                     help="expected fundamental in Hz; flags >0.5%% error")
+    ap.add_argument("--envelope", action="store_true",
+                    help="print the RMS envelope in dBFS per 100 ms block "
+                         "instead of the summary table. This is the FIRE "
+                         "acceptance view: the channel is noise through a "
+                         "swept filter and a VCA, so it has no fundamental "
+                         "and only its decay shape can be checked.")
+    ap.add_argument("--block", type=float, default=0.100,
+                    help="envelope block length in seconds (default 0.1)")
     args = ap.parse_args()
+
+    if args.envelope:
+        import math
+        files = []
+        for p in args.paths:
+            files.extend(sorted(glob.glob(p)) or [p])
+        for path in files:
+            d, sr = read_wav(path)
+            n = max(1, int(args.block * sr))
+            print(f"\n{path}  ({len(d)/sr:.3f} s @ {sr} Hz)")
+            for i in range(0, len(d), n):
+                seg = d[i:i + n]
+                if len(seg) < n // 2:
+                    break
+                r = math.sqrt(sum(float(x) * x for x in seg) / len(seg))
+                db = 20 * math.log10(r / 32768 + 1e-12)
+                bar = "#" * max(0, int((db + 80) / 2))
+                print(f"  t={i/sr:6.3f}  rms={r:8.1f}  {db:+7.1f} dB  {bar}")
+        return 0
 
     files = []
     for p in args.paths:
