@@ -12,18 +12,22 @@
 //   IC24 -> C13 -> HIT DIS0-2 3x4066 gain/lowpass select network ->
 //   IC28 inverting stage -> HIT MIX
 //
-// OPEN QUESTION: the 74123's timing resistor is drawn on sheet 2 with no
-// designator and no value, and remains unidentified. It is NOT R92 -- R92 is
-// 4.7 ohm 1/2 W, a Zobel resistor on the LA4460 speaker outputs, and the
-// assembly drawing (page 20) shows the bank beside IC13 as R90 1M, R91 470,
-// an MA150 diode, R93 4.7K, R94 4.7K, R95 2.7K, with no R92 in it at all.
+// The 74123's timing resistor is drawn on sheet 2 with no designator and no
+// value. Taken as 47K -- INFERRED, not traced, but on strong evidence: this
+// board sets every one-shot's width with its CAPACITOR and holds the resistor
+// at 47K throughout. ALARM0-2 (R2/R3/R14, 6.8uF), ALARM3 (R15, 10uF), FIRE
+// (R7, 1uF), EXP crack (R16, 4.7uF), EXP rumble (R17, 22uF) and REBOUND
+// (R47, 1uF) are eight for eight at 47K across a 22:1 spread of capacitors --
+// and R47 is the OTHER SECTION OF THIS VERY PACKAGE. At 47K/4.7uF, HIT is
+// identical to EXP's crack in both R and C.
 //
-// 47K is ASSUMED -- not read off the schematic. Its only support is symmetry:
-// every other 74123 timing resistor on this board is 47K, including R47 on
-// the OTHER SECTION OF THIS VERY PACKAGE (IC13 sec.2, REBOUND), and this one
-// is drawn identically. If a BOM or a bare board ever turns up a different
-// value, only WIDTH_CYCLES below changes -- the envelope shape and every
-// level in this channel are set by C48/R91/R90/R96 and are unaffected.
+// Two dead ends, so nobody re-walks them: it is NOT R92 (4.7 ohm 1/2 W, a
+// Zobel resistor on the LA4460 outputs; the assembly drawing shows the bank
+// beside IC13 as R90 1M, R91 470, MA150, R93 4.7K, R94 4.7K, R95 2.7K, with
+// no R92 present), and NOT R97 (by IC21/C51/C52, in EXP's rumble filter).
+//
+// If a BOM ever contradicts this, only WIDTH_CYCLES below changes -- the
+// envelope shape and every level here are set by C48/R91/R90/R96.
 module hit_chan (
     input  logic               clk,
     input  logic               rst_n,

@@ -527,25 +527,34 @@ R90 and R96 are equal, so the control voltage is again exactly `(5 + Vc48)/2`, s
 **2.9 V (full +13 dB) → 5.0 V (80 dB down)**. Structurally identical to both EXP legs;
 the VCA control model ports over unchanged.
 
-> **OPEN — one unresolved value.** The 74123's timing resistor is drawn on sheet 2 with
-> **no reference designator and no value**, and it is still unidentified.
+> **The 74123's timing resistor is drawn on sheet 2 with no designator and no value.**
+> It is taken as **47 K** — inferred, not traced, but on strong evidence.
 >
-> An earlier revision of this section claimed it was R92 "by elimination". **That was
-> wrong.** R92 is **4.7 Ω ½ W** — one of the two Zobel resistors on the LA4460 speaker
-> outputs (sheet 1: 0.033 µF + 4.7 R per output). A 4.7 Ω timing resistor would give
-> tw = 10 µs, which is absurd here.
+> The board sets every one-shot's width with its **capacitor**, holding the resistor at
+> 47 K throughout:
 >
-> The assembly drawing (page 20) confirms it independently: the vertical bank beside IC13
-> reads R90 (1 M), R91 (470), an MA150 diode, R93 (4.7 K), R94 (4.7 K), R95 (2.7 K) —
-> **no R92 anywhere in it**. R97 also exists but sits next to IC21/C51/C52, in EXP's
-> rumble Sallen-Key, not here.
+> | one-shot | R | C | tw |
+> |---|---|---|---|
+> | ALARM0/1/2 | R2 / R3 / R14 47 K | 6.8 µF | 144 ms |
+> | ALARM3 | R15 47 K | 10 µF | 211 ms |
+> | FIRE | R7 47 K | 1 µF | 21.2 ms |
+> | EXP crack | R16 47 K | 4.7 µF | 99.4 ms |
+> | EXP rumble | R17 47 K | 22 µF | 465 ms |
+> | REBOUND | R47 47 K | 1 µF | 21.2 ms |
+> | **HIT** | **47 K (inferred)** | 4.7 µF | **99.4 ms** |
 >
-> **47 K is therefore an assumption, not a trace.** Its only support is symmetry: every
-> other 74123 timing resistor on this board is 47 K (R2, R3, R14, R15, R7, R16, R17, and
-> R47 — the latter being the *other section of this very package*, IC13 sec.2 for
-> REBOUND), and this one is drawn identically. With C42 = 4.7 µF that gives tw = 99.4 ms,
-> exactly EXP's crack width. If the real value differs, only the burst length changes —
-> the envelope shape and all levels are set by C48/R91/R90/R96 and are unaffected.
+> Eight for eight, across a 22:1 spread of capacitor values, including **R47 — the other
+> section of this very package** (IC13 sec.2). At 47 K / 4.7 µF, HIT is identical to EXP's
+> crack in both R and C.
+>
+> Two dead ends, recorded so nobody re-walks them. It is **not R92**: R92 is 4.7 Ω ½ W, a
+> Zobel resistor on the LA4460 speaker outputs, and a 4.7 Ω timing resistor would give
+> tw = 10 µs. The assembly drawing (page 20) agrees — the bank beside IC13 reads R90 1 M,
+> R91 470, an MA150 diode, R93 4.7 K, R94 4.7 K, R95 2.7 K, with no R92 present. It is
+> also **not R97**, which sits by IC21/C51/C52 in EXP's rumble Sallen-Key.
+>
+> If a BOM ever contradicts this, only `WIDTH_CYCLES` changes. The envelope shape and every
+> level in HIT are set by C48/R91/R90/R96 and are unaffected.
 
 ### Shaping filter — Sallen-Key, resonant
 
