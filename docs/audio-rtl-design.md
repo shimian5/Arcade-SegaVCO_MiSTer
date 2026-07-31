@@ -876,14 +876,303 @@ the cabinet recording's drone changes character and not just level between ACC s
 This also means **no part of SHIP is a filter of the noise source** — SHIP does not use
 NOISE at all. It is entirely self-oscillating.
 
-> **STILL OPEN — Tr4 and Tr5.** Two further transistor stages sit between this oscillator
-> and the VCA and are not yet traced: Tr4 with R112 100K, R113 51K, R114 51K, D4, R52
-> 2.2K, R53 51K, R54 100K, R63 10K, C57 33uF; and Tr5 with C66 0.033uF, R116 150K, R117
-> 51K, R121 51K, R111 56K, R108 51K, R110 2.2K, D11, R122 10K, R109 100K. Given the Tr2
-> stage turned out to be an oscillator rather than the follower the summary claimed, treat
-> the summary's description of these two as unreliable and re-trace both. Then C65 2.2uF,
-> R118 220K, C64 0.0022uF; IC24 MB4391 (C68 680pF on RO) -> C10 2.2uF -> IC10 4066 ->
-> R124 100K / R125 220K -> IC28 -> C70 2.2uF -> SHIP MIX.
+### Tr4 and Tr5 — RESOLVED. They are two more copies of the same oscillator.
+
+Traced at high magnification from sheet 1. Tr2, Tr4 and Tr5 are **three instances of one
+circuit**, drafted identically, differing only in the integrator's three passives:
+
+```
+        Vs ---R_in--->|- \                        integrator
+                      |    >--+--- Vint           (C is the ONLY feedback element)
+        Vs --+--51K---|+ /    |
+             |        |       |
+            51K       +---C---+
+             |
+            GND                  summing node also pulled down by R_c -> Tr collector
+                                 (emitter grounded)
+
+        Vint ---------|- \                        Schmitt
+                      |    >--+--- Vsq
+        6V ---51K--+--|+ /    |
+                   |          |
+                   +---100K---+
+
+        Vsq --10K--|>|-- base (2.2K to ground), collector -> R_c
+```
+
+| | integrator R_in | C | R_c | Schmitt R / R | series R + diode | base R |
+|---|---|---|---|---|---|---|
+| **Tr2** | R59 150 K | C22 0.01 µF | R58 68 K | R48 51 K / R49 100 K | R57 10 K + D10 | R55 2.2 K |
+| **Tr4** | R112 100 K | C64 0.0022 µF | R114 51 K | R53 51 K / R54 100 K | R63 10 K + D4 | R52 2.2 K |
+| **Tr5** | R116 150 K | C66 0.033 µF | R111 56 K | R108 51 K / R109 100 K | R122 10 K + D11 | R110 2.2 K |
+
+All three diodes have the **anode toward the Schmitt output**, confirmed visually at high
+magnification on D4 and D11 (D10 was already traced). That is the only orientation that
+works: the Schmitt's high output sources base current through the diode, and the diode
+blocks when it goes low so the base is never reverse-driven.
+
+> **A designator ambiguity, recorded not hidden.** Tr4's stage carries **two** resistors
+> both labelled *R114 51 K* on the sheet — the one from R113 to ground and the one from the
+> summing node to Tr4's collector. One of them is presumably R115. Both read 51 K, and 51 K
+> is what both slots need by analogy with Tr2 and Tr5, so nothing in the model turns on
+> which is which.
+
+**The `+` input is at `Vs/2`, referred to true ground, not to the 6 V rail.** The 51 K/51 K
+divider goes from the source to *ground*. So the integrator's virtual node sits at `Vs/2`
+and the current into it through `R_in` is `(Vs − Vs/2)/R_in = Vs/(2·R_in)`, always positive.
+With the transistor saturated, `R_c` sinks `Vs/(2·R_c)` out of the same node. Because
+`R_c < R_in` in all three, the net reverses sign:
+
+```
+Tr off:  dVint/dt = -(Vs/2) / (R_in · C)                     output falls
+Tr on:   dVint/dt = +(Vs/2) · (1/R_c - 1/R_in) / C           output rises
+```
+
+**Frequency is exactly proportional to `Vs`.** These are voltage-controlled oscillators in
+the linear sense, not just "roughly".
+
+### Schmitt thresholds — shared by all three
+
+`R48` (and R53, R108) goes to the **6 V rail**, `R49` (R54, R109) is the positive feedback
+from the comparator output, which swings the LM324's full rails:
+
+```
+Vth = (6/51K + Vsq/100K) / (1/51K + 1/100K)
+Vsq = V_OH = 10.5 V  ->  TH_HI = 7.519868 V
+Vsq = V_OL =  0.0 V  ->  TH_LO = 3.973510 V
+```
+
+So every one of the three runs a triangle of **3.546358 Vpp about a mean of 5.746689 V**,
+independent of frequency. The mean is *exactly* constant, which is what makes the DC blocks
+downstream trivially correct (see below).
+
+> **The one soft number in SHIP.** `V_OH` carries the same 0.5 V LM324-vs-MB3614 ambiguity
+> flagged under "Op-amp output rails". At the MB3614's 10.0 V the hysteresis band narrows to
+> 3.3775 V and **every SHIP frequency rises by exactly 5.0 %** — a uniform transposition, not
+> a change of character. We take the LM324 figure, consistently with the rest of this file.
+> This is SHIP's tuning knob, and it is the only one.
+
+Duty cycle is set by `R_c`/`R_in` alone and does **not** move with frequency:
+
+| | up | down | shape |
+|---|---|---|---|
+| Tr2 | 45.3 % | 54.7 % | near-triangle |
+| Tr4 | 51.0 % | 49.0 % | near-symmetric |
+| Tr5 | 37.3 % | 62.7 % | clearly sawtoothed |
+
+### What drives each of the three — and this is the shape of the whole channel
+
+```
+IC14 555  --C12 ramp--> IC17 sec.A follower (pin 1) = Vramp, 4..8 V at 6.95 Hz
+                          |
+                          +--------------------------------> Tr5 VCO   (Vs = Vramp)
+                          |
+                          +-> IC17 sec.B, R50/R51 10K, + at 6V, gain -1
+                                = 12 - Vramp  ------------> Tr2 VCO   (Vs = 12 - Vramp)
+
+ACC0-3 4066 ladder -> R22/C11 -> IC22 sec.A follower ------> Tr4 VCO   (Vs = V_ACC)
+```
+
+| VCO | Vs range | Vs/2 | Hz per volt of Vs/2 | frequency |
+|---|---|---|---|---|
+| Tr2 | 4 → 8 V (inverted ramp) | 2 → 4 | 102.766 | **205.5 → 411.1 Hz** |
+| Tr5 | 8 → 4 V (ramp) | 4 → 2 | 35.698 | **142.8 → 71.4 Hz** |
+| Tr4 | 0 → 10.305 V (ACC) | 0 → 5.15 | 628.045 | **0 → 3236 Hz** |
+
+**Tr2 and Tr5 are the audible engine and they sweep in opposite directions**, because one
+takes the ramp and the other its inversion through IC17 sec.B. Tr2 covers an exact octave
+(205.5–411.1 Hz) and Tr5 an exact octave an octave-and-a-half below (71.4–142.8 Hz),
+crossing each other 6.95 times a second. That counter-motion is the whole reason the engine
+reads as an engine and not as a siren.
+
+**Tr4 is not audio: it is the VCA's control voltage.** It is the only thing ACC touches.
+
+### The two output paths
+
+**Audio** — Tr2's and Tr5's *integrator* outputs (not the Schmitt squares), each AC-coupled
+into one inverting summing amp:
+
+```
+Tr2 IC17 pin 7  -> C65 2.2uF -> R118 220K --+
+Tr5 IC26 pin 1  -> C59 2.2uF -> R120 220K --+-> IC26 sec.C (-), R119 30K fb, + at 6 V
+                                               gain -30/220 = -0.136364  -> C72 2.2uF
+                                               -> IC24 MB4391 pin 5 (I)
+```
+
+There is **no input attenuator** ahead of this VCA — the only channel without one. Peak
+`±3.546 V · 0.136364 = ±0.4836 V` when the two happen to align.
+
+**Control** — Tr4's integrator output, AC-coupled into an inverting stage sitting on a
+2.977 V reference (the same R106 100 K / R104 33 K divider off 12 V that FIRE uses, here
+with C57 33 µF):
+
+```
+Tr4 IC22 pin 7 -> C56 2.2uF -> R102 100K -> IC22 sec.C (-), R103 51K fb
+                  + at 12 * 33/(100+33) = 2.977444 V   -> IC24 pin 6 (C)
+
+V2 = 2.977444 - 0.51 * Vtr4_ac      Vtr4_ac = +/-1.773179 V
+   -> V2 sweeps 2.0731 V .. 3.8818 V
+```
+
+Against the MC3340 curve that is **fully open (+13 dB) below 3.1 V, closing to about
+35 dB down at 3.88 V**. So Tr4 *chops* the drone at an audio rate that tracks throttle. The
+open half is 56.8 % of the voltage swing, so this is a deep asymmetric gate, not a gentle
+tremolo — it is a ring-modulator in all but name, and the sum-and-difference sidebands it
+throws off the 71–411 Hz drone are what makes the engine buzz.
+
+### The DC blocks are exact, and that is worth stating
+
+All three triangles have a mean of exactly 5.746689 V — the midpoint of two thresholds that
+do not move — regardless of what the frequency is doing. So the three coupling networks
+(C65/R118 and C59/R120 at tau = 0.484 s, C56/R102 at tau = 0.220 s) have a *constant* input
+DC and are exact DC removers in steady state. They are still implemented as real one-pole
+high-passes, for one reason: **at ACC = 0000 Tr4 stops dead** (Vs = 0, so both slew rates
+are zero and the integrator freezes wherever it stood). The real C56 then bleeds that
+frozen offset away over 0.22 s, leaving V2 at 2.977 V and the VCA wide open. A DC
+subtraction would leave a permanent arbitrary offset instead.
+
+```
+audio  tau 0.484 s  a = 0.999956956  Q0.24 = 16776494  realised 0.484108 s (+0.022%)
+ctrl   tau 0.220 s  a = 0.999905305  Q0.24 = 16775627  realised 0.219960 s (-0.018%)
+```
+
+Q0.24 is sufficient here (unlike FIRE's 1.02 s envelope, which needed it to be *usable at
+all*). The stall floor 0.5/(1−a) is 11614 and 5280 state LSB; carried at 2^32 LSB/V those
+are 2.7 µV and 1.2 µV, three orders under one output LSB.
+
+### The 555 — corrected again, and now modelled as a real RC
+
+The earlier `0.693·R·C` figures assumed the cap charges toward the full 12 V. It does not:
+D1 is in the charge path, so the target is `12 − 0.6 = 11.4 V` and the ramp still has to
+climb from 4 V to 8 V.
+
+```
+charge:  R24 6.8K, tau = 6.800 ms, target 11.4 V   t_high = 6.8m*ln(7.4/3.4) = 5.288 ms
+discharge: R23 200K, tau = 200.0 ms, target 0 V    t_low  = 200m*ln(8/4)     = 138.629 ms
+period 143.918 ms -> 6.9484 Hz, duty 3.675 %
+```
+
+(was 4.712 ms / 143.31 ms / 6.978 Hz / 3.29 %.) The discharge figure is unchanged because
+the discharge transistor really does pull to ground. More to the point, **SHIP needs the
+ramp's shape, not just its period** — IC17 sec.A follows the C12 node — so the 555 is
+modelled the way `rebound_chan` models IC15B: two exponentials and a pair of comparators,
+not a fixed-cycle square.
+
+```
+A_CHARGE_Q24    = 16725893   realised tau 6.8000 ms  (+0.0006%)
+A_DISCHARGE_Q24 = 16775468   realised tau 199.95 ms  (-0.024%)
+```
+
+### ACC ladder — full table
+
+Each enabled IC9 4066 section connects its resistor from **+12 V** to a common node loaded
+by R22 10 K to ground and smoothed by C11 33 µF. `A_Q24` is the glide pole at
+fs = 47,998.875 Hz.
+
+| ACC3..0 | R_sel | V_ACC | glide tau | Tr4 | V·2^24 | A_Q24 |
+|---|---|---|---|---|---|---|
+| 0000 | ∞ | 0.0000 | 330.0 ms | stopped | 0 | 16776157 |
+| 0001 | 82 K | 1.3043 | 294.1 ms | 409.6 Hz | 21883325 | 16776028 |
+| 0010 | 30 K | 3.0000 | 247.5 ms | 942.1 Hz | 50331648 | 16775804 |
+| 0011 | 21.96 K | 3.7542 | 226.8 ms | 1178.9 Hz | 62984856 | 16775675 |
+| 0100 | 16 K | 4.6154 | 203.1 ms | 1449.3 Hz | 77433305 | 16775495 |
+| 0101 | 13.39 K | 5.1309 | 188.9 ms | 1611.2 Hz | 86082051 | 16775366 |
+| 0110 | 10.43 K | 5.8723 | 168.5 ms | 1844.0 Hz | 98521524 | 16775142 |
+| 0111 | 9.26 K | 6.2316 | 158.6 ms | 1956.8 Hz | 104548201 | 16775013 |
+| 1000 | 2 K | 10.0000 | 55.0 ms | 3140.2 Hz | 167772160 | 16770862 |
+| 1001 | 1.95 K | 10.0398 | 53.9 ms | 3152.7 Hz | 168440575 | 16770733 |
+| 1010 | 1.875 K | 10.1053 | 52.1 ms | 3173.3 Hz | 169538183 | 16770509 |
+| 1011 | 1.833 K | 10.1411 | 51.1 ms | 3184.5 Hz | 170138719 | 16770380 |
+| 1100 | 1.778 K | 10.1887 | 49.8 ms | 3199.5 Hz | 170937672 | 16770200 |
+| 1101 | 1.740 K | 10.2214 | 48.9 ms | 3209.8 Hz | 171486953 | 16770071 |
+| 1110 | 1.678 K | 10.2754 | 47.4 ms | 3226.7 Hz | 172393429 | 16769847 |
+| 1111 | 1.645 K | 10.3052 | 46.6 ms | 3236.1 Hz | 172891776 | 16769718 |
+
+ACC3's 2 K swamps the other three: everything from 1000 up is within 3 % of the top step.
+The ladder is really a 9-step control with a coarse top half.
+
+### Gate and output
+
+```
+IC24 pin 11 (O) -> C10 2.2uF -> IC10 4066 pin 11, control pin 12 = SHIP ON (active high)
+   -> pin 10 -> R124 100K -> IC28 (-), R125 220K fb, + at 6 V  = -2.200
+   -> C70 2.2uF -> SHIP MIX
+```
+
+The 4066 is a hard gate with no ramp, so SHIP ON produces a real click on the board. C10 and
+C70 would soften it; they are not modelled, consistently with every other channel's coupling
+caps.
+
+### Predicted level, and where it clips
+
+```
+0.4836 V (IC26 out, both VCOs aligned) x 4.4668 (+13 dB) x 2.200 = 4.752 V
+```
+
+against `RAIL_HI` = +4.50 V, so SHIP just touches the positive rail on coincidences and is
+otherwise under it. Same league as ALARM's 4.26 V and far short of EXP/HIT, which rail
+outright. Apply the rails at IC28's output as every other channel does.
+
+### One thing this trace does NOT explain: the recording's level steps
+
+`buckrog_cabinet_recording.mp4` steps its drone between roughly −37 dB and −27 dB as
+throttle changes. Nothing in the circuit above changes SHIP's *amplitude* with ACC: Tr4's
+triangle has the same 3.546 Vpp swing at every ACC setting, so the VCA's duty and depth are
+identical — only its rate moves. What ACC changes is **spectrum**: sidebands at 71–411 Hz ±
+(410…3236 Hz), which slide from a low buzz to a bright whine.
+
+Deliberately **not** resolved by adding a level term. Every element here is off the
+schematic, and a recording does not override a primary source (same standing rule as FIRE's
+decay). A band-limited measurement of the recording would very plausibly show the "level"
+step as the spectral shift it actually is; whoever cares enough should measure it that way
+before proposing a circuit change.
+
+### RTL realisation — the VCOs run at clk_sys, not at fs
+
+Every other channel's analog tail runs entirely at `sample_ce`. SHIP cannot: Tr4 reaches
+3.2 kHz, which is only 15 audio samples per cycle, and a relaxation oscillator whose
+threshold crossings are quantised to the audio grid jitters its period by up to 7 % and
+aliases audibly.
+
+So `relax_vco.sv` runs its integrator **at full `clk_sys`**, exactly like the 555/74123/74393
+parts, and the result is box-averaged over the 832 cycles of each audio sample — the same
+1st-order CIC decimator ALARM uses, and for the same reason. Two things make this cheap:
+
+* the integrator ramp is **linear**, so a full-rate accumulator is *exact*, not an
+  approximation of an exponential; and
+* the slew rate only depends on `Vs`, which moves at 7 Hz, so the two step sizes are computed
+  once per audio sample and merely *added* 832 times.
+
+Threshold crossings then land within one `clk_sys` (25 ns) of the true instant.
+
+```
+Numeric formats inside ship_chan (they differ from the other channels on purpose):
+
+  555 cap, VCO integrator state, Vs/2      2^24  LSB/V   signed [39:0]
+  per-clock slew step  = (Vs/2) * K_Q40 >> 40           K in Q0.40
+  DC-block state                           2^32  LSB/V   signed [47:0]
+  audio tail and VCA control voltage       2^20  LSB/V   (= 4096*256, the house scale,
+                                                          so the MC3340 LUT ports verbatim)
+```
+
+The 2^24 oscillator scale is set by the *smallest* step, Tr5 falling at Vs/2 = 2 V: 10.1 µV
+per clock, which is 170 LSB — plenty of resolution. The largest, Tr4 rising at full
+throttle, is 9450 LSB per clock. `K_Q40` carries the slew constants to a relative precision
+of 4.5e−8, so period error from the coefficients is nil and all of it comes from the ±1 clk
+crossing quantisation.
+
+```
+                K_UP (Q0.40)   K_DN (Q0.40)
+  Tr2             22133960       18354991
+  Tr4            120239916      125147668
+  Tr5              9336413        5562119
+
+  TH_HI = 126162442   TH_LO = 66664434   mean = 96413438     (all * 2^24 LSB/V)
+```
+
+`Vce_sat` is taken as 0 V. Base drive is ~0.6 mA against a collector current under 80 µA,
+so all three transistors are saturated by more than 3 orders of magnitude; the real ~50 mV
+`Vce_sat` shifts the rising slew rate by 1–3 % and nothing else.
 
 ## Op-amp output rails — a real clipping mechanism
 
