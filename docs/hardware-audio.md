@@ -204,8 +204,9 @@ IC18 out pin 15 -> C25 2.2uF, R69 100K -> IC25 (R142 220K fb, ~ -2.2x)
 Fully digital up to the mix, so it ports almost literally:
 
 ```
-IC15A 555 astable: R29 470R (Ra), R30 270R (Rb), C15 0.01uF, C17 0.01uF on CTRL
-    f = 1.44 / ((Ra + 2*Rb) * C) = 1.44 / (1010 * 1e-8) ~ 142.6 kHz
+IC15A 555 astable: R29 470R (Ra), R30 270R (Rb), C15 0.1uF (NOT .01 -- see below),
+                   C17 0.01uF on CTRL
+    f = 1.44 / ((Ra + 2*Rb) * C) = 1.44 / (1010 * 1e-7) ~ 14.26 kHz
   -> R66 1K pull-up -> IC16 74LS393 pin 1 (1A)
   -> IC16 pin 2 (1CLR) and pin 12 (2CLR) are tied together and GROUNDED (free-running)
   -> 2A (pin 13) is tied to 1QD (pin 6), so the two halves cascade into one 8-stage ripple
@@ -216,18 +217,19 @@ RESOLVED tap -> gate -> alarm mapping (sheet 3; the four one-shot lines do not c
 
 | Alarm | 74123 | one-shot R/C | IC11 gate (in,in -> out) | IC16 tap | divide | tone |
 |---|---|---|---|---|---|---|
-| ALARM0 | IC3 pin 1  -> Q13 | R2 47K / C1 6.8uF  | 1,2 -> 3   | pin 11 = 2QA | /32 | 4.46 kHz |
-| ALARM1 | IC3 pin 9  -> Q5  | R3 47K / C2 6.8uF  | 12,13 -> 11 | pin 6 = 1QD  | /16 | 8.91 kHz |
-| ALARM2 | IC7 pin 1  -> Q13 | R14 47K / C5 6.8uF | 4,5 -> 6   | pin 5 = 1QC  | /8  | 17.8 kHz |
-| ALARM3 | IC7 pin 9  -> Q5  | R15 47K / C6 10uF  | 9,10 -> 8  | pin 4 = 1QB  | /4  | 35.6 kHz |
+| ALARM0 | IC3 pin 1  -> Q13 | R2 47K / C1 6.8uF  | 1,2 -> 3    | pin 11 = 2QA | /32 | 446 Hz |
+| ALARM1 | IC3 pin 9  -> Q5  | R3 47K / C2 6.8uF  | 12,13 -> 11 | pin 6 = 1QD  | /16 | 891 Hz |
+| ALARM2 | IC7 pin 1  -> Q13 | R14 47K / C5 6.8uF | 4,5 -> 6    | pin 5 = 1QC  | /8  | 1782 Hz |
+| ALARM3 | IC7 pin 9  -> Q5  | R15 47K / C6 10uF  | 9,10 -> 8   | pin 4 = 1QB  | /4  | 3565 Hz |
+
+Every element of this table is read directly off sheet 3 at high magnification. The tap
+verticals are unambiguous (2QA -> gate pin 2, 1QD -> gate pin 13, 1QC -> gate pin 5,
+1QB -> gate pin 10) and the four one-shot enable lines run to gate pins 1/12/4/9 in
+top-to-bottom order without crossing.
 
 One-shot gate lengths are ~0.45*R*C: 144 ms for the three 6.8 uF sections, 211 ms for
 ALARM3's 10 uF. (An earlier revision of this document said "tau ~ 9 ms"; that was a
 decimal slip and is wrong by more than 10x.)
-
-**Two of these tones are ultrasonic and ALARM3 is beyond hearing entirely** — see the
-open-questions section. Every element above is confirmed against both the schematic and
-the assembly drawing; the arithmetic is what looks wrong, not the reading.
 
 mix: R154 5.1K, C88 4.7uF -> IC29 -> R127 100K -> IC25 (R129 200K fb, ~2x)
      -> C74 2.2uF -> ALARM MIX
@@ -316,7 +318,7 @@ assembly drawing wins:
   prose section calls it.
 - Transistors are **2SC458**; diodes are **MA150**.
 
-**Previously open, now CLOSED** (all three traced at high magnification, 2026-07-30):
+**Previously open, now CLOSED** (traced at high magnification, 2026-07-30):
 
 1. ~~Connector pin → signal-name mapping~~ — resolved; see the pinout table above.
 2. ~~74393 tap wiring~~ — resolved; `1CLR`/`2CLR` grounded, `2A ← 1QD`, taps are
@@ -324,26 +326,32 @@ assembly drawing wins:
 3. ~~R138~~ — resolved; it is a **series** element, and the mixer is passive-summing
    followed by a −0.5 gain stage, not a virtual-ground summer. See above.
 
-**NEW — open, and blocking the ALARM channel:**
+4. **C15 is 0.1 µF, not the 0.01 µF the schematic letters.** Taking the schematic
+   literally gives a 142.6 kHz alarm clock and tones of 4.46 k / 8.91 k / 17.8 k /
+   35.6 kHz — two ultrasonic, one inaudible outright, which no 1982 cabinet shipped.
+   At 0.1 µF the clock is 14.26 kHz and the tones are 446 / 891 / 1782 / 3565 Hz.
 
-4. **The alarm tone frequencies come out implausibly high.** Every input to the
-   calculation is confirmed twice over — R29 = 470 Ω and R30 = 270 Ω appear on both the
-   schematic and the assembly drawing, C15 = 0.01 µF is legible on the schematic and is
-   drawn non-polarised, and the divider taps are unambiguous. Yet the result is a
-   142.6 kHz clock giving tones of 4.46 k / 8.91 k / **17.8 k** / **35.6 kHz**. ALARM2 is
-   at the edge of adult hearing and ALARM3 is inaudible outright, which cannot be what a
-   1982 arcade cabinet shipped.
+   Primary evidence, in order of weight:
+   - **Assembly drawing (page 20)** — a 0.1 µF part sits immediately beside IC15A. It is
+     lettered ambiguously and was previously transcribed here as "C19"; the 5/9 glyphs
+     are near-identical in this draftsman's hand. Per the standing rule that the assembly
+     drawing wins on values, this is C15.
+   - **MAME's own Turbo netlist**, `turbo_a.cpp:648`:
+     `DISCRETE_555_ASTABLE(NODE_50,1,470,120,0.1e-6,...)`. Turbo's alarm 555 is the same
+     circuit from the same vendor in the same year, with the same 470 Ω Ra and a 0.1 µF
+     timing cap. This is reverse-engineered netlist, not a recording.
 
-   If instead C15 were 0.1 µF (or R29/R30 were 4.7 K/2.7 K), the clock would be 14.26 kHz
-   and the four tones would be **3565 / 1782 / 891 / 446 Hz** — a textbook alarm set.
-   That is a suspiciously good fit, but it is a *guess*, and nothing on either drawing
-   supports it. Note the assembly drawing does show a 0.1 µF part next to IC15, but it is
-   labelled C19 and drawn as a polarised tantalum, so it is not C15.
+   Corroborating only (a recording, not a primary source): an FFT of the `buckrog`
+   WAV samples gives 470 / 942 / 1885 / 3770 Hz, implying a 15.07 kHz clock — 5.7 % above
+   the 14.26 kHz nominal, comfortably inside 555 + electrolytic tolerance. **Model the
+   nominal 14.26 kHz**, and treat the clock rate as the one tuning knob if it sounds off.
 
-   **Resolution path:** measure the real board, or compare against MAME's `buckrog`
-   alarm WAV samples in the samples folder — an FFT of those will state the intended
-   pitches directly and settle it without hardware. Do not build the ALARM channel until
-   this is decided; the tap wiring is certain, only the clock rate is not.
+**On the MAME samples as a comparison target** — they are a recording of one board and
+are not authoritative. Concretely, `alarm1.wav` (1885 Hz) and `alarm2.wav` (942 Hz) are
+**swapped** relative to what the schematic wires: ALARM1 is gated by 1QD (÷16 = 891 Hz)
+and ALARM2 by 1QC (÷8 = 1782 Hz). MAME's own comments betray the same confusion —
+`turbo_a.cpp:522,525` label sample indices 2 and 3 as "/ALARM3" and "/ALARM4". Follow the
+schematic; use the WAVs for timbre and rough level only, never for signal assignment.
 
 ---
 
