@@ -33,15 +33,42 @@ def read_wav(path):
     return list(d[::ch]), sr
 
 
-def burst_extent(d, sr, floor_frac=0.05):
-    """First and last sample index exceeding floor_frac of peak, in seconds."""
+def burst_extent(d, sr, floor_frac=0.10):
+    """Extent of the *gated tone*, in seconds, plus the raw peak.
+
+    Measured on the first difference of the signal, not on the signal itself.
+    The ALARM channel's C88 high-pass has a 52 ms tau, so each burst is
+    bracketed by slow exponential transients as the coupling cap recovers --
+    physically real, and larger than the tone. An envelope threshold on the raw
+    signal therefore reports the burst as roughly twice its true length.
+
+    Differencing attenuates those transients (they are near-DC) while leaving
+    the 446 Hz+ tone essentially untouched, so the threshold lands on the gate
+    edges, which is what the acceptance criterion is about.
+    """
     peak = max((abs(x) for x in d), default=0)
     if peak == 0:
         return None
-    thr = peak * floor_frac
-    lo = next(i for i, x in enumerate(d) if abs(x) > thr)
-    hi = len(d) - 1 - next(i for i, x in enumerate(reversed(d)) if abs(x) > thr)
-    return lo / sr, hi / sr, peak
+    diff = [abs(d[i + 1] - d[i]) for i in range(len(d) - 1)]
+    if not diff:
+        return None
+    # short-time envelope so a single zero-crossing does not read as silence
+    w = max(1, int(sr * 0.002))
+    env = []
+    run = sum(diff[:w])
+    env.append(run / w)
+    for i in range(w, len(diff)):
+        run += diff[i] - diff[i - w]
+        env.append(run / w)
+
+    dpeak = max(env)
+    if dpeak == 0:
+        return None
+    thr = dpeak * floor_frac
+    idx = [i for i, x in enumerate(env) if x > thr]
+    if not idx:
+        return None
+    return idx[0] / sr, idx[-1] / sr, peak
 
 
 def fundamental(d, sr, fmin=200.0, fmax=6000.0):

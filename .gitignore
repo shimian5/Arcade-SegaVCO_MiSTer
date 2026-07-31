@@ -32,3 +32,9 @@ sim/out/
 
 # built ROM images (produced from MRA + MAME sets, never checked in)
 *.rom
+
+# Verilator sim output
+sim/obj_dir/
+sim/obj_dir_audio/
+sim/out/
+sim/*.rom

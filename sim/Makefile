@@ -19,6 +19,11 @@ SOURCES = \
 	$(RTL_DIR)/video/video_timing.v \
 	$(RTL_DIR)/video/fg_tilemap.v \
 	$(RTL_DIR)/video/sprite_engine.v \
+	$(RTL_DIR)/audio/ttl_555_astable.sv \
+	$(RTL_DIR)/audio/ttl_74123.sv \
+	$(RTL_DIR)/audio/alarm_chan.sv \
+	$(RTL_DIR)/audio/audio_mixer.sv \
+	$(RTL_DIR)/audio/audio_top.sv \
 	$(RTL_DIR)/io/i8255.v \
 	$(RTL_DIR)/io/i8279.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_core.v \
@@ -62,3 +67,37 @@ clean:
 	rm -rf obj_dir out *.rom
 
 .PHONY: all run dump clean
+
+# ---------------------------------------------------------------------------
+# Discrete-audio harness (rtl/audio -> WAV). Independent of the z80_3d rules
+# above: separate obj dir, separate output dir, separate target names, so
+# `make` / `make run` keep meaning exactly what they always meant.
+#
+#   make audio        build the audio sim
+#   make audio-run    render all six ALARM scenarios to out/audio/scenN.wav
+#   make audio-clean
+#
+# Analyse the results from the repo root with:
+#   python tools/analyze_audio.py sim/out/audio/*.wav
+# ---------------------------------------------------------------------------
+AUDIO_TOP     = audio_top
+AUDIO_OBJ_DIR = obj_dir_audio
+AUDIO_OUT_DIR = out/audio
+AUDIO_SOURCES = $(wildcard ../rtl/audio/*.sv)
+
+AUDIO_VFLAGS = --cc --exe --build -Wno-fatal -Mdir $(AUDIO_OBJ_DIR) \
+	--top-module $(AUDIO_TOP) -O2
+
+.PHONY: audio audio-run audio-clean
+
+audio: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
+
+$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP): $(AUDIO_SOURCES) audio_tb.cpp
+	$(VERILATOR) $(AUDIO_VFLAGS) $(AUDIO_SOURCES) audio_tb.cpp
+
+audio-run: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
+	mkdir -p $(AUDIO_OUT_DIR)
+	for s in 0 1 2 3 4 5; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
+
+audio-clean:
+	rm -rf $(AUDIO_OBJ_DIR) $(AUDIO_OUT_DIR)

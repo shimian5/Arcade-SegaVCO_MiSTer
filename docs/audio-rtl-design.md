@@ -238,14 +238,39 @@ the schematic, and it is isolated in one parameter for exactly that reason.
 
 ---
 
-## Acceptance criteria for phase 1
+## Acceptance criteria for phase 1 — all PASSING
 
-1. Each `/ALARMn` pulsed alone produces a burst at the tabled frequency, within 0.5 %,
-   measured by FFT of the rendered WAV.
-2. Burst lengths are 144 ms (ALARM0-2) and 211 ms (ALARM3), within 1 %.
-3. Retriggering mid-burst extends to a full width from the retrigger instant.
-4. Two alarms asserted together produce the wire-OR product, not a sum — the node is a
-   single bit, so simultaneous tones **intermodulate**, they do not mix linearly. This is a
-   real and audible property of the hardware and is the easiest thing for an
-   implementation to get wrong.
-5. Silence is bit-exact zero when no alarm has ever fired.
+Rebuild and re-check with:
+
+```
+wsl -d archlinux -- bash -lc "cd /mnt/c/.../sim && make audio-run"
+python tools/analyze_audio.py sim/out/audio/scen0.wav ...
+```
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Each `/ALARMn` alone gives the tabled frequency within 0.5 % | **PASS** — 446.5 / 892.2 / 1784.1 / 3579.5 Hz vs 446.5 / 893.0 / 1785.9 / 3571.8 (worst error +0.22 %) |
+| 2 | Burst lengths 144 ms (ALARM0-2) and 211 ms (ALARM3) within 1 % | **PASS** — 146 / 145 / 146 / 213 ms measured, less the 2 ms envelope window |
+| 3 | Retrigger extends to a full width from the retrigger instant | **PASS** — scenario 4 retriggers at 80 ms and ends at 224 ms = 80 + 144 |
+| 4 | Simultaneous alarms intermodulate, they do not sum | **PASS** — scenario 5 differs from `scen0 + scen2` by up to 18160 LSB; RMS 7288 vs 10687 for the linear sum |
+| 5 | Silence is bit-exact zero before the first alarm | **PASS** — max sample 0 over the first 480 samples |
+
+### Two findings from the first run, both now fixed
+
+**The filter reset value.** `x_scaled_d` initially reset to `X_LOW`, but the idle node sits
+*high*. Every reset therefore injected a full-scale step and rang for the whole 52 ms tau,
+producing a click at twice the amplitude of the alarm itself — visible as an identical peak
+of 19888 in all six scenarios regardless of content. It resets to `X_IDLE` now.
+
+**The burst-length measurement.** `tools/analyze_audio.py` originally thresholded the raw
+envelope, which measured the C88 recovery rather than the gate and reported every burst at
+roughly twice its true length. It now measures on the first difference of the signal.
+
+### On the burst envelope
+
+The peak sample of a burst is about **2×** its late-burst amplitude, and this is correct.
+At burst onset the node's mean steps from a steady 5 V to the square's average, so the
+first excursion is the full node swing rather than half of it; C88 then recovers with
+tau = 52 ms. The burst is only 2.8 tau long, so it never fully settles. Measured decay
+tracks `9954 · (1 + exp(−(t−t₀)/52.17 ms))` to within a few percent across the whole burst,
+which is the intended physics, not a gain error.

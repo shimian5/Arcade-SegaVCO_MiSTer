@@ -38,9 +38,13 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
-assign AUDIO_S = 0;
-assign AUDIO_L = 0;
-assign AUDIO_R = 0;
+// Sound board 834-5122, modelled discretely in rtl/audio. AUDIO_S = 1
+// because the mixer works in signed volts about the board's 6 V mid-rail.
+// AUDIO_MIX = 0: the cabinet is mono, so there is nothing for the
+// framework to blend.
+assign AUDIO_S = 1;
+assign AUDIO_L = audio_l;
+assign AUDIO_R = audio_r;
 assign AUDIO_MIX = 0;
 
 assign LED_DISK = 0;
@@ -232,6 +236,9 @@ wire VSync;
 wire ce_pix;
 wire [7:0] video_r, video_g, video_b;
 
+// Sound board output, straight from the discrete model in rtl/audio.
+wire signed [15:0] audio_l, audio_r;
+
 z80_3d z80_3d
 (
 	.clk(clk_sys),
@@ -255,7 +262,9 @@ z80_3d z80_3d
 
 	.video_r(video_r),
 	.video_g(video_g),
-	.video_b(video_b)
+	.video_b(video_b),
+	.audio_l(audio_l),
+	.audio_r(audio_r)
 );
 
 assign CLK_VIDEO = clk_sys;

@@ -42,7 +42,12 @@ module z80_3d
     output wire         ce_pix,
     output wire [7:0]   video_r,
     output wire [7:0]   video_g,
-    output wire [7:0]   video_b
+    output wire [7:0]   video_b,
+
+    // Sound board 834-5122 (discrete/analog on real hardware). Modelled in
+    // rtl/audio; see docs/hardware-audio.md and docs/audio-rtl-design.md.
+    output wire signed [15:0] audio_l,
+    output wire signed [15:0] audio_r
 
 `ifdef VERILATOR_SIM
     // Phase0-1a sprite debug harness (see sprite_engine.v's VERILATOR_SIM
@@ -677,6 +682,20 @@ module z80_3d
         .pa    (ppi1_pa), .pb (ppi1_pb), .pc (ppi1_pc),
         .pa_wr (), .pb_wr (), .pc_wr ()
     );
+    // The sound board hangs off PPI1 ports A and B over a 20-pin flat cable.
+    // Only the four /ALARM lines are consumed so far (phase 1); the rest of
+    // the channels land later. Full pinout in docs/hardware-audio.md.
+    audio_top u_audio
+    (
+        .clk     (clk),
+        .rst_n   (~reset),
+        .ppi1_pa (ppi1_pa),
+        .ppi1_pb (ppi1_pb),
+        .audio_l (audio_l),
+        .audio_r (audio_r),
+        .sample_ce ()
+    );
+
     wire [2:0] obch          = ppi1_pc[2:0];
     wire       coin_meter1   = ppi1_pc[4];
     wire       coin_meter2   = ppi1_pc[5];
