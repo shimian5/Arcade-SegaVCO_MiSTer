@@ -41,7 +41,7 @@ Everything else is buffered straight through:
 | `/FIRE` | active low | sheet 3, IC4 one-shot |
 | `/EXP`, `/HIT`, `/REBOUND` | active low | sheet 2 |
 | `SHIP ON` | active high, level | sheet 1 engine gate |
-| `GAME ON` | active high, level | global mute |
+| `GAME ON` | active high, level | LA4460 pin 6 DC mute — see "The global mute" |
 
 These names match MAME's `turbo_a.cpp` handlers 1:1, which is good evidence the driver's
 latch decode was taken directly off this schematic.
@@ -301,9 +301,54 @@ Output stage:
 
 ```
 IC28 -> C69 4.7uF -> R45 100K -> VR1 20K volume pot -> C83 4.7uF -> LA4460 pin 2
-LA4460: pin 10 = +12 V (C80 470uF), pin 6 = NFB/ripple (fed from D5 off the SHIP chain),
-        pins 4/5 bootstrap C82 47uF / C81 47uF / R145 1.5K, pin 3 gnd C84 0.01uF,
-        pins 7 & 9 = speaker out, each with a Zobel: 0.033uF + 4.7R 1/2W
+LA4460: pin 10 = +12 V (C80 470uF), pin 2 = IN, pin 3 = preamp GND,
+        pins 4/5 = NF1/NF2, CNF = C82 47uF / C81 47uF, Rx = R145 1.5K, Cx = C84 0.01uF,
+        pin 6 = DC AUDIO MUTING  (see "The global mute" below),
+        pins 7 & 9 = OUT2/OUT1, BRIDGED across the speaker, each with a Zobel:
+                     0.033uF + 4.7R 1/2W
+```
+
+Every external part matches the datasheet's Application 1 recommended circuit one for one
+(CNF 47 µF x2, Cx 0.01 µF, Rx 1.5 K, both Zobels, C80 = the supply bulk). The board's only
+departure is that it drives pin 6; the recommended circuit leaves pins 1 and 6 open.
+
+### The global mute — traced 2026-07-31, sheet 1
+
+`hardware-audio.md` previously recorded pin 6 as "NFB/ripple, fed from D5 off the SHIP
+chain". **Both halves of that are wrong.** Pin 6 is the LA4460's **DC muting** input
+(datasheet pin table, quiescent 5.6 V, attenuation = ∞; the *AC* mute with its 38 dB is
+pin 1, which this board leaves unconnected). And D5 comes off a power-on timer, not off
+SHIP.
+
+```
+conn pin 16 --4.7K to 5V (RA2)--> IC5 7417 pin 13 -> pin 12 (OPEN COLLECTOR)
+                                  --47K to 12V (RA3)--> LA4460 pin 6
+12 V --R107 470K--+-- IC26 sec.D pin 12 (+),  pin 13 (-) at the 6 V rail
+                  +-- C58 4.7uF to ground
+                  +-- D9 anode here, cathode at 12 V
+IC26 pin 14 -> D5 (CATHODE toward IC26, anode toward pin 6) -> LA4460 pin 6
+```
+
+Both drivers are **pull-down only** — an open-collector gate and a diode pointing the wrong
+way to source — so pin 6 is a wired-OR of two mute requests:
+
+* **`GAME ON` low** mutes. The 7417 is a non-inverting OC buffer, so a low input sinks pin 6.
+  This agrees with MAME's `turbo_a.cpp`, which does `system_mute(!BIT(data, 7))`.
+* **The first 1.53 s after power-on** mutes. IC26 sec.D is an open-loop comparator with the
+  6 V rail on its `−`. C58 starts uncharged, so the output sits low and sinks pin 6 through
+  D5 until the R107/C58 node climbs past 6 V: `tau = 470K · 4.7 µF = 2.209 s`, crossing at
+  `2.209 · ln(12/6)` = **1.531 s**.
+
+D9 is the reason this also works at power-*off*: reverse-biased in normal operation, it dumps
+C58 into the collapsing 12 V rail so the mute re-arms before the rails die. (The IC roster
+below calls D9 "a 12 V zener reference" — it is an ordinary MA150 doing exactly this, anode on
+the C58 node, cathode at 12 V, confirmed at high magnification.)
+
+So the muting circuit is what makes the board's coupling capacitors inaudible: C69/C83 and
+the rest charge behind an infinite attenuation and are long settled by the time pin 6
+releases. Any thump this board makes at power-on is upstream of the mute, not through it.
+
+```
 On-board supply filtering: R147 1K, R148 1K, C60-C63 470uF (12 V / 6 V / 5 V rails)
 ```
 
@@ -331,7 +376,7 @@ On-board supply filtering: R147 1K, R148 1K, C60-C63 470uF (12 V / 6 V / 5 V rai
 | LA4460 | Sanyo power amp | 1 | speaker output |
 | VR1 | 20 K pot | 1 | master volume |
 | Tr1-Tr5 | 2SC458 | 1, 2, 3 | envelope-follower / gate stages |
-| D1-D11 | MA150 | all | rectifiers in decay networks; D9 is a 12 V zener reference |
+| D1-D11 | MA150 | all | rectifiers in decay networks; D9 arms the power-off mute |
 
 ---
 

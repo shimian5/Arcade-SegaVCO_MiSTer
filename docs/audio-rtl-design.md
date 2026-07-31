@@ -5,9 +5,11 @@ the *implementation* decisions: numeric formats, clocking, module boundaries, an
 place we knowingly depart from the circuit. Nothing here may contradict
 `hardware-audio.md`; if it seems to, the schematic wins and this file is the bug.
 
-Status: **all six channels built and connected** — ALARM, FIRE, EXP, HIT, REBOUND, SHIP.
-`MASTER_VOL` is calibrated (see "Output stage"). The mixer was built for all six from the
-start; see "Why the mixer is built whole" for why that was not premature.
+Status: **complete, from the PPI to the speaker terminals** — ALARM, FIRE, EXP, HIT, REBOUND
+and SHIP, the passive mixer, the `GAME ON` / power-on mute, and the LA4460 output stage. The
+mixer was built for all six from the start; see "Why the mixer is built whole" for why that was
+not premature. The one thing deliberately left unmodelled is the **speaker**, which is not on
+the schematic — see "Phase 7".
 
 ---
 
@@ -98,6 +100,8 @@ rtl/audio/
   alarm_chan.sv     555 + 74393 + 4x74123 + wire-OR NAND -> node bit + analog tail
   fire_chan.sv exp_chan.sv hit_chan.sv rebound_chan.sv ship_chan.sv
   audio_mixer.sv    passive summing node + IC28
+  mute_ctl.sv       GAME ON + the R107/C58/IC26 power-on timer -> LA4460 pin 6
+  la4460.sv         C69/R45/VR1/C83 input network, the amp's two poles, the rail clip
 ```
 
 `ttl_74123` and `ttl_555_astable` are written as general parts, parameterised by their
@@ -1302,13 +1306,16 @@ C88 pre-charged to the node-*low* level — a state the board is never in — an
 18452 LSB click, 5× too large and of the wrong sign. The correct initial condition is the
 cap uncharged.
 
-**It is also only the ALARM leg's share.** Most of a real cabinet's power-on thump is the
-other coupling caps charging — C69 and C83 (4.7 µF) into the LA4460, plus C74/C76/C77 —
-none of which are modelled yet. Expect this to be subtle on its own; the big one arrives
-with the LA4460 output stage.
+**It is also only the ALARM leg's share**, and — resolved in phase 7 — that is the whole of
+it. This section used to predict that "the big one arrives with the LA4460 output stage". It
+does not. C69/C83 charge behind the DC mute, which holds for 1.531 s, and the *reason* that
+timer is on the board is to make exactly this inaudible. ALARM's thump is modelled, is
+correct, and never reaches the speaker.
 
-Scenarios 0–10 call `settle()` first, which runs 600 ms (11.5 tau) **without recording**,
-so the thump has decayed to bit-exact zero and each scenario's timeline still starts at
+Scenarios 0–10 call `settle()` first, which runs **without recording** — 600 ms originally,
+now 1700 ms, because since phase 7 the binding constraint is no longer the 52 ms high-pass
+tau but the 1.531 s mute release. It runs long enough that
+the thump has decayed to bit-exact zero and each scenario's timeline still starts at
 t = 0. That models reality — a board has been powered for seconds before the game makes a
 sound — and keeps acceptance criterion 5 meaningful. Scenario 11 skips the settle and
 captures the thump itself.
@@ -1343,34 +1350,168 @@ ALARM at ±2.13 V therefore reaches IC28's output at **±0.152 V** (±622 LSB).
 Implementation: a single constant-coefficient weighted sum. The coefficients are fixed
 because the resistors are fixed — no runtime division.
 
-## Output stage
+## Phase 7 — the global mute and the LA4460 output stage
 
-`VR1` is a real 20 K panel pot, so a master volume is authentic hardware, not a fudge. Its
-*setting* is still the one number in this document chosen by taste rather than by the
-schematic, which is why it is isolated in a single parameter.
+Until this phase the model stopped at IC28 and scaled its output by an integer `MASTER_VOL`.
+That constant is gone: the amplifier, its input network and the board's mute are all on the
+schematic and are now modelled. `mute_ctl.sv` and `la4460.sv`.
+
+### GAME ON is the LA4460's DC mute, not an upstream gate
+
+Traced from sheet 1. `hardware-audio.md` had pin 6 as "NFB/ripple, fed from D5 off the SHIP
+chain"; both halves were wrong and are corrected there. Pin 6 is **DC Audio Muting**
+(datasheet pin table: quiescent 5.6 V, attenuation **∞**). The *AC* mute, with its finite
+38 dB, is pin 1 and this board does not use it — so the mute is total, not a fade.
+
+Two pull-down-only drivers wire-OR onto that pin:
 
 ```
-AUDIO_L = AUDIO_R = saturate16( mix_out * MASTER_VOL >>> 4 )
+GAME ON (ppi1_pb[7]) -> IC5 7417 OPEN COLLECTOR, 47K pull-up to 12 V -> pin 6
+12 V --R107 470K--+-- IC26 sec.D (12+), (13-) at 6 V, out 14 -> D5 (cathode at IC26) -> pin 6
+                  +-- C58 4.7uF to ground
+                  +-- D9 (anode here, cathode at 12 V)
 ```
 
-**`MASTER_VOL` = 80 (×5) — now calibrated, not provisional.** The calibration case is
-scenario 20, the actual gameplay pile-up: the engine held under alarms with a laser and
-hits over the top. SHIP is the only *continuous* channel, so it and not scenario 14 sets
-the ceiling. Measured `mix_out` peak there is **5417 LSB**:
+* `GAME ON` low mutes — matching MAME's `system_mute(!BIT(data,7))`.
+* The comparator mutes for the first **1.531 s** after power-on:
+  `tau = 470K · 4.7 µF = 2.209 s`, crossing the 6 V reference at `2.209 · ln(12/6)`, which is
+  **61,147,057 `clk_sys` cycles**.
 
-| MASTER_VOL | scenario 20 | |
+D9 re-arms the mute at power-off by dumping C58 into the collapsing rail. There is no
+power-off on an FPGA, so D9 is documented and not modelled. Reset is treated as power-on,
+which means **a mid-session core reset re-arms the 1.5 s delay** where the real board would
+not, C58 staying charged. Recorded as a deviation; it only shows on reload.
+
+The power-on timer is implemented as a plain counter rather than an RC plus comparator. The
+crossing is deterministic, nothing else observes the node, and this is the one place in the
+design where the exponential shape has no consequence.
+
+**This resolves the open item under "Power-on thump".** That section predicted "the big one
+arrives with the LA4460 output stage". It does not: the mute is what the timer is *for*. Every
+coupling capacitor on the board charges behind an infinite attenuation and is long settled
+before pin 6 releases — 1.53 s is 2.9 tau of the slowest of them (C69, 0.53 s). ALARM's
+modelled +0.90 V thump is now inaudible for the same reason, which is the correct behaviour
+rather than a lost feature.
+
+### The input network — VR1 is a divider, not a scalar
+
+```
+IC28 -> C69 4.7uF -> R45 100K -> VR1 20K (top at R45, bottom to GND, wiper out)
+     -> C83 4.7uF -> LA4460 pin 2 (ri = 30 K typ, 21 K min)
+```
+
+At wiper fraction `k` the pot is a loaded divider, not a gain: `R_upper = (1−k)·20K` adds to
+R45 while `R_lower = k·20K` shunts, in parallel with `ri` through C83. At the chosen
+k = 0.100:
+
+```
+R_par = 2K || 30K = 1.875K
+divider = 1.875 / (100 + 18 + 1.875) = 0.015641
+C69 tau = 4.7u * (100K + 18K + 1.875K) = 0.5634 s   -> 0.282 Hz
+C83 tau = 4.7u * (R_src 1.844K + 30K)  = 0.1502 s   -> 1.059 Hz
+```
+
+Both corners are subsonic and neither removes any DC, because the house format already carries
+every channel as an AC quantity about the implicit 6 V rail — the caps reset *uncharged*, which
+in that format is simply zero. They are still real one-poles: the 0.282 Hz pole is the slowest
+in the whole design, so it is also the worst stall case, and it is what shapes ALARM's power-on
+thump on its way to the (muted) amp.
+
+### The amplifier
+
+51 dB fixed gain (spec 49/51/53), bridged outputs, on the board's 12 V rail. Two poles, both
+read off the datasheet's **f Response** graph, which plots exactly the component values this
+board fits:
+
+| | source | corner |
 |---|---|---|
-| 256 (×16) | — | scenario 10 already clipped; phase-2 value |
-| 128 (×8) | 32767, clipped hard | phase-5 value, before SHIP existed |
-| 96 (×6) | 32502 | under, by 0.07 dB, which is nothing |
-| **80 (×5)** | **27085 = −1.66 dBFS** | chosen |
+| low-pass | `Cx` = C84 0.01 µF (the graph's "0.01 µF" curve, against "C1 = 0" nearer 20 kHz) | **9 kHz** |
+| high-pass | `CNF` = C82/C81 47 µF (the graph's 47 µF curve, −3 dB ≈ 47 Hz, −9 dB at 20 Hz) | **47 Hz** |
 
-What this deliberately does **not** budget for: all six channels railed in the same sample
-and the same direction sums to about 10011 LSB at IC28 and would clip at anything above
-×3.3. EXP and REBOUND both pinned while HIT is also pinned is not a state the game
-produces, and designing for it would cost 4 dB across every normal sound.
+**These two are the roll-off this document has been pointing at since phase 1.** The note under
+"Anti-aliasing" says the board's square waves "are rolled off only by the LA4460 and the
+speaker"; the LA4460's half of that is now modelled and is datasheet-backed. The speaker's half
+is not, and will not be: there is no part number on the schematic and no measurement, and
+fitting a speaker response to a recording would break the standing rule that a recording does
+not override a primary source. ALARM and HIT will therefore still read brighter than a cabinet.
+
+Both corners are read off a printed log graph and are worth no better than ±20 %. **They are
+the output stage's only tuning knobs**, and 9 kHz is the one to move first — it is what decides
+how harsh the alarms sound.
+
+```
+fs = 47,998.875 Hz, all Q0.24
+A_C69_Q24 = 16776596   0.282 Hz     A_CNF_Q24 = 16674312   47.000 Hz
+A_C83_Q24 = 16774890   1.059 Hz     B_CX_Q24  = 11612258   9000.0 Hz (low-pass)
+```
+
+High-pass states are carried at 2^32 LSB/V in 48 bits, per "Numeric formats" — at 0.282 Hz the
+stall floor bites harder here than anywhere else in the design.
+
+### Clipping is now physical
+
+```
+AUDIO_L = AUDIO_R = saturate16( filtered * OUT_GAIN_Q16 >>> 16 )
+OUT_GAIN_Q16 = 338322 = 0.01564129 (VR1) * 354.813389 (51 dB) * 0.9302042 (scale) * 65536
+```
+
+The last factor maps 4096 LSB/V onto an int16 whose full scale **is the amplifier's clip
+point**, so the saturation in that line is the LA4460 running out of rail, not a format guard:
+
+```
+V_CLIP = 8.6 V differential
+   datasheet: 12 W into 4 ohm at Vcc = 13.2 V  ->  9.8 V peak  ->  3.4 V dropped in the device
+   the board runs it on 12 V                   ->  12 - 3.4    =  8.6 V
+```
+
+This is the same argument already made for the op-amp rails: a real clip in the right place is
+part of what the hardware sounds like, and modelling it away costs both the distortion and the
+level.
+
+`VR1`'s setting remains the one number in this document chosen by taste rather than by the
+schematic, and it is still isolated in a single constant — but it now has a physical meaning
+(fraction of pot rotation) and a physical consequence (turn it up and the amp clips, as it does
+on the board).
 
 `AUDIO_S = 1` (signed), `AUDIO_MIX = 0` (no MiSTer-side blending; the board is mono).
+
+### Phase 7 results
+
+Scenario 21 (the power-on mute, no settle, engine running underneath), 22 (`GAME ON` toggled
+with an alarm and a hit fired *while* muted). All 23 scenarios re-run.
+
+| | measured | design |
+|---|---|---|
+| mute release | sample **73,494** | 61,147,057 / 832 = 73,494.06 |
+| output before release | **bit-exact zero**, 73,494 samples | silent |
+| scenario 11, the power-on thump | peak **0** at the output, 3688 LSB (0.90 V) at `dbg_alarm_mix` | thump modelled, never heard |
+| `GAME ON` low | exactly 19,200 samples = 400.000 ms of zero | — |
+| channels behind the mute | alarm 4.26 V and hit 6.00 V reached while silent, hit reappears mid-tail | not a reset |
+
+**Scenario 11 is now the interesting one.** The power-on thump is still modelled, still 0.90 V,
+and still visible on the channel probe — and the output is zero for the whole capture. That is
+the correct hardware result and it is only checkable *because* the per-channel debug taps exist.
+A master-only instrument would have read "no thump" and been unable to tell a modelled-then-muted
+thump from a thump that was never built.
+
+**Levels.** No scenario clips. The pile-up, scenario 20, peaks at **27,616 = −1.49 dBFS**
+against the 8.6 V rail — near enough to the −1.66 dBFS the old `MASTER_VOL` was set to that the
+smoke test should sound the same loudness, which is deliberate. Nothing else exceeds 27,000.
+Per-channel MIX levels are unchanged to within 2 LSB, as they must be: phase 7 is downstream of
+every one of them.
+
+### The idle floor is 4 LSB, and it is not ours
+
+Idle output is not bit-exact zero: it dithers over roughly −5..+2 LSB, about −78 dBFS. This is
+**not** a filter stall and **not** new in phase 7 — it is the MC3340's finite attenuation.
+80 dB down is not infinity, so the noise-fed channels leak a little of the MM5837 forever, which
+is why every scenario's per-channel column reads `exp=10, fire=1` with nothing triggered. Through
+the mixer and the amp that becomes ±4 LSB.
+
+**Acceptance criterion 5 below ("silence is bit-exact zero") has therefore been stale since EXP
+landed in phase 3**, and phase 7 is what made it visible by adding a `first_nonzero` probe.
+The criterion should read: silence is the VCA leakage floor, ±4 LSB, and true zero only while
+the DC mute is asserted. Chasing the 10 LSB at `dbg_exp_mix` would be chasing the circuit.
 
 ---
 
@@ -1389,7 +1530,7 @@ python tools/analyze_audio.py sim/out/audio/scen0.wav ...
 | 2 | Burst lengths 144 ms (ALARM0-2) and 211 ms (ALARM3) within 1 % | **PASS** — 146 / 145 / 146 / 213 ms measured, less the 2 ms envelope window |
 | 3 | Retrigger extends to a full width from the retrigger instant | **PASS** — scenario 4 retriggers at 80 ms and ends at 224 ms = 80 + 144 |
 | 4 | Simultaneous alarms intermodulate, they do not sum | **PASS** — scenario 5 differs from `scen0 + scen2` by up to 18160 LSB; RMS 7288 vs 10687 for the linear sum |
-| 5 | Silence is bit-exact zero before the first alarm | **PASS** — scen0 has 387 leading zero samples against an onset at sample 384. Now measured *after* `settle()`, since the power-on thump is deliberately modelled; see "Power-on thump" |
+| 5 | Silence is bit-exact zero before the first alarm | **SUPERSEDED** — was PASS in phase 1 (387 leading zero samples against an onset at 384), but only because ALARM was then the only channel. Since phase 3 the floor is EXP's VCA leakage at ±4 LSB; since phase 7 true zero exists only under the DC mute. See "The idle floor is 4 LSB, and it is not ours" |
 
 ### Two findings from the first run, both now fixed
 

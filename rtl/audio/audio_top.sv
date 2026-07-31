@@ -2,9 +2,10 @@
 // every trigger, plus the shared data nibble and the two latch strobes.
 // See docs/audio-rtl-design.md.
 //
-// GAME ON global mute (ppi1_pb[7]) is deliberately NOT implemented in
-// phase 1 -- its muting path (which stage of the analog chain it actually
-// gates) has not been traced yet. Do not wire it up on a guess.
+// GAME ON (ppi1_pb[7]) IS now implemented, and the path it gates is traced:
+// it drives IC5, a 7417 open-collector buffer, whose output is the LA4460's
+// DC-mute pin 6. See mute_ctl.sv. The output stage is the real amplifier
+// (la4460.sv) rather than a scalar volume constant.
 module audio_top (
     input  logic               clk,
     input  logic               rst_n,
@@ -22,29 +23,10 @@ module audio_top (
     output logic signed [15:0] dbg_exp_mix,
     output logic signed [15:0] dbg_hit_mix,
     output logic signed [15:0] dbg_rebound_mix,
-    output logic signed [15:0] dbg_ship_mix
+    output logic signed [15:0] dbg_ship_mix,
+    // Mute state, for the bench. Synthesises away when unconnected.
+    output logic               dbg_dc_mute
 );
-
-    // VR1 master volume -- a real 20 K panel pot, so this is authentic
-    // hardware rather than a fudge, but its SETTING is the one number in the
-    // whole design chosen by taste. Now settled, all six channels being built.
-    //
-    // The calibration case is scenario 20, the actual gameplay pile-up: the
-    // engine held under alarms with a laser and hits over the top. SHIP is the
-    // only CONTINUOUS channel, so it -- not scenario 14 -- sets the ceiling.
-    // Measured mix_out peak there is 5417 LSB, so
-    //
-    //   256 (x16)  scenario 10 clipped                    (phase 2 value)
-    //   128 (x8)   scenario 20 clips hard at 32767        (phase 5 value)
-    //    96 (x6)   32502 -- under, but with 0.07 dB spare, which is nothing
-    //    80 (x5)   27085 = -1.66 dBFS                     <- chosen
-    //
-    // Note what is deliberately NOT budgeted for: all six channels railed in
-    // the same sample and the same direction sums to about 10011 at IC28 and
-    // would clip at any setting above x3.3. EXP and REBOUND both pinned while
-    // HIT is also pinned is not a state the game produces, and designing for
-    // it would cost 4 dB of level across every normal sound.
-    parameter int MASTER_VOL = 80;
 
     // ---------------------------------------------------------------
     // Sample-rate generator: clk_sys / 832 = 47,999.4 Hz
@@ -243,24 +225,50 @@ module audio_top (
     );
 
     // ---------------------------------------------------------------
-    // Output stage: VR1 master volume pot, MASTER_VOL is a placeholder
-    // (see docs/audio-rtl-design.md, "Output stage")
+    // Output stage: the real thing. IC28's output leaves the mixer through
+    // C69 / R45 / VR1 / C83 into IC27, an LA4460 BTL power amp with a fixed
+    // 51 dB of gain; its DC-mute pin 6 is wire-ORed between GAME ON (via the
+    // IC5 7417) and a power-on RC comparator. Both are modelled:
+    //
+    //   mute_ctl  ->  the pin 6 control node (mute_ctl.sv)
+    //   la4460    ->  C69/C83 high-passes, the amp's own 47 Hz and 9 kHz
+    //                 corners, the VR1 divider, 51 dB, and the 8.6 V clip
+    //
+    // What used to sit here was `MASTER_VOL`, a single scalar standing in for
+    // the whole of that. It is gone: VR1's setting now lives inside la4460.sv
+    // as the k = 0.100 term of OUT_GAIN_Q16, which is the only number that
+    // moves when the pot is recalibrated. Do not reintroduce a second volume
+    // constant at this level.
     // ---------------------------------------------------------------
-    wire signed [31:0] vol_prod = 32'(mix_out) * 32'(MASTER_VOL);
-    wire signed [31:0] vol_shifted = vol_prod >>> 4;
+    wire dc_mute;
 
-    wire signed [15:0] vol_sat =
-        (vol_shifted > 32'sd32767)  ? 16'sd32767  :
-        (vol_shifted < -32'sd32768) ? -16'sd32768 :
-        vol_shifted[15:0];
+    mute_ctl u_mute (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .game_on (ppi1_pb[7]),   // GAME ON, active high
+        .dc_mute (dc_mute)
+    );
+
+    assign dbg_dc_mute = dc_mute;
+
+    logic signed [15:0] amp_out;
+
+    la4460 u_amp (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .sample_ce (sample_ce),
+        .dc_mute   (dc_mute),
+        .mix_in    (mix_out),
+        .audio_out (amp_out)
+    );
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             audio_l <= 16'sd0;
             audio_r <= 16'sd0;
         end else begin
-            audio_l <= vol_sat;
-            audio_r <= vol_sat;
+            audio_l <= amp_out;
+            audio_r <= amp_out;
         end
     end
 

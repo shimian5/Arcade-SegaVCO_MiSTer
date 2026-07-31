@@ -24,6 +24,7 @@ static const int HITCLK_PA_BIT = 4;   // rising edge strobes IC2 (HIT DIS)
 static const int REBOUND_PB_BIT= 5;
 static const int SHIPON_PB_BIT = 6;   // active-HIGH level, not an edge
 static const int ACCCLK_PA_BIT = 5;   // rising edge strobes IC6 (ACC0-3)
+static const int GAMEON_PB_BIT = 7;   // active-HIGH level: 7417 O.C. -> LA4460 pin 6 (DC mute)
 
 struct Harness {
     Vaudio_top *dut;
@@ -31,8 +32,16 @@ struct Harness {
     uint8_t pa = 0xFF;
     // pb[6] = SHIP ON is active HIGH, so it must idle LOW or every scenario
     // would have the engine running underneath it.
+    // pb[7] = GAME ON is also active HIGH but idles HIGH: it is the board's
+    // global enable, and the game asserts it once at boot and leaves it there.
+    // Idling it low would mute every scenario.
     uint8_t pb = 0xFF & ~(1 << 6);
     std::vector<int16_t> samples;
+    // DC-mute tracking: how many captured samples were muted, and the sample
+    // index at which the mute first released (-1 = never released).
+    uint64_t muted_samples = 0;
+    long mute_release_idx = -1;
+    bool was_muted = false;
     // per-channel peaks, to separate an internally-saturating channel from
     // master-stage clipping
     int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0, pk_reb = 0, pk_ship = 0;
@@ -66,6 +75,13 @@ struct Harness {
         dut->clk = !dut->clk;
         dut->eval();
         if (dut->clk && dut->sample_ce && capture) {
+            // Record the mute state alongside the sample. A "release" is the
+            // first unmuted sample that follows a muted one, so a scenario that
+            // starts already unmuted reports -1 rather than a spurious 0.
+            bool m = dut->dbg_dc_mute != 0;
+            if (m) { muted_samples++; was_muted = true; }
+            else if (was_muted && mute_release_idx < 0)
+                mute_release_idx = (long)samples.size();
             samples.push_back((int16_t)dut->audio_l);
             auto absmax = [](int &acc, int16_t v) {
                 int a = v < 0 ? -(int)v : (int)v;
@@ -103,10 +119,14 @@ struct Harness {
     }
 
     // Run without recording, so the caller's timeline still starts at t=0.
-    // 600 ms is 11.5 of the ALARM high-pass's 52.17 ms tau, which is enough
-    // for the power-on thump to decay back to bit-exact zero and so preserve
-    // phase-1 acceptance criterion 5. (300 ms left a 22 LSB residual.)
-    void settle(double ms = 600.0) {
+    // The binding constraint is no longer the ALARM high-pass's 52.17 ms tau
+    // (600 ms covered that comfortably): it is the LA4460's DC mute. IC26
+    // holds pin 6 low through the 470K/4.7uF power-on delay, so nothing at all
+    // reaches the output for the first 1.5312 s. Settling for less than that
+    // would make every scenario record silence for its opening samples.
+    // 1700 ms clears the release with ~170 ms of margin, by which point the
+    // thump the mute was covering is long gone.
+    void settle(double ms = 1700.0) {
         capture = false;
         run_ms(ms);
         capture = true;
@@ -171,6 +191,14 @@ struct Harness {
     void ship_on(bool on) {
         if (on) pb |= (1 << SHIPON_PB_BIT);
         else    pb &= ~(1 << SHIPON_PB_BIT);
+        apply_ports();
+    }
+
+    // GAME ON is a level too: the CPU's global sound enable, which drives the
+    // LA4460's DC mute pin through a 7417 open-collector buffer. Low = muted.
+    void game_on(bool on) {
+        if (on) pb |= (1 << GAMEON_PB_BIT);
+        else    pb &= ~(1 << GAMEON_PB_BIT);
         apply_ports();
     }
 
@@ -240,15 +268,16 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-10>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-22>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
 
     Harness h;
     h.reset(100);
-    // Scenario 11 is the power-on thump itself, so it must NOT settle first.
-    if (scen != 11) h.settle();
+    // Scenarios 11 (the power-on thump) and 21 (the power-on mute that covers
+    // it) are both about t = 0 itself, so they must NOT settle first.
+    if (scen != 11 && scen != 21) h.settle();
 
     switch (scen) {
         case 0:
@@ -454,6 +483,40 @@ int main(int argc, char **argv) {
             // everything here is the analog tail settling.
             h.run_ms(400);
             break;
+        // ---- global mute (LA4460 pin 6) ----
+        case 21:
+            // The power-on mute, captured from the instant reset releases, so
+            // it must NOT settle. IC26 watches a 470K/4.7uF network and holds
+            // the DC mute pin low for the first 1.5312 s -- which is exactly
+            // what covers the power-on thump scenario 11 records. The engine is
+            // started at t = 0 and held so there is something loud underneath:
+            // the acceptance test is bit-exact zero out until the release at
+            // sample 73494 (61,147,057 clk_sys / 832), and the engine already
+            // running at full tilt the moment it lifts.
+            h.set_acc(6);
+            h.ship_on(true);
+            h.run_ms(2500);
+            break;
+        case 22:
+            // GAME ON toggling. The CPU's own mute, same pin as the power-on
+            // delay. The point is that muting is an OUTPUT-stage attenuation,
+            // not a reset: the channels keep running behind it. So an alarm and
+            // a hit are fired WHILE muted, and when GAME ON comes back the hit
+            // must reappear part-way through its 1.36 s tail rather than
+            // starting over -- and the engine must be at whatever phase it
+            // reached, not re-glided from idle.
+            h.set_acc(6);
+            h.ship_on(true);
+            h.set_hit_dis(7);
+            h.run_ms(400);
+            h.game_on(false);
+            h.run_ms(50);
+            h.pulse_alarm(0);
+            h.pulse_hit();
+            h.run_ms(400 - 52);
+            h.game_on(true);
+            h.run_ms(400);
+            break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
             return 1;
@@ -465,24 +528,31 @@ int main(int argc, char **argv) {
 
     int16_t peak = 0;
     uint64_t nonzero = 0;
-    for (int16_t s : h.samples) {
+    long first_nonzero = -1;
+    for (size_t i = 0; i < h.samples.size(); i++) {
+        int16_t s = h.samples[i];
         int16_t a = s < 0 ? (int16_t)(-s) : s;
         if (a > peak) peak = a;
-        if (s != 0) nonzero++;
+        if (s != 0) { nonzero++; if (first_nonzero < 0) first_nonzero = (long)i; }
     }
+    // For the mute scenarios this is the acceptance check: first_nonzero must
+    // not precede the mute release.
+    printf("scenario=%2d first_nonzero=%ld\n", scen, first_nonzero);
 
     // channel peaks in volts: 4096 LSB = 1 V. The board is a 12 V single
     // supply biased at 6 V, so anything much past +/-5.5 V at a channel's
     // MIX node is not physically reachable on hardware.
     printf("scenario=%2d samples=%6zu peak=%5d nonzero=%6llu | "
-           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV) reb=%5d (%.2fV) ship=%5d (%.2fV)\n",
+           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV) reb=%5d (%.2fV) ship=%5d (%.2fV) | "
+           "muted=%6llu release=%7ld\n",
            scen, h.samples.size(), (int)peak, (unsigned long long)nonzero,
            h.pk_alarm, h.pk_alarm / 4096.0,
            h.pk_fire,  h.pk_fire  / 4096.0,
            h.pk_exp,   h.pk_exp   / 4096.0,
            h.pk_hit,   h.pk_hit   / 4096.0,
            h.pk_reb,   h.pk_reb   / 4096.0,
-           h.pk_ship,  h.pk_ship  / 4096.0);
+           h.pk_ship,  h.pk_ship  / 4096.0,
+           (unsigned long long)h.muted_samples, h.mute_release_idx);
 
     return 0;
 }
