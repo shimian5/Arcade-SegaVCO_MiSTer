@@ -231,6 +231,26 @@ One-shot gate lengths are ~0.45*R*C: 144 ms for the three 6.8 uF sections, 211 m
 ALARM3's 10 uF. (An earlier revision of this document said "tau ~ 9 ms"; that was a
 decimal slip and is wrong by more than 10x.)
 
+### When the game uses ALARM
+
+**The end-of-level score count-up.** Each point tick fires an alarm pulse, which is why
+the lines are driven as a dense retrigger train rather than as discrete beeps.
+
+Confirmed by `tools/mame/dump_sound_triggers.lua`: **zero** alarm activity in 50 s of
+attract mode, then a burst during play driven from two code sites -- PC `4d09` writes
+ALARM0 and ALARM1, PC `4bc5` writes ALARM2. Retrigger interval was **50-100 ms**, well
+inside the 144 ms one-shot width, so the 74123s never time out mid-tally and the tone is
+continuous for as long as the score is rolling.
+
+Two consequences for the model, both load-bearing:
+
+1. The 74123s **must** be retriggerable. If they merely re-fired on timeout the tally
+   would stutter instead of sustaining.
+2. ALARM0/1/2 overlap during the tally, so the four open-collector NANDs are wire-ORing
+   several tones at once. Simultaneous alarms **intermodulate** -- the node is one bit,
+   so the tones multiply rather than sum. This is the normal case in gameplay, not an
+   edge case, which is why it is a phase-1 acceptance criterion.
+
 mix: R154 5.1K, C88 4.7uF -> IC29 -> R127 100K -> IC25 (R129 200K fb, ~2x)
      -> C74 2.2uF -> ALARM MIX
 ```
