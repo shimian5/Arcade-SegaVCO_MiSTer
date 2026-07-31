@@ -55,6 +55,32 @@ module audio_top (
         .node       (alarm_node)
     );
 
+    // ---------------------------------------------------------------
+    // NOISE (MM5837) and FIRE (laser). /FIRE is ppi1_pb[2].
+    // ---------------------------------------------------------------
+    logic signed [15:0] noise_a, noise_b;
+
+    noise_mm5837 u_noise (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sample_ce  (sample_ce),
+        .noise_a    (noise_a),
+        .noise_b    (noise_b)
+    );
+
+    wire fire_n = ppi1_pb[2];
+
+    logic signed [15:0] fire_mix;
+
+    fire_chan u_fire (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sample_ce  (sample_ce),
+        .fire_n     (fire_n),
+        .noise_a    (noise_a),
+        .fire_mix   (fire_mix)
+    );
+
     logic signed [15:0] mix_out;
 
     audio_mixer u_mixer (
@@ -63,7 +89,7 @@ module audio_top (
         .sample_ce   (sample_ce),
         .ship_mix    (16'sd0),
         .hit_mix     (16'sd0),
-        .fire_mix    (16'sd0),
+        .fire_mix    (fire_mix),
         .exp_mix     (16'sd0),
         .rebound_mix (16'sd0),
         .alarm_mix   (alarm_mix),
