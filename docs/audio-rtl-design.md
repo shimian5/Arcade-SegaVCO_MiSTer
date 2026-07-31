@@ -528,12 +528,24 @@ R90 and R96 are equal, so the control voltage is again exactly `(5 + Vc48)/2`, s
 the VCA control model ports over unchanged.
 
 > **OPEN — one unresolved value.** The 74123's timing resistor is drawn on sheet 2 with
-> **no reference designator and no value**. R90/R91/R93 all exist, and R92 appears nowhere
-> else, so it is R92 by elimination. The assembly drawing (page 20) is a scan with no
-> extractable text, so confirming it means a visual search. **47 K is assumed**, because
-> every other 74123 timing resistor on this board is 47 K (R2, R3, R14, R15, R7, R16, R17,
-> R47) and this one is drawn identically — with C42 = 4.7 µF that gives tw = 99.4 ms,
-> exactly EXP's crack. Flagged rather than presented as traced.
+> **no reference designator and no value**, and it is still unidentified.
+>
+> An earlier revision of this section claimed it was R92 "by elimination". **That was
+> wrong.** R92 is **4.7 Ω ½ W** — one of the two Zobel resistors on the LA4460 speaker
+> outputs (sheet 1: 0.033 µF + 4.7 R per output). A 4.7 Ω timing resistor would give
+> tw = 10 µs, which is absurd here.
+>
+> The assembly drawing (page 20) confirms it independently: the vertical bank beside IC13
+> reads R90 (1 M), R91 (470), an MA150 diode, R93 (4.7 K), R94 (4.7 K), R95 (2.7 K) —
+> **no R92 anywhere in it**. R97 also exists but sits next to IC21/C51/C52, in EXP's
+> rumble Sallen-Key, not here.
+>
+> **47 K is therefore an assumption, not a trace.** Its only support is symmetry: every
+> other 74123 timing resistor on this board is 47 K (R2, R3, R14, R15, R7, R16, R17, and
+> R47 — the latter being the *other section of this very package*, IC13 sec.2 for
+> REBOUND), and this one is drawn identically. With C42 = 4.7 µF that gives tw = 99.4 ms,
+> exactly EXP's crack width. If the real value differs, only the burst length changes —
+> the envelope shape and all levels are set by C48/R91/R90/R96 and are unaffected.
 
 ### Shaping filter — Sallen-Key, resonant
 

@@ -13,12 +13,17 @@
 //   IC28 inverting stage -> HIT MIX
 //
 // OPEN QUESTION: the 74123's timing resistor is drawn on sheet 2 with no
-// designator and no value. It is identified as R92 only by elimination
-// (it is the only unassigned timing resistor feeding this one-shot), and
-// 47K is ASSUMED -- not read off the schematic -- because every other
-// 74123 timing resistor on this board is 47K. If a bare board or BOM ever
-// turns up a different value for this position, WIDTH_CYCLES below must
-// be regenerated.
+// designator and no value, and remains unidentified. It is NOT R92 -- R92 is
+// 4.7 ohm 1/2 W, a Zobel resistor on the LA4460 speaker outputs, and the
+// assembly drawing (page 20) shows the bank beside IC13 as R90 1M, R91 470,
+// an MA150 diode, R93 4.7K, R94 4.7K, R95 2.7K, with no R92 in it at all.
+//
+// 47K is ASSUMED -- not read off the schematic. Its only support is symmetry:
+// every other 74123 timing resistor on this board is 47K, including R47 on
+// the OTHER SECTION OF THIS VERY PACKAGE (IC13 sec.2, REBOUND), and this one
+// is drawn identically. If a BOM or a bare board ever turns up a different
+// value, only WIDTH_CYCLES below changes -- the envelope shape and every
+// level in this channel are set by C48/R91/R90/R96 and are unaffected.
 module hit_chan (
     input  logic               clk,
     input  logic               rst_n,
@@ -45,7 +50,7 @@ module hit_chan (
 
     // ---------------------------------------------------------------
     // Stage 1: IC13 sec.1 74123 one-shot.
-    //   tw = 0.45 * R92(47K, ASSUMED -- see header) * C42(4.7uF) = 99.4ms
+    //   tw = 0.45 * Rtiming(47K, ASSUMED -- see header) * C42(4.7uF) = 99.4ms
     //     WIDTH_CYCLES = 0.0994 * 39,935,064 = 3,969,745.36 -> 3,969,745
     // ---------------------------------------------------------------
     logic q_hit;
