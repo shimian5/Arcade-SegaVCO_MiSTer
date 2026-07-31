@@ -21,6 +21,7 @@ static const int FIRE_PB_BIT   = 2;
 static const int EXP_PB_BIT    = 3;
 static const int HIT_PB_BIT    = 4;
 static const int HITCLK_PA_BIT = 4;   // rising edge strobes IC2 (HIT DIS)
+static const int REBOUND_PB_BIT= 5;
 
 struct Harness {
     Vaudio_top *dut;
@@ -30,7 +31,7 @@ struct Harness {
     std::vector<int16_t> samples;
     // per-channel peaks, to separate an internally-saturating channel from
     // master-stage clipping
-    int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0;
+    int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0, pk_reb = 0;
 
     Harness() {
         dut = new Vaudio_top;
@@ -70,6 +71,7 @@ struct Harness {
             absmax(pk_fire,  (int16_t)dut->dbg_fire_mix);
             absmax(pk_exp,   (int16_t)dut->dbg_exp_mix);
             absmax(pk_hit,   (int16_t)dut->dbg_hit_mix);
+            absmax(pk_reb,   (int16_t)dut->dbg_rebound_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -140,6 +142,13 @@ struct Harness {
         pb &= ~(1 << HIT_PB_BIT);
         run_ms(low_ms);
         pb |= (1 << HIT_PB_BIT);
+    }
+
+    // /REBOUND is port B bit 5.
+    void pulse_rebound(double low_ms = 1.0) {
+        pb &= ~(1 << REBOUND_PB_BIT);
+        run_ms(low_ms);
+        pb |= (1 << REBOUND_PB_BIT);
     }
 
     // HIT DIS0-2: drive the shared nibble on port A bits 0-2, then strobe
@@ -338,6 +347,26 @@ int main(int argc, char **argv) {
             }
             h.run_ms(1500);
             break;
+        // ---- REBOUND (phase 5) ----
+        case 15:
+            // one rebound. 3.5 s: C43 recharges through 800 K with
+            // tau = 1.76 s, and the 555 rate sweeps 24.6 -> 6.2 Hz and then
+            // stops as the control voltage reaches Vcc, so the whole decay
+            // must be visible.
+            h.run_ms(10);
+            h.pulse_rebound();
+            h.run_ms(3500 - 10);
+            break;
+        case 16:
+            // repeated rebounds -- the 74123 is retriggerable, so each should
+            // restart the sweep from the top rather than queueing.
+            h.run_ms(10);
+            for (int i = 0; i < 4; i++) {
+                h.pulse_rebound();
+                h.run_ms(700 - 1);
+            }
+            h.run_ms(2000);
+            break;
         // ---- power-on ----
         case 11:
             // The power-on thump, captured from the instant reset releases.
@@ -368,12 +397,13 @@ int main(int argc, char **argv) {
     // supply biased at 6 V, so anything much past +/-5.5 V at a channel's
     // MIX node is not physically reachable on hardware.
     printf("scenario=%2d samples=%6zu peak=%5d nonzero=%6llu | "
-           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV)\n",
+           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV) reb=%5d (%.2fV)\n",
            scen, h.samples.size(), (int)peak, (unsigned long long)nonzero,
            h.pk_alarm, h.pk_alarm / 4096.0,
            h.pk_fire,  h.pk_fire  / 4096.0,
            h.pk_exp,   h.pk_exp   / 4096.0,
-           h.pk_hit,   h.pk_hit   / 4096.0);
+           h.pk_hit,   h.pk_hit   / 4096.0,
+           h.pk_reb,   h.pk_reb   / 4096.0);
 
     return 0;
 }

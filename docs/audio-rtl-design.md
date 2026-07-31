@@ -759,6 +759,35 @@ output gain   -3.30      -> Q0.16 = -216269
 
 The recharge pole again needs Q0.24; in Q0.16 it is unrepresentable.
 
+### Phase 5 results
+
+Scenario 15 (one rebound, 3.5 s), 16 (four rebounds at 700 ms, testing retrigger).
+
+| | measured | design |
+|---|---|---|
+| bounce rate, early | 22.7 Hz | 24.6 Hz |
+| bounce rate, late | 16.7 Hz | — |
+| oscillator stops at | t = 0.98 s | — |
+| band-pass peak | 281 Hz | 320 Hz |
+| peak level, one rebound | 5.63 V | under the 6 V rail |
+| idle | 1 LSB | silent |
+
+**The channel stops before the 555 does, and that is correct.** The oscillator's own floor
+is 6.2 Hz, but Tr3's gate latches shut once the whole ramp sits above its 2.132 V
+threshold, which happens first. Deceleration and fade-out are the same mechanism, so the
+sound ends while the rate is still ~17 Hz. Scenario 15 has only 2/3 of its samples
+non-zero for exactly this reason.
+
+Retrigger (scenario 16) restarts the sweep rather than queueing, and touches the rail at
+24576 where two rebounds overlap.
+
+**A caveat on the band-pass measurement.** The 281 Hz peak and the apparent Q of 1.71 come
+from an analysis window that was Hann-windowed over 4096 samples but only summed over the
+first 512, so the figures are smeared and good to no better than ~15 %. The *shape* — a
+clear single-peaked band-pass rolling off on both sides, −3 dB somewhere around
+200–360 Hz — is unambiguous and matches the design. Re-measure properly before treating
+281 Hz as a discrepancy worth chasing.
+
 ## Op-amp output rails — a real clipping mechanism
 
 Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its

@@ -1,5 +1,5 @@
-// Discrete audio top level. ALARM, FIRE, EXP and HIT are built; SHIP and
-// REBOUND are still tied to zero (see docs/audio-rtl-design.md, "why the
+// Discrete audio top level. ALARM, FIRE, EXP, HIT and REBOUND are
+// built; only SHIP is still tied to zero (see docs/audio-rtl-design.md, "why the
 // mixer is built whole"). PPI1 port A/B carry every trigger, plus the
 // shared data nibble and the two latch strobes.
 //
@@ -21,7 +21,8 @@ module audio_top (
     output logic signed [15:0] dbg_alarm_mix,
     output logic signed [15:0] dbg_fire_mix,
     output logic signed [15:0] dbg_exp_mix,
-    output logic signed [15:0] dbg_hit_mix
+    output logic signed [15:0] dbg_hit_mix,
+    output logic signed [15:0] dbg_rebound_mix
 );
 
     // VR1 master volume. Still a placeholder to be settled once all six
@@ -150,10 +151,27 @@ module audio_top (
         .hit_mix    (hit_mix)
     );
 
+    // ---------------------------------------------------------------
+    // REBOUND. /REBOUND is ppi1_pb[5].
+    // ---------------------------------------------------------------
+    wire rebound_n = ppi1_pb[5];
+
+    logic signed [15:0] rebound_mix;
+
+    rebound_chan u_rebound (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .sample_ce   (sample_ce),
+        .rebound_n   (rebound_n),
+        .noise_a     (noise_a),
+        .rebound_mix (rebound_mix)
+    );
+
     assign dbg_alarm_mix = alarm_mix;
     assign dbg_fire_mix  = fire_mix;
     assign dbg_exp_mix   = exp_mix;
     assign dbg_hit_mix   = hit_mix;
+    assign dbg_rebound_mix = rebound_mix;
 
     logic signed [15:0] mix_out;
 
@@ -165,7 +183,7 @@ module audio_top (
         .hit_mix     (hit_mix),
         .fire_mix    (fire_mix),
         .exp_mix     (exp_mix),
-        .rebound_mix (16'sd0),
+        .rebound_mix (rebound_mix),
         .alarm_mix   (alarm_mix),
         .mix_out     (mix_out)
     );
