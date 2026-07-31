@@ -788,6 +788,75 @@ clear single-peaked band-pass rolling off on both sides, −3 dB somewhere aroun
 200–360 Hz — is unambiguous and matches the design. Re-measure properly before treating
 281 Hz as a discrepancy worth chasing.
 
+## Phase 6 — SHIP (sheet 1) — **FRONT END TRACED, CHAIN STILL OPEN**
+
+`SHIP ON` is `ppi1_pb[6]` (a level, not an edge). ACC0-3 is latched on-board by IC6
+(4175B) from the shared port-A nibble on the **rising edge of port A bit 5** — the twin of
+the IC2/bit-4 strobe that HIT uses.
+
+### The 555 (IC14) — two corrections
+
+```
+pin R (reset) tied to 12 V;  C88 0.01 uF on CTRL;  C12 1 uF on TH/TR
+R24 6.8K from 12 V to DIS;  R23 200K and D1 in PARALLEL between DIS and TH/TR
+```
+
+**D1's anode is at DIS and its cathode at TH/TR** — confirmed visually at high
+magnification. That puts D1 in the **charge** path, where it shorts out R23; during
+discharge it is reverse-biased and the cap drains through R23 alone.
+`hardware-audio.md` records this as "R23 200K + D1 discharge", which has D1 in the wrong
+phase.
+
+```
+t_high = 0.693 * R24 6.8K  * C12 = 4.712 ms    T_HIGH =   188,190 clk_sys
+t_low  = 0.693 * R23 200K  * C12 = 138.600 ms  T_LOW  = 5,535,000 clk_sys
+period = 143.31 ms -> 6.978 Hz, duty 3.29 %
+```
+
+**So this is a ~7 Hz sawtooth, not a tone** — sub-audio, exactly like REBOUND's 555. The
+extreme asymmetry (fast rise, slow fall) is the whole point; it is what makes the engine a
+lumpy putt rather than a hum.
+
+As in REBOUND, **the 555's output pin 3 is unused**: IC17 (pins 2/3/1) is a unity follower
+sitting on the **C12 node**, so the signal is the capacitor ramp itself.
+
+### ACC0-3 is a DC level ladder, not an audio path
+
+**The four 4066 inputs are tied to +12 V**, not to any "MY SHIP" signal — that label names
+the block on the sheet. Each enabled switch puts its resistor from 12 V onto a common node
+loaded by R22 10 K to ground and smoothed by C11 33 µF. Parallel conductance, not a binary
+DAC.
+
+| ACC bits | R_sel | node V | glide tau |
+|---|---|---|---|
+| 0000 | ∞ | 0.000 | 330.0 ms |
+| ACC0 | 82 K | 1.304 | 294.1 ms |
+| ACC1 | 30 K | 3.000 | 247.5 ms |
+| ACC2 | 16 K | 4.615 | 203.1 ms |
+| ACC3 | 2 K | 10.000 | 55.0 ms |
+| ACC1+2 | 10.4 K | 5.872 | 168.5 ms |
+| ACC0+1+2 | 9.26 K | 6.232 | 158.6 ms |
+| all four | 1.65 K | 10.305 | 46.6 ms |
+
+**ACC3 dominates** — its 2 K swamps the other three, so the ladder is strongly weighted
+toward the top step. The C11/R22 time constant means every ACC change *glides* over
+50–330 ms rather than stepping, and the glide is faster at high throttle. That glide is
+directly visible in the cabinet recording, whose drone steps between roughly −27 dB and
+−37 dB.
+
+Full 16-entry table with Q0.24 pole codes is in the commit that added this section.
+
+> **STILL OPEN — the Tr2/Tr4/Tr5 chain.** Between the two buffered sources (the 7 Hz ramp
+> from IC17 and the ACC level from IC22) and the MB4391 VCA sits a three-transistor
+> envelope-follower/filter chain across IC17/IC22/IC26: R50/R51 (unity-inverting), R59
+> 150K, R60 51K, R61 51K, R58 68K, C22 0.01 µF, Tr2 with D10/R55 2.2K/R57 10K/R48 51K/R49
+> 100K; then R112 100K, R113 51K, R114 51K, D4, R52 2.2K, R53 51K around Tr4; then C66
+> 0.033 µF, R116 150K, R117 51K, R121 51K, R111 56K, R108 51K, R110 2.2K, D11, R122 10K
+> around Tr5; then C65 2.2 µF, R118 220 K, C64 0.0022 µF. Output: IC24 MB4391 (C68 680 pF
+> on RO) → C10 2.2 µF → IC10 4066 → R124 100 K / R125 220 K → IC28 → C70 2.2 µF → SHIP MIX.
+> None of that is traced yet. Do not write RTL for it from the summary — every channel so
+> far has had errors there.
+
 ## Op-amp output rails — a real clipping mechanism
 
 Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its
