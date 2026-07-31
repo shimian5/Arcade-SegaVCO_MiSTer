@@ -659,6 +659,106 @@ mean the master stage must be set so it does not clip them a second time. Scenar
 (HIT + ALARM) peaks at 32520 against a 32767 ceiling, which is uncomfortably tight, and
 SHIP and REBOUND are not built yet. Revisit once all six exist.
 
+## Phase 5 — REBOUND (sheet 2)
+
+Re-traced at high magnification. `/REBOUND` is `ppi1_pb[5]`. Three things here contradict
+the summary in `hardware-audio.md`, all confirmed visually.
+
+### 1. The 555's output pin is not connected
+
+`IC15(B)` runs as an astable (R65 10 K = Ra, R64 33 K = Rb, C31 1 µF), but **pin 3 goes
+nowhere**. IC12 sec.2 (pins 13/12/14) is a unity follower whose `+` input sits on the
+**C31 timing-capacitor node**. REBOUND therefore uses the 555's *exponential ramp*, not
+its square wave.
+
+### 2. It is sub-audio — a bounce rate, not a tone
+
+The envelope drives the 555's **pin 5 control-voltage** input, so the oscillator sweeps:
+
+| CV | period | rate |
+|---|---|---|
+| 2.53 V (envelope open) | 40.7 ms | **24.6 Hz** |
+| 3.50 V | 56.1 ms | 17.8 Hz |
+| 4.50 V | 96.2 ms | 10.4 Hz |
+| 4.90 V | 162 ms | 6.2 Hz |
+| → 5.0 V | ∞ | stops |
+
+`t_low = ln2·Rb·C = 22.87 ms` is constant; only the charge phase stretches. None of this is
+a pitch — it is the rate at which the channel is *gated*.
+
+### 3. NOISE·A feeds it, and the filter is a BAND-PASS, not FIRE's low-pass
+
+`hardware-audio.md` omits noise from REBOUND entirely. In fact **NOISE·A → C41 4.7 µF →
+R39 10 K** runs the full width of the sheet into node **M**, the midpoint of C51/C40
+(0.022 µF each) which sit in series across R38 51 K, IC12's feedback. Tr3 + R40 100 Ω
+shunt that same node M.
+
+This *looks* like FIRE's Tr1/R31/C32/C33/R35 trick but is not, and the difference matters:
+
+* **FIRE** injects noise at the inverting input through R33, and Tr1 shunts the cap
+  midpoint → a **switchable low-pass**.
+* **REBOUND** injects noise **at the midpoint itself**, the same node Tr3 shunts.
+
+Solving that network:
+
+```
+Vo/Vin = -s*C51*R38 / [1 + s*R39*(C51+C40) + s^2*R39*R38*C40*C51]
+
+f0   = 1/(2*pi*sqrt(R39*R38*C40*C51)) = 320.3 Hz
+Q    = 1/(w0*R39*(C51+C40))           = 1.129
+peak gain                              = 2.550   (inverting)
+```
+
+A resonant band-pass. Tr3 does not retune it — it **gates** it: saturated, M is pulled to
+ground through R40 100 Ω, which against R39 10 K is **−40.1 dB**.
+
+### Envelope, gate and output
+
+```
+/REBOUND -> IC13 sec.2 (R47 47K / C44 1uF) -> tw = 21.15 ms -> WIDTH_CYCLES = 844627
+         Q-bar (pin 12), pulled up by R46 4.7K
+      -> D2 (cathode toward IC13, as D3/D6/D7) -> R44 470 -> C43 2.2uF
+      -> R43 330K -> node -> R42 470K to 5 V -> IC12 sec.1 unity buffer
+```
+
+| | gated | idle |
+|---|---|---|
+| C43 2.2 µF | R44 470, tau = **1.034 ms** | R43+R42 = 800 K, tau = **1.76 s** |
+
+**The divider is unequal here** — 330 K / 470 K, not the matched pairs EXP and HIT use — so
+the control is *not* `(5+Vc)/2`:
+
+```
+V = (Vc*470K + 5*330K)/800K = 0.5875*Vc + 2.0625     spans 2.5325 V -> 5.0 V
+```
+
+That one node drives **both** the 555's pin 5 **and** IC18's VCA control, so rate and
+level fall together.
+
+Tr3's base sees the ramp through R37 12 K / R36 4.7 K = 0.28144, so it conducts above
+**2.132 V** of ramp. Early on (CV ≈ 2.53, ramp 1.27–2.53 V) it crosses only near the peak,
+so the gate is briefly closed each cycle; as CV rises past ~4.3 V the whole ramp sits above
+threshold and the channel is held muted. Fade-out and slow-down are the same mechanism.
+
+```
+IC12 out -> C45 2.2uF -> R82 3.3K -> R83 10K to gnd  (divider 0.75188 -- note this is the
+                                                      INVERSE of EXP/HIT's 0.248/0.233)
+         -> C24 2.2uF -> IC18 MB4391 pin 5, control pin 6, C21 680 pF on RO
+IC18 pin 11 -> C20 2.2uF -> R62 100K -> IC22 (R128 330K fb, + at 6 V) = -3.30
+            -> C75 2.2uF -> REBOUND MIX
+```
+
+Fixed-point constants at fs = 47998.875:
+
+```
+discharge  a = 0.980052866  Q0.16 = 64229,  B = 1307   realised tau 1.0342 ms  (+0.020%)
+recharge   a = 0.999988163  Q0.24 = 16777017, B = 199  realised tau 1.7564 s   (-0.202%)
+output divider 0.751880 -> Q0.16 = 49275
+output gain   -3.30      -> Q0.16 = -216269
+```
+
+The recharge pole again needs Q0.24; in Q0.16 it is unrepresentable.
+
 ## Op-amp output rails — a real clipping mechanism
 
 Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its
