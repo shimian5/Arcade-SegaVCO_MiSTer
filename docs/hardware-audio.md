@@ -46,10 +46,34 @@ Everything else is buffered straight through:
 These names match MAME's `turbo_a.cpp` handlers 1:1, which is good evidence the driver's
 latch decode was taken directly off this schematic.
 
+### Connector pinout (RESOLVED — sheet 1, IC1/IC2/IC6 wiring traced)
+
+The 20-pin flat cable `FAP-20-07`. IC1 (7417) buffers connector pins 1-6; its six outputs
+split into a shared 4-bit **data nibble** and **two independent latch clocks**:
+
+| Conn pin | IC1 in → out | Destination |
+|---|---|---|
+| 1 | 1 → 2 | D0 — IC2 `D0` **and** IC6 `D0` |
+| 2 | 13 → 12 | D1 — IC2 `D1` **and** IC6 `D1` |
+| 3 | 3 → 4 | D2 — IC2 `D2` **and** IC6 `D2` |
+| 4 | 11 → 10 | D3 — IC6 `D3` only (IC2's D3 is unused) |
+| 5 | 5 → 6 | **IC2 `CK` (pin 9)** — latches `HIT DIS0-2` |
+| 6 | 9 → 8 | **IC6 `CK` (pin 9)** — latches `ACC0-3` |
+| 7-10 | (direct) | `/ALARM0` … `/ALARM3` |
+| 11 | (direct) | `/FIRE` |
+| 12, 13, 14 | (direct) | `/EXP`, `/HIT`, `/REBOUND` |
+| 15, 16 | IC5 (7417) | `SHIP ON`, `GAME ON` |
+| 17-20 | — | to the power/ground block, bottom left |
+
+Both latches are **4175B quad D** parts sharing one nibble; IC2 simply ignores D3. So the
+CPU writes a 4-bit value and then strobes whichever latch it means. This matches
+`turbo_a.cpp` exactly.
+
 ### CPU-side latch bits (from `turbo_a.cpp`, PPI1 at `d000-d003`)
 
-**Port A** — bits 0-2 hit distance; bit 4 rising edge strobes hit volume; bit 5 rising
-edge strobes `ACC0-3`; bit 6 `/ALARM0` (falling edge); bit 7 `/ALARM1` (falling edge).
+**Port A** — bits 0-3 are the shared data nibble (`HIT DIS` uses only bits 0-2, `ACC` uses
+all four); bit 4 rising edge strobes hit volume; bit 5 rising edge strobes `ACC0-3`; bit 6
+`/ALARM0` (falling edge); bit 7 `/ALARM1` (falling edge).
 
 **Port B** — bit 0 `/ALARM2`; bit 1 `/ALARM3`; bit 2 `/FIRE`; bit 3 `/EXP`; bit 4 `/HIT`;
 bit 5 `/REBOUND` (all falling edge); bit 6 `SHIP` (level, engine on/off); bit 7 `GAME ON`
@@ -182,16 +206,28 @@ Fully digital up to the mix, so it ports almost literally:
 ```
 IC15A 555 astable: R29 470R (Ra), R30 270R (Rb), C15 0.01uF, C17 0.01uF on CTRL
     f = 1.44 / ((Ra + 2*Rb) * C) = 1.44 / (1010 * 1e-8) ~ 142.6 kHz
-  -> R66 1K -> IC16 74LS393 pin 1 (1A)
-  -> ripple divider, taps QB (pin 4), QC (pin 5), QD (pin 6); 2A (pin 13) tied to 1QD
+  -> R66 1K pull-up -> IC16 74LS393 pin 1 (1A)
+  -> IC16 pin 2 (1CLR) and pin 12 (2CLR) are tied together and GROUNDED (free-running)
+  -> 2A (pin 13) is tied to 1QD (pin 6), so the two halves cascade into one 8-stage ripple
   -> IC11 74LS38 open-collector NAND x4: each ANDs one tap with one alarm enable,
      all four wire-OR'd onto a node pulled up by R153 1K
 
-alarm enables, one 74123 section each:
-    ALARM0  IC3 pin 1  -> Q13   R2  47K / C1 6.8uF   (tau ~ 9 ms)
-    ALARM1  IC3 pin 9  -> Q5    R3  47K / C2 6.8uF   (tau ~ 9 ms)
-    ALARM2  IC7 pin 1  -> Q13   R14 47K / C5 6.8uF   (tau ~ 9 ms)
-    ALARM3  IC7 pin 9  -> Q5    R15 47K / C6 10uF    (tau ~ 13 ms, deliberately longer)
+RESOLVED tap -> gate -> alarm mapping (sheet 3; the four one-shot lines do not cross):
+
+| Alarm | 74123 | one-shot R/C | IC11 gate (in,in -> out) | IC16 tap | divide | tone |
+|---|---|---|---|---|---|---|
+| ALARM0 | IC3 pin 1  -> Q13 | R2 47K / C1 6.8uF  | 1,2 -> 3   | pin 11 = 2QA | /32 | 4.46 kHz |
+| ALARM1 | IC3 pin 9  -> Q5  | R3 47K / C2 6.8uF  | 12,13 -> 11 | pin 6 = 1QD  | /16 | 8.91 kHz |
+| ALARM2 | IC7 pin 1  -> Q13 | R14 47K / C5 6.8uF | 4,5 -> 6   | pin 5 = 1QC  | /8  | 17.8 kHz |
+| ALARM3 | IC7 pin 9  -> Q5  | R15 47K / C6 10uF  | 9,10 -> 8  | pin 4 = 1QB  | /4  | 35.6 kHz |
+
+One-shot gate lengths are ~0.45*R*C: 144 ms for the three 6.8 uF sections, 211 ms for
+ALARM3's 10 uF. (An earlier revision of this document said "tau ~ 9 ms"; that was a
+decimal slip and is wrong by more than 10x.)
+
+**Two of these tones are ultrasonic and ALARM3 is beyond hearing entirely** — see the
+open-questions section. Every element above is confirmed against both the schematic and
+the assembly drawing; the arithmetic is what looks wrong, not the reading.
 
 mix: R154 5.1K, C88 4.7uF -> IC29 -> R127 100K -> IC25 (R129 200K fb, ~2x)
      -> C74 2.2uF -> ALARM MIX
@@ -201,16 +237,34 @@ mix: R154 5.1K, C88 4.7uF -> IC29 -> R127 100K -> IC25 (R129 200K fb, ~2x)
 
 ## Master mixer and output (sheet 1)
 
-Six weighted inputs into IC28's inverting summing amp, feedback **R126 = 100 K**:
+**This is not a virtual-ground summing amp.** R138 (200 K) sits *in series* between the
+common mix node and IC28 pin 13 — resolved by tracing sheet 1 zone A6. The six channel
+resistors therefore meet at a **passive** node that is **not** held at AC ground, and
+IC28 (feedback R126 = 100 K, non-inverting input tied to the 6 V rail) is a following
+gain stage of −R126/R138 = **−0.5**.
 
-| Channel | Summing R | Gain (R126/Rch) |
-|---|---|---|
-| **HIT MIX** | **R136 = 5.1 K** | **≈ 19.6× — about 2× everything else** |
-| SHIP MIX | R137 = 10 K | 10× |
-| FIRE MIX | R131 = 10 K | 10× |
-| EXP MIX | R133 = 10 K | 10× |
-| REBOUND MIX | R130 = 10 K | 10× |
-| ALARM MIX | R132 = 10 K | 10× |
+```
+Vnode = (SUM Vch/Rch) / (SUM 1/Rch + 1/R138)
+Vout  = -(R126/R138) * Vnode = -0.5 * Vnode
+```
+
+With SUM 1/Rch = 5x(1/10K) + 1/5.1K = 6.961e-4 and 1/R138 = 5e-6, denominator = 7.011e-4:
+
+| Channel | Summing R | Node share | Effective gain to IC28 out |
+|---|---|---|---|
+| **HIT MIX** | **R136 = 5.1 K** | 0.280 | **−0.140 — 1.96× everything else** |
+| SHIP MIX | R137 = 10 K | 0.143 | −0.0713 |
+| FIRE MIX | R131 = 10 K | 0.143 | −0.0713 |
+| EXP MIX | R133 = 10 K | 0.143 | −0.0713 |
+| REBOUND MIX | R130 = 10 K | 0.143 | −0.0713 |
+| ALARM MIX | R132 = 10 K | 0.143 | −0.0713 |
+
+The *relative* weighting an earlier revision recorded (HIT ≈ 2×, everything else equal)
+survives, but the absolute figures there (10×, 19.6×) were computed as if R138 did not
+exist and are wrong by a factor of ~140. Because the node is passive, the channels also
+**load each other**: a channel's gain depends on the source impedance of all five others,
+so the outputs feeding this node must be modelled as low-impedance drivers or the
+weighting will drift.
 
 Output stage:
 
@@ -262,16 +316,34 @@ assembly drawing wins:
   prose section calls it.
 - Transistors are **2SC458**; diodes are **MA150**.
 
-**Still to resolve** (re-render the region at `--scale 800` when the block is being built):
+**Previously open, now CLOSED** (all three traced at high magnification, 2026-07-30):
 
-1. **Connector pin → signal-name mapping**, sheet 1 zone D8. Pin numbers were not
-   readable across a tile seam. Not blocking — every signal name and destination is
-   known, and the CPU-side bit assignments come from `turbo_a.cpp`.
-2. **74393 tap wiring**, sheet 3. The second counter section's cascade beyond
-   `2A ← 1QD` is ambiguous, so the four alarm tone frequencies are not yet derivable.
-   Must be resolved before the ALARM channel can be finished.
-3. **R138 (200 K)** at the master summing junction, sheet 1 zone A6 — series element
-   into IC28's inverting input, or a second bias source? Affects overall mix calibration.
+1. ~~Connector pin → signal-name mapping~~ — resolved; see the pinout table above.
+2. ~~74393 tap wiring~~ — resolved; `1CLR`/`2CLR` grounded, `2A ← 1QD`, taps are
+   `1QB`/`1QC`/`1QD`/`2QA`. Full tap→alarm mapping table above.
+3. ~~R138~~ — resolved; it is a **series** element, and the mixer is passive-summing
+   followed by a −0.5 gain stage, not a virtual-ground summer. See above.
+
+**NEW — open, and blocking the ALARM channel:**
+
+4. **The alarm tone frequencies come out implausibly high.** Every input to the
+   calculation is confirmed twice over — R29 = 470 Ω and R30 = 270 Ω appear on both the
+   schematic and the assembly drawing, C15 = 0.01 µF is legible on the schematic and is
+   drawn non-polarised, and the divider taps are unambiguous. Yet the result is a
+   142.6 kHz clock giving tones of 4.46 k / 8.91 k / **17.8 k** / **35.6 kHz**. ALARM2 is
+   at the edge of adult hearing and ALARM3 is inaudible outright, which cannot be what a
+   1982 arcade cabinet shipped.
+
+   If instead C15 were 0.1 µF (or R29/R30 were 4.7 K/2.7 K), the clock would be 14.26 kHz
+   and the four tones would be **3565 / 1782 / 891 / 446 Hz** — a textbook alarm set.
+   That is a suspiciously good fit, but it is a *guess*, and nothing on either drawing
+   supports it. Note the assembly drawing does show a 0.1 µF part next to IC15, but it is
+   labelled C19 and drawn as a polarised tantalum, so it is not C15.
+
+   **Resolution path:** measure the real board, or compare against MAME's `buckrog`
+   alarm WAV samples in the samples folder — an FFT of those will state the intended
+   pitches directly and settle it without hardware. Do not build the ALARM channel until
+   this is decided; the tap wiring is certain, only the clock rate is not.
 
 ---
 
