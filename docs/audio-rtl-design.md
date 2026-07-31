@@ -846,16 +846,44 @@ directly visible in the cabinet recording, whose drone steps between roughly −
 
 Full 16-entry table with Q0.24 pole codes is in the commit that added this section.
 
-> **STILL OPEN — the Tr2/Tr4/Tr5 chain.** Between the two buffered sources (the 7 Hz ramp
-> from IC17 and the ACC level from IC22) and the MB4391 VCA sits a three-transistor
-> envelope-follower/filter chain across IC17/IC22/IC26: R50/R51 (unity-inverting), R59
-> 150K, R60 51K, R61 51K, R58 68K, C22 0.01 µF, Tr2 with D10/R55 2.2K/R57 10K/R48 51K/R49
-> 100K; then R112 100K, R113 51K, R114 51K, D4, R52 2.2K, R53 51K around Tr4; then C66
-> 0.033 µF, R116 150K, R117 51K, R121 51K, R111 56K, R108 51K, R110 2.2K, D11, R122 10K
-> around Tr5; then C65 2.2 µF, R118 220 K, C64 0.0022 µF. Output: IC24 MB4391 (C68 680 pF
-> on RO) → C10 2.2 µF → IC10 4066 → R124 100 K / R125 220 K → IC28 → C70 2.2 µF → SHIP MIX.
-> None of that is traced yet. Do not write RTL for it from the summary — every channel so
-> far has had errors there.
+### SHIP is a VCO, not an envelope follower — the Tr2 loop
+
+`hardware-audio.md` describes the middle of this channel as an "envelope-follower + 2-pole
+filter chain". **It is not.** Traced at magnification, the first two IC17 stages after the
+input buffer form a **relaxation oscillator**:
+
+```
+IC17 (6-, 5+, 7)   C22 0.01uF is its ONLY feedback element -> pure INTEGRATOR
+                   input  R59 150K from the previous stage (pin 8)
+                   + input at R60 51K / R61 51K = half of pin 8
+                   summing node also pulled down by R58 68K -> Tr2 collector
+IC17 (13-, 12+, 14) R49 100K from OUTPUT back to the + input, R48 51K to 6 V
+                   -> POSITIVE feedback = SCHMITT TRIGGER
+                   - input driven directly from pin 7
+   pin 14 -> D10 -> R57 10K -> Tr2 base (R55 2.2K to ground), Tr2 emitter grounded
+```
+
+Integrator → Schmitt → D10/R57 → Tr2 → back into the integrator's summing node is a
+textbook relaxation oscillator. Its frequency is set by the current into the integrator,
+which comes from R59 150 K driven by the buffered/inverted 555 ramp.
+
+**So the audible engine pitch is this VCO, and the 555 is a ~7 Hz LFO modulating it.** The
+555's sawtooth is what makes the engine lumpy — a pitch wobble at 7 Hz, not a 7 Hz tone.
+The ACC ladder sets the DC operating point and therefore the centre pitch: throttle up,
+pitch up. That is exactly what an analog engine sound is built from, and it explains why
+the cabinet recording's drone changes character and not just level between ACC steps.
+
+This also means **no part of SHIP is a filter of the noise source** — SHIP does not use
+NOISE at all. It is entirely self-oscillating.
+
+> **STILL OPEN — Tr4 and Tr5.** Two further transistor stages sit between this oscillator
+> and the VCA and are not yet traced: Tr4 with R112 100K, R113 51K, R114 51K, D4, R52
+> 2.2K, R53 51K, R54 100K, R63 10K, C57 33uF; and Tr5 with C66 0.033uF, R116 150K, R117
+> 51K, R121 51K, R111 56K, R108 51K, R110 2.2K, D11, R122 10K, R109 100K. Given the Tr2
+> stage turned out to be an oscillator rather than the follower the summary claimed, treat
+> the summary's description of these two as unreliable and re-trace both. Then C65 2.2uF,
+> R118 220K, C64 0.0022uF; IC24 MB4391 (C68 680pF on RO) -> C10 2.2uF -> IC10 4066 ->
+> R124 100K / R125 220K -> IC28 -> C70 2.2uF -> SHIP MIX.
 
 ## Op-amp output rails — a real clipping mechanism
 
