@@ -609,7 +609,7 @@ Modelling it as a plain gain would throw away most of what the circuit does.
 Note HIT also has the hottest path into the master mixer: R136 is 5.1 K against everyone
 else's 10 K, giving it 1.96× the weight (see the mixer table).
 
-### Phase 4 results — and a cross-channel level problem worth resolving
+### Phase 4 results, and the cross-channel level question — RESOLVED
 
 Scenario 12 (one hit, DIS = 7), 13 (the DIS sweep), 14 (hits under ALARM0). Measured at
 `dbg_hit_mix`:
@@ -621,44 +621,43 @@ Scenario 12 (one hit, DIS = 7), 13 (the DIS sweep), 14 (hits under ALARM0). Meas
 | 2 (DIS1) | −5.6 dB | 2459 Hz |
 | 1 (DIS0) | −12.9 dB | 1935 Hz |
 
-Level and brightness both fall monotonically as DIS decreases, which is the acceptance
-test for the distance cue. It passes.
+Level and brightness both fall monotonically as DIS decreases — the acceptance test for the
+distance cue. It passes.
 
-**But HIT pins the −6.00 V rail at every DIS setting** — the peak is an identical 27496 in
-all seven, i.e. the rail, not the signal. Working the chain at full envelope:
+HIT pins the −6.00 V rail at every DIS setting, and EXP does the same, while FIRE sits
+1.53 V, about 3× under. That looked like a systematic error shared by the three VCA
+channels. **It is not.**
 
-```
-noise_b 5895 LSB -> Sallen-Key (ENBW ~10.1 kHz, G 2.5) ~9550 RMS
-  x 0.2326 atten  x 4.466 VCA  x 0.886 DIS  x 6.8 output  =  ~59,800 LSB = 14.6 V RMS
-```
+**`NOISE_VPP` cannot be the cause, by construction.** FIRE, EXP and HIT are all *linear*
+in it, so changing it moves all three together and cannot alter their ratio. Confirmed by
+measurement at 7.0 V pp, the datasheet floor and 26 % below our 9.5 V:
 
-against a rail of 6 V. That is **~3× over**, so the channel is clipped essentially flat.
-
-This is now a cross-channel pattern rather than a HIT quirk, and it is exactly the
-comparison the FIRE section said to wait for:
-
-| channel | peak at its MIX node | vs rails |
+| | 9.5 V | 7.0 V |
 |---|---|---|
-| ALARM | 4.26 V | under |
-| FIRE | 1.53 V | 3× under |
-| EXP | 6.00 V | clipped |
-| HIT | 6.00 V | clipped, ~3× over |
+| FIRE | 1.53 V | 1.01 V |
+| EXP | 6.00 V (railed) | 6.00 V (still railed) |
+| HIT | 6.00 V (railed) | 6.00 V (still railed) |
 
-All three VCA channels share `NOISE_VPP` and the MC3340 LUT, so a systematic error would
-land on EXP and HIT together — which is what we see. Two candidates, neither yet tested:
+**The MC3340 knee cannot be the cause either**, for the same reason: at full envelope FIRE
+sits at V2 = 2.82 V, EXP at 2.9 V and HIT at 2.9 V — all three *below* the 3.1 V knee, so
+all three take the identical +13 dB. Moving the knee moves them together.
 
-* **`NOISE_VPP` = 9.5 V is too high.** It is the datasheet *midpoint* of a 7.0–12.0 V
-  bound, chosen because it also made FIRE sit alongside ALARM. But FIRE is the channel
-  that is 3× *under*, so that corroboration is weaker than it looked.
-* **The MC3340 knee.** Documented as the one tuning knob for all three VCA channels, with
-  ±0.5 V of part spread. EXP and HIT both sit at V2 = 2.9 V at full open, which is below
-  the 3.1 V knee and therefore pinned at the full +13 dB. FIRE bottoms out at 2.82 V, also
-  below the knee — so the knee position alone does not explain the split.
+The split is **structural, and every term is off the schematic**:
 
-Note the split is partly *by design*: FIRE's input attenuator is 0.0991 against HIT's
-0.2326, and its output gain is −2.2 against HIT's −6.8, so FIRE is ~10× quieter straight
-off the schematic. Resolve this before the LA4460 stage, not after — it changes what the
-output stage is being asked to reproduce.
+```
+FIRE:  atten 0.0991  x  output gain 2.2  = 0.218
+EXP:   atten 0.2481  x  output gain 4.7  = 1.166   -> 5.3x FIRE
+HIT:   atten 0.2326  x  output gain 6.8  = 1.582   -> 7.3x FIRE, i.e. 17.2 dB
+```
+
+So **EXP and HIT clip on the real board too**, and FIRE really is a thin, quiet laser. The
+clipping is authentic behaviour rather than a defect — and it is one of the genuine
+sources of the era-typical "crunch". Nothing here should be tuned away.
+
+What this *does* leave open is `MASTER_VOL`: two channels that legitimately sit at the rail
+mean the master stage must be set so it does not clip them a second time. Scenario 14
+(HIT + ALARM) peaks at 32520 against a 32767 ceiling, which is uncomfortably tight, and
+SHIP and REBOUND are not built yet. Revisit once all six exist.
 
 ## Op-amp output rails — a real clipping mechanism
 
