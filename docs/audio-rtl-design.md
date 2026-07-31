@@ -233,8 +233,26 @@ tuning knob for all three VCA channels**; do not chase small discrepancies elsew
 part's nominal 32-64 kHz and avoiding any beat against the audio rate. The real part's
 clock is notoriously variable, so this is a documented tuning knob.
 
-Raw output amplitude is **not** documented and is parameterised as `NOISE_VPP`, default
-1.0 V. Two buffered taps via IC29:
+**Output amplitude — RESOLVED** from `docs/reference/MM5837.PDF`. The MM5837 is a PMOS
+part whose output swings essentially the full V_SS..V_DD span. The board wires
+**V_SS (pin 4) = +12 V, V_DD (pin 2) = ground, and V_GG tied to V_DD** — the degraded-V_GG
+case, so the datasheet's wider logic-0 limit applies:
+
+```
+logical 1: Vss - 1.5 .. Vss   = 10.5 .. 12.0 V
+logical 0: Vdd .. Vdd + 3.5   =  0.0 ..  3.5 V     -> swing bounded to 7.0 .. 12.0 Vpp
+```
+
+No typical is given, so `NOISE_VPP` = **9.5 V**, the midpoint. Independently, the master
+mixer's identical 10 K summing resistor on every channel implies the designer expected
+comparable channel amplitudes; solving for the swing that puts FIRE alongside ALARM gives
+**9.3 V**. Two unrelated routes to the same figure.
+
+This is the single scaling knob for FIRE, EXP and HIT — all three are linear in it. Note
+the datasheet spec is taken under a 20 K/20 K load while this board presents ~77 K, so if
+anything the true swing sits above the midpoint.
+
+Two buffered taps via IC29:
 
 | Tap | Network | Gain | Feeds |
 |---|---|---|---|
@@ -305,6 +323,43 @@ Full Ebers-Moll would trade one undocumented parameter (the MC3340 knee) for ano
 → gain **−2.2** → C77 2.2 µF → FIRE MIX.
 
 Input attenuator ahead of the VCA: R67 30 K into R68 3.3 K to ground = **0.0991**.
+
+### Phase 2 results
+
+Scenario 6 (one shot) peaks at 7168, against ALARM's 19904 — FIRE sits 8.9 dB below the
+alarm, which is consistent with the equal 10 K mixer resistors. Scenario 8 (FIRE under a
+sustained ALARM0, the real gameplay combination) peaks at 25616 with no clipping.
+
+**One bug found by the first run.** The envelope decay pole was written in Q0.16, which
+cannot represent it: the ideal `exp(-1/(fs·1.02))` = 0.99997957 falls between two adjacent
+codes, so 65535 gives tau = 1.365 s (+34 %) and 65534 gives 0.68 s (−33 %). Carried in
+Q0.24 the realised tau is 1.0191 s. This is the identical trap already flagged for the
+ALARM high-pass, and it will recur in every channel with a slow envelope — SHIP and EXP
+both have one. **Check the pole precision before believing any envelope.**
+
+### Open: FIRE decays faster than the recording
+
+Our decay reaches −20 dB at t ≈ 0.29 s. MAME's `fire.wav` reaches −20 dB at t ≈ 0.78 s —
+roughly **2.7× slower**. The shapes differ in character too: ours falls immediately and
+smoothly, the recording holds nearly flat for 0.4 s and then collapses.
+
+Deliberately **not** resolved by tuning to the recording. Every element of our chain is
+primary-sourced — C3/R4 tau = 1.02 s off the schematic, the 40 dB/V slope off the MC3340
+datasheet at the correct 12 V rail — and a recording does not override primary sources
+without schematic backing. Recorded here rather than fitted away.
+
+Candidates, if it is ever worth chasing:
+
+* **MC3340 part spread.** Figure 3's dashed limit curves span roughly ±0.5 V, which is
+  easily enough to account for the gap. The knee position is the documented tuning knob.
+* **V_peak.** Taken as 3.16 V. Fitting the recording's onset against the 3.1 V knee instead
+  of the 3.5 V point gives 3.80 V, which is equally plausible as a 74123 V_OH less D8.
+* **The recording itself.** `fire.wav` is a hand-made MAME asset — possibly trimmed, faded,
+  normalised, or captured from another board revision. It is 0.949 s long, suspiciously
+  close to a round number.
+
+Not worth chasing until a second channel is built and the relative levels can be judged
+together; a systematic error would show up in EXP the same way.
 
 ## Mixer — why it is built whole
 

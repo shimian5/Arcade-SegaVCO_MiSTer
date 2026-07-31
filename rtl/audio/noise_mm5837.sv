@@ -2,15 +2,36 @@
 // 14, XOR feedback, advanced once per sample_ce (47,999 Hz), which sits
 // inside the part's nominal 32-64 kHz clock range and avoids any beat
 // against the audio rate itself. See docs/audio-rtl-design.md, "NOISE --
-// MM5837". Raw amplitude is undocumented on the schematic and is exposed
-// as NOISE_VPP_LSB (default 4096 LSB = 1.0 V) for later tuning. Two
-// buffered IC29 taps follow, both simple resistive-gain scalers (no
+// MM5837".
+//
+// Output amplitude, from docs/reference/MM5837.PDF. It is a PMOS part whose
+// output swings essentially the whole Vss..Vdd span. The board wires
+// Vss (pin 4) = +12 V, Vdd (pin 2) = ground, and Vgg tied to Vdd -- the
+// degraded-Vgg case, so the datasheet's wider logic-0 limit applies:
+//     logical 1: Vss - 1.5 .. Vss   = 10.5 .. 12.0 V
+//     logical 0: Vdd .. Vdd + 3.5   =  0.0 ..  3.5 V
+// which bounds the swing to 7.0 .. 12.0 Vpp. The datasheet gives no typical,
+// so we take the midpoint, 9.5 V.
+//
+// Corroboration: the master mixer uses an identical 10 K summing resistor for
+// every channel (only HIT differs, deliberately hotter), which implies the
+// designer expected comparable channel amplitudes. Solving for the swing that
+// puts FIRE's RMS level alongside ALARM's gives 9.3 V -- independently landing
+// on the same midpoint. Two unrelated routes to the same number.
+//
+// This remains the single scaling knob for FIRE, EXP and HIT: all three are
+// linear in it. The datasheet's own spec is taken under a 20 K/20 K load,
+// whereas this board loads the pin with ~77 K (R140 100K parallel R144 330K),
+// an order of magnitude lighter -- so if anything the true swing sits above
+// the midpoint, nearer the 12 V rail span.
+//
+// Two buffered IC29 taps follow, both simple resistive-gain scalers (no
 // filtering -- C86/C85 are DC-blocking coupling caps, not shaping the
 // audio-band response we model here):
 //   NOISE.A: gain -0.10  (R140 100K in, R139 10K fb)  -> FIRE, EXP
 //   NOISE.B: gain -0.303 (R144 330K in, R143 100K fb) -> HIT
 module noise_mm5837 #(
-    parameter int NOISE_VPP_LSB = 4096   // 4096 LSB = 1V, undocumented amplitude
+    parameter int NOISE_VPP_LSB = 38912  // 9.5 V * 4096 LSB/V (datasheet midpoint)
 )(
     input  logic               clk,
     input  logic               rst_n,
