@@ -18,6 +18,7 @@ static const int ALARM1_PA_BIT = 7;
 static const int ALARM2_PB_BIT = 0;
 static const int ALARM3_PB_BIT = 1;
 static const int FIRE_PB_BIT   = 2;
+static const int EXP_PB_BIT    = 3;
 
 struct Harness {
     Vaudio_top *dut;
@@ -98,6 +99,13 @@ struct Harness {
         pb |= (1 << FIRE_PB_BIT);
     }
 
+    // /EXP is port B bit 3.
+    void pulse_exp(double low_ms = 1.0) {
+        pb &= ~(1 << EXP_PB_BIT);
+        run_ms(low_ms);
+        pb |= (1 << EXP_PB_BIT);
+    }
+
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
             switch (w) {
@@ -152,7 +160,7 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-8>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-10>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -225,6 +233,28 @@ int main(int argc, char **argv) {
                 h.run_ms(60 - 1);
             }
             h.run_ms(600);
+            break;
+        // ---- EXP (phase 3) ----
+        case 9:
+            // one explosion. 5 s of capture: the rumble's C89 recovers
+            // through 2M with tau = 4.4 s, so the tail is very long and
+            // truncating it would hide the shape.
+            h.run_ms(10);
+            h.pulse_exp();
+            h.run_ms(5000 - 10);
+            break;
+        case 10:
+            // explosion with the laser still firing over it, and an alarm
+            // running underneath -- three live channels on the passive mix
+            // node, which is where clipping would first show up.
+            h.run_ms(10);
+            h.pulse_exp();
+            for (int i = 0; i < 8; i++) {
+                if (i % 2 == 0) h.pulse_fire();
+                h.pulse_alarm(0);
+                h.run_ms(80 - 2);
+            }
+            h.run_ms(2500);
             break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);

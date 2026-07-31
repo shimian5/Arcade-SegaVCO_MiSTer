@@ -19,11 +19,7 @@ SOURCES = \
 	$(RTL_DIR)/video/video_timing.v \
 	$(RTL_DIR)/video/fg_tilemap.v \
 	$(RTL_DIR)/video/sprite_engine.v \
-	$(RTL_DIR)/audio/ttl_555_astable.sv \
-	$(RTL_DIR)/audio/ttl_74123.sv \
-	$(RTL_DIR)/audio/alarm_chan.sv \
-	$(RTL_DIR)/audio/audio_mixer.sv \
-	$(RTL_DIR)/audio/audio_top.sv \
+	$(wildcard $(RTL_DIR)/audio/*.sv) \
 	$(RTL_DIR)/io/i8255.v \
 	$(RTL_DIR)/io/i8279.v \
 	$(RTL_DIR)/tv80/rtl/core/tv80_core.v \
@@ -97,7 +93,7 @@ $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP): $(AUDIO_SOURCES) audio_tb.cpp
 
 audio-run: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
 	mkdir -p $(AUDIO_OUT_DIR)
-	for s in 0 1 2 3 4 5 6 7 8; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
+	for s in 0 1 2 3 4 5 6 7 8 9 10; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
 
 audio-clean:
 	rm -rf $(AUDIO_OBJ_DIR) $(AUDIO_OUT_DIR)
