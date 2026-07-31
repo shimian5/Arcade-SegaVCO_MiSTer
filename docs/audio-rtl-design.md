@@ -5,8 +5,9 @@ the *implementation* decisions: numeric formats, clocking, module boundaries, an
 place we knowingly depart from the circuit. Nothing here may contradict
 `hardware-audio.md`; if it seems to, the schematic wins and this file is the bug.
 
-Status: **phase 1 — ALARM channel only.** The mixer is built for all six channels from
-the start (see "Why the mixer is built whole"), but five of its inputs are tied to zero.
+Status: **ALARM, FIRE and EXP built and connected.** The mixer is built for all six
+channels from the start (see "Why the mixer is built whole"); SHIP, HIT and REBOUND are
+still tied to zero.
 
 ---
 
@@ -57,14 +58,30 @@ range it needs rather than us guessing).
 |---|---|---|---|
 | Channel `*_MIX` outputs | `signed [15:0]` | **4096 LSB = 1 V** | ±8.000 V |
 | Mixer internal / master out | `signed [15:0]` | 4096 LSB = 1 V | ±8.000 V |
-| High-pass filter state | `signed [31:0]` | 4096·256 LSB = 1 V | ±2048 V |
+| High-pass filter state | `signed [31:0]` | 4096·65536 LSB = 1 V | ±8.000 V |
 | Filter coefficients | `unsigned [15:0]` | Q0.16 | — |
 
 All channel buses are **AC quantities centred on zero**, representing volts relative to the
 board's 6 V mid-rail. The 6 V rail is the model's zero; it is never represented explicitly.
 
-The filter state carries 8 extra fractional bits because the high-pass pole is at
+The filter state carries **16** extra fractional bits because the high-pass pole is at
 a = 0.9996, and a leaky integrator that close to unity quantizes to death in 16 bits.
+
+8 extra bits is not enough, which only became visible once the power-on thump gave
+`y_state` a negative initial condition. A leaky integrator **stalls** once its per-step
+decrement falls below the rounding threshold, at |y| = 0.5/(1−a) = 1260 state LSB. At
+4096·256 LSB/V that is 1.2 mV — a *permanent* +10 LSB DC offset on the channel, which six
+channels would accumulate. At 4096·65536 LSB/V the same 1260 codes are 4.7 µV, under one
+output LSB, and the channel reaches true silence.
+
+Two things this is **not**. It is not coefficient precision: the stall point is 0.5/(1−a)
+measured in state LSBs, so carrying the coefficient in Q0.24 does not move it — only
+widening the state does. And it is separate from the pole-representation trap recorded
+under FIRE, which *is* a coefficient-format problem. Both exist; check for both.
+
+All fixed-point shifts in the analog tail **round to nearest** rather than truncating.
+Truncation toward −∞ biases a negative state away from zero on every step, which doubles
+the stall offset and gives it a sign.
 
 ---
 
@@ -326,9 +343,16 @@ Input attenuator ahead of the VCA: R67 30 K into R68 3.3 K to ground = **0.0991*
 
 ### Phase 2 results
 
-Scenario 6 (one shot) peaks at 7168, against ALARM's 19904 — FIRE sits 8.9 dB below the
-alarm, which is consistent with the equal 10 K mixer resistors. Scenario 8 (FIRE under a
-sustained ALARM0, the real gameplay combination) peaks at 25616 with no clipping.
+Measured at the channel's own MIX node (`dbg_fire_mix`), which is the level that does not
+move when `MASTER_VOL` is recalibrated: FIRE peaks at **6255 LSB = 1.53 V** against
+ALARM's 17432 LSB = 4.26 V, so FIRE sits 8.9 dB below the alarm — consistent with the
+equal 10 K mixer resistors. Scenario 8 (FIRE under a sustained ALARM0, the real gameplay
+combination) shows no clipping at either channel or the master.
+
+Earlier revisions quoted master-output figures (7168 against 19904, and 25616 for scenario
+8). Those are still correct in ratio but no longer in absolute terms, because
+`MASTER_VOL` moved from 256 to 128. **Quote per-channel MIX levels, not master levels**,
+for anything meant to survive calibration.
 
 **One bug found by the first run.** The envelope decay pole was written in Q0.16, which
 cannot represent it: the ideal `exp(-1/(fs·1.02))` = 0.99997957 falls between two adjacent
@@ -361,26 +385,36 @@ Candidates, if it is ever worth chasing:
 Not worth chasing until a second channel is built and the relative levels can be judged
 together; a systematic error would show up in EXP the same way.
 
-## Phase 3 — EXP (sheet 2) — **KNOWN BROKEN, DISCONNECTED**
+## Phase 3 — EXP (sheet 2) — **BUILT AND CONNECTED**
 
-> **Status: `exp_chan` is instantiated in `audio_top.sv` but its output is tied off.**
-> Connected, it saturates the master output to full scale *even when `/EXP` has never
-> fired* — every scenario clips at 32767, including ALARM-alone, which is 19904 with EXP
-> disconnected. So it is emitting a large steady signal at idle, not merely mis-scaling
-> its burst.
+> **Resolved.** The spec below was correct; the bug was in `ttl_74123`, not in EXP at all.
 >
-> Re-enable by restoring `.exp_mix (exp_mix)` in `audio_top.sv`.
+> `ttl_74123` reset its input-history register `a_n_d` to a hardcoded 1. That is the right
+> idle value only when `a_n` is driven from a PPI line, which idles high. EXP is the first
+> channel to **cascade** two one-shots — sec.B's `a_n` is sec.A's `q`, which idles **low** —
+> so on the first clock after reset the module saw a falling edge that never happened and
+> fired a phantom full-width pulse.
 >
-> **Where to look first.** The channel is silent at idle only if both control voltages sit
-> at 5.0 V (80 dB down). The envelope caps reset to 5.0 V, and the control is
-> `(5 + Vcap)/2`, so idle control should be exactly 5.0 V — verify that first, in
-> isolation, before suspecting the biquads. Second suspect is the rumble low-pass:
-> `b0 = b2 = 0.000785` against `a1 = -1.981145`, a very high-Q pole with tiny numerators,
-> which is precisely the shape that blows up if the coefficient format or the state width
-> is wrong. Third is the −4.700 output weight applied to it.
+> That pulse discharged C89, putting the rumble control at (5 + 0.8)/2 = 2.9 V — the
+> *bottom* of the MC3340 curve, i.e. full +13 dB, the loudest state the channel has — for
+> 465 ms, recovering over the 4.4 s C89 tail. Every scenario is shorter than that tail,
+> which is why ALARM-alone clipped too, and why it presented as a steady idle signal rather
+> than a mis-scaled burst.
 >
-> Everything below is the *design contract*, which was checked against the schematic and
-> is believed correct. The bug is in the implementation, not the spec.
+> Fix: reset `a_n_d` to the current value of `a_n`. No change for ALARM/FIRE.
+>
+> **All three ranked suspects were innocent**, and are ruled out by analysis rather than by
+> the fix happening to work. The envelope recharge is an *exact* fixed point at
+> `VHIGH_SCALED` (5242880 · 16777216 >> 24 = 5242880), so idle V2 is exactly 5.000 V and
+> the LUT index is exactly 48. The rumble low-pass DC gain is
+> (13175 + 26349 + 13175)/(2²⁴ − 33237369 + 16481232) = 52699/21079 = 2.500, as specced.
+> The −4.700 weight matches the schematic. Recorded because "the fix worked" is not the
+> same as "the suspects were wrong", and the next channel will have the same suspects.
+>
+> **Lesson worth carrying.** The bug was in the *shared TTL part*, exposed by the first
+> channel to use it in a new topology. `ttl_555_astable` and `ttl_74123` are used by every
+> remaining channel; SHIP and REBOUND will exercise the 555's duty cycle for the first
+> time, which is likewise untested by ALARM.
 
 
 
@@ -466,6 +500,74 @@ IC25 R141 470K feedback, + at 6 V -> C76 2.2uF -> EXP MIX
 
 The rumble is weighted **2.2× hotter** than the crack at the summing junction.
 
+## Op-amp output rails — a real clipping mechanism
+
+Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its
+`+` input at the **6 V mid-rail**. Its output therefore cannot leave roughly 0 .. 10.5 V,
+which referred to the 6 V rail is about:
+
+```
+RAIL_HI = +4.50 V   (Vcc - 1.5 V headroom)   = +18432 LSB
+RAIL_LO = -6.00 V   (sinks nearly to ground) = -24576 LSB
+```
+
+Note the **asymmetry** — an LM324 pulls down almost to ground but stops well short of Vcc.
+That asymmetry is itself audible: it clips one half-cycle before the other, generating even
+harmonics.
+
+This is not a format guard, it is the circuit. A full-gain explosion through EXP's −4.700
+rumble weight drives well past +4.5 V, so **the real board clips here too**, and that
+clipping is part of what an explosion on this hardware sounds like. Saturating at the
+numeric format's ±8.000 V instead — a voltage no LM324 on a 12 V rail can reach — both
+misses the distortion and lets a channel run about 5 dB hotter than the circuit permits.
+EXP was doing exactly that: `exp_mix` pinned at 32768 = 8.00 V.
+
+Currently applied at **EXP's IC25 output only**, because that is the only place it is
+demonstrably reached. ALARM peaks at 4.26 V and FIRE at 1.53 V, both under RAIL_HI, so
+adding it there today would be a no-op — but it belongs on every op-amp output stage, and
+must be added as each channel lands rather than retrofitted once levels drift.
+
+> **PROVISIONAL — the one number here that is not primary-sourced.** The 1.5 V headroom is
+> the light-load typical (the summing loads are 100 K–470 K, i.e. very light). There is no
+> LM324 or MB3614 datasheet in `docs/reference/` yet. Get one and confirm V_OH before
+> treating RAIL_HI as settled; RAIL_LO is the safer of the two.
+
+## Power-on thump — modelled deliberately
+
+The real board thumps at power-on and this is reproduced, at the correct amplitude, rather
+than skipped. An earlier revision of this file recorded the opposite decision; that has
+been reversed.
+
+At power-on C88 (4.7 µF) is uncharged, so it is momentarily a **short**, and the op-amp
+`+` input is a plain resistive divider between the idle node (5 V through R153 + R154 =
+6.1 K) and the 6 V Thevenin of R155/R156 (5 K):
+
+```
+Vp(0) = (5/6.1 + 6/5) / (1/6.1 + 1/5) = 2.019672 / 0.363934 = 5.5495 V
+y(0)  = Vp(0) - 6 = -0.45045 V,  which is exactly (5 - 6) * 5/11.1
+```
+
+In model units the 6 V rail's share of the divider is 6 · (5/11.1) · 4096 = 11071 LSB, so
+`y(0)` = X_IDLE − X_SIXV = 9226 − 11071 = **−1845 LSB**, decaying over the 52.17 ms tau.
+After the ×(−2) stage that is a **+0.90 V** thump at ALARM MIX. Measured tau in scenario
+11 is 52.8 ms.
+
+**This is not the old bug.** The pre-phase-1 code reset `x_scaled_d` to `X_LOW`, modelling
+C88 pre-charged to the node-*low* level — a state the board is never in — and produced an
+18452 LSB click, 5× too large and of the wrong sign. The correct initial condition is the
+cap uncharged.
+
+**It is also only the ALARM leg's share.** Most of a real cabinet's power-on thump is the
+other coupling caps charging — C69 and C83 (4.7 µF) into the LA4460, plus C74/C76/C77 —
+none of which are modelled yet. Expect this to be subtle on its own; the big one arrives
+with the LA4460 output stage.
+
+Scenarios 0–10 call `settle()` first, which runs 600 ms (11.5 tau) **without recording**,
+so the thump has decayed to bit-exact zero and each scenario's timeline still starts at
+t = 0. That models reality — a board has been powered for seconds before the game makes a
+sound — and keeps acceptance criterion 5 meaningful. Scenario 11 skips the settle and
+captures the thump itself.
+
 ## Mixer — why it is built whole
 
 `hardware-audio.md` establishes that R138 (200 K) sits *in series* into IC28, so the six
@@ -504,10 +606,15 @@ because the resistors are fixed — no runtime division.
 AUDIO_L = AUDIO_R = saturate16( mix_out * MASTER_VOL >>> 4 )
 ```
 
-`MASTER_VOL` defaults to **256** (i.e. ×16), putting ALARM alone at about −10 dBFS. This is
-a placeholder to be recalibrated once all six channels exist and the loudest realistic
-combination is known — it is the one number in this document chosen by taste rather than by
-the schematic, and it is isolated in one parameter for exactly that reason.
+`MASTER_VOL` defaults to **128** (i.e. ×8). Still a placeholder to be settled once all six
+channels exist and the loudest realistic combination is known — it is the one number in
+this document chosen by taste rather than by the schematic, and it is isolated in one
+parameter for exactly that reason.
+
+It was 256 (×16) through phase 2. With EXP live that is demonstrably too hot: scenario 10
+(EXP + FIRE + ALARM) clipped the master stage. At ×8 that combination peaks at 21720,
+about −3.6 dBFS, leaving headroom for HIT — which will be the hottest channel of all, its
+5.1 K summing resistor giving it 1.96× everything else.
 
 `AUDIO_S = 1` (signed), `AUDIO_MIX = 0` (no MiSTer-side blending; the board is mono).
 
@@ -528,7 +635,7 @@ python tools/analyze_audio.py sim/out/audio/scen0.wav ...
 | 2 | Burst lengths 144 ms (ALARM0-2) and 211 ms (ALARM3) within 1 % | **PASS** — 146 / 145 / 146 / 213 ms measured, less the 2 ms envelope window |
 | 3 | Retrigger extends to a full width from the retrigger instant | **PASS** — scenario 4 retriggers at 80 ms and ends at 224 ms = 80 + 144 |
 | 4 | Simultaneous alarms intermodulate, they do not sum | **PASS** — scenario 5 differs from `scen0 + scen2` by up to 18160 LSB; RMS 7288 vs 10687 for the linear sum |
-| 5 | Silence is bit-exact zero before the first alarm | **PASS** — max sample 0 over the first 480 samples |
+| 5 | Silence is bit-exact zero before the first alarm | **PASS** — scen0 has 387 leading zero samples against an onset at sample 384. Now measured *after* `settle()`, since the power-on thump is deliberately modelled; see "Power-on thump" |
 
 ### Two findings from the first run, both now fixed
 

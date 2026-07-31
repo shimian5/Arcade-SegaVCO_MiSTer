@@ -93,7 +93,7 @@ $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP): $(AUDIO_SOURCES) audio_tb.cpp
 
 audio-run: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
 	mkdir -p $(AUDIO_OUT_DIR)
-	for s in 0 1 2 3 4 5 6 7 8 9 10; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
+	for s in 0 1 2 3 4 5 6 7 8 9 10 11; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
 
 audio-clean:
 	rm -rf $(AUDIO_OBJ_DIR) $(AUDIO_OUT_DIR)

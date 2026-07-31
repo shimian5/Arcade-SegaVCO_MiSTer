@@ -93,13 +93,13 @@ module alarm_chan (
     // Stage 5: analog tail. Everything below updates only on sample_ce.
     // x[n] = 506 + ((9226-506) * acc) / 832
     // y[n] = (a * (y[n-1] + x[n] - x[n-1])) >>> 16   (s32 state, a=65510 Q0.16)
-    // alarm_mix = -2 * (y[n] >>> 8), saturated to s16
+    // alarm_mix = -2 * (y[n] >>> 16), saturated to s16
     // ---------------------------------------------------------------
     localparam signed [31:0] X_LOW  = 32'sd506;
     localparam signed [31:0] X_SPAN = 32'sd9226 - 32'sd506; // 8720
     localparam signed [31:0] A_COEF = 32'sd65510; // Q0.16
 
-    logic signed [31:0] x_scaled_d;   // previous x<<8, s32 4096*256 LSB/V
+    logic signed [31:0] x_scaled_d;   // previous x<<16, s32 4096*65536 LSB/V
     logic signed [31:0] y_state;      // s32 filter state, same scale
 
     // combinational: level map on the *latched* acc (i.e. the value from
@@ -108,15 +108,37 @@ module alarm_chan (
     // sample_ce and has been accumulating ever since).
     wire signed [31:0] acc_s   = {22'd0, acc};
     wire signed [31:0] x_next  = X_LOW + ((X_SPAN * acc_s) / 32'sd832);
-    wire signed [31:0] x_scaled_next = x_next <<< 8;
+    wire signed [31:0] x_scaled_next = x_next <<< 16;
 
     // widen to 64 bits for the multiply so the >>>16 is a real Q0.16
     // fixed-point multiply, not a truncate-then-shift
+    // TWO FIXED-POINT DEFECTS, both exposed by the power-on thump below and
+    // both invisible while y_state started at 0 and never went negative.
+    //
+    // 1. `hp_prod[47:16]` alone truncates toward -infinity, biasing a negative
+    //    y_state AWAY from zero every step. Rounded to nearest instead, by
+    //    adding half an LSB before the shift.
+    //
+    // 2. A leaky integrator stalls once its per-step decrement falls below the
+    //    rounding threshold, at |y| = 0.5/(1-a) = 1260 state LSB. That is why
+    //    the state carries 16 fractional bits and not 8: at 4096*256 LSB/V the
+    //    stall sat at 1260/1048576 = 1.2 mV, which is +10 LSB of permanent DC
+    //    at alarm_mix, and six channels would accumulate it. At 4096*65536
+    //    LSB/V the same 1260 codes are 4.7 uV, comfortably under one output
+    //    LSB, so the channel actually reaches silence.
+    //
+    // Note (2) is NOT coefficient precision: the stall point is 0.5/(1-a) in
+    // units of the STATE LSB, so carrying A_COEF in Q0.24 would not move it.
+    // Only widening the state does. Headroom check for the wider scale:
+    // x_scaled max = 9226<<16 = 6.05e8, hp_sum max ~1.18e9 (< 2^31), and
+    // hp_prod max = 65510*1.18e9 = 7.7e13 (< 2^63).
     wire signed [63:0] hp_sum  = 64'(y_state) + 64'(x_scaled_next) - 64'(x_scaled_d);
-    wire signed [63:0] hp_prod = 64'(A_COEF) * hp_sum;
+    wire signed [63:0] hp_prod = 64'(A_COEF) * hp_sum + 64'sd32768;
     wire signed [31:0] y_next  = hp_prod[47:16];
 
-    wire signed [31:0] mix_full = -32'sd2 * (y_next >>> 8);
+    // same rounding on the filter-scale -> audio-scale shift, so that a
+    // y_next of -1 maps to 0 rather than to -1
+    wire signed [31:0] mix_full = -32'sd2 * ((y_next + 32'sd32768) >>> 16);
 
     // saturate mix_full to signed 16-bit
     wire signed [15:0] mix_sat =
@@ -125,21 +147,44 @@ module alarm_chan (
         mix_full[15:0];
 
     // Idle level: with no alarm gated, every 74LS38 output is off and R153
-    // holds the node HIGH, so x settles at X_LOW + X_SPAN. x_scaled_d must
-    // reset to that, not to X_LOW -- otherwise the first sample sees a
-    // full-scale 0 -> idle step and the high-pass rings for its whole 52 ms
-    // tau, producing a reset click twice the amplitude of the alarm itself.
-    //
-    // Physically this starts C88 pre-charged. A real board powering up does
-    // thump; the core's rst_n is not a power cycle of the analog board, and
-    // the design contract requires bit-exact silence before the first alarm,
-    // so we deliberately skip the power-on transient.
+    // holds the node HIGH, so x settles at X_LOW + X_SPAN. x_scaled_d resets
+    // to that, not to X_LOW -- resetting to X_LOW would model C88 pre-charged
+    // to the node-LOW level, which is not a state the board is ever in, and
+    // injected a spurious step twice the amplitude of the alarm itself.
     localparam signed [31:0] X_IDLE = X_LOW + X_SPAN;
+
+    // POWER-ON THUMP -- modelled deliberately; the real board does this.
+    //
+    // At power-on C88 (4.7 uF) is uncharged, so it is momentarily a short and
+    // the op-amp + input is a plain resistive divider between the idle node
+    // (5 V through R153+R154 = 6.1 K) and the 6 V Thevenin of R155/R156
+    // (5 K):
+    //
+    //   Vp(0) = (5/6.1 + 6/5) / (1/6.1 + 1/5) = 2.019672 / 0.363934 = 5.5495 V
+    //   y(0)  = Vp(0) - 6 = -0.45045 V, which is exactly (5 - 6) * 5/11.1
+    //
+    // In model units y is scaled like x (4096 LSB/V, then <<16), and the 6 V
+    // rail's share of the divider is 6 * (5/11.1) * 4096 = 11071 LSB, so
+    //
+    //   y(0) = X_IDLE - X_SIXV = 9226 - 11071 = -1845 LSB
+    //
+    // decaying to 0 over the 52.17 ms tau. After the x(-2) output stage that
+    // is a +0.90 V thump at ALARM MIX.
+    //
+    // NOTE this is only the ALARM leg's share. The bulk of a real cabinet's
+    // power-on thump is the other coupling caps charging -- C69 and C83
+    // (4.7 uF) into the LA4460, plus C74/C76/C77 -- none of which are
+    // modelled yet. Expect this one to be subtle on its own.
+    //
+    // Consequence: silence before the first alarm is NO LONGER bit-exact
+    // zero. Phase-1 acceptance criterion 5 is restated accordingly in
+    // docs/audio-rtl-design.md.
+    localparam signed [31:0] X_SIXV = 32'sd11071;  // 6 V * (5/11.1) * 4096
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            x_scaled_d <= X_IDLE <<< 8;
-            y_state    <= '0;
+            x_scaled_d <= X_IDLE <<< 16;
+            y_state    <= (X_IDLE - X_SIXV) <<< 16;
             alarm_mix  <= 16'sd0;
         end else if (sample_ce) begin
             y_state    <= y_next;

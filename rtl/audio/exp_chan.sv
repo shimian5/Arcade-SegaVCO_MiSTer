@@ -297,9 +297,31 @@ module exp_chan (
     wire signed [31:0] sum_full = crack_out + rumble_out;
     wire signed [31:0] mix_full = sum_full >>> 8; // filter scale -> audio scale (4096 LSB/V)
 
+    // IC25 OUTPUT RAILS -- a real clipping mechanism, not a format guard.
+    //
+    // IC25 is an LM324 on the board's 12 V single supply with its + input at
+    // the 6 V mid-rail, so its output cannot leave 0 .. ~10.5 V. Referred to
+    // the 6 V rail that is roughly -6.0 V / +4.5 V, and it is ASYMMETRIC:
+    // the LM324 sinks nearly to ground but stops about 1.5 V short of Vcc.
+    //
+    // This matters. A full-gain explosion through the -4.700 rumble weight
+    // drives well past +4.5 V, so the real board clips here too -- that
+    // clipping is part of what an explosion on this hardware sounds like.
+    // Saturating at the format limit of +/-8.000 V instead (which no LM324 on
+    // a 12 V rail can reach) both misses the distortion and lets the channel
+    // run ~5 dB hotter than the circuit permits.
+    //
+    // PROVISIONAL: the 1.5 V headroom figure is the light-load typical, and
+    // the summing loads here are 100 K - 470 K, i.e. very light. There is no
+    // LM324 or MB3614 datasheet in docs/reference yet, so confirm V_OH before
+    // treating these two constants as settled. Everything else in this file
+    // is primary-sourced; these two are not.
+    localparam signed [31:0] RAIL_HI = 32'sd18432;   // +4.50 V * 4096
+    localparam signed [31:0] RAIL_LO = -32'sd24576;  // -6.00 V * 4096
+
     wire signed [15:0] mix_sat =
-        (mix_full > 32'sd32767)  ? 16'sd32767  :
-        (mix_full < -32'sd32768) ? -16'sd32768 :
+        (mix_full > RAIL_HI) ? RAIL_HI[15:0] :
+        (mix_full < RAIL_LO) ? RAIL_LO[15:0] :
         mix_full[15:0];
 
     always_ff @(posedge clk) begin

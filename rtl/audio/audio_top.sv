@@ -22,7 +22,13 @@ module audio_top (
     output logic signed [15:0] dbg_exp_mix
 );
 
-    parameter int MASTER_VOL = 256;
+    // VR1 master volume. Still a placeholder to be settled once all six
+    // channels exist and the loudest realistic combination is known -- but
+    // 256 (x16) is now demonstrably too hot: with EXP live, scenario 10
+    // (EXP + FIRE + ALARM) clipped the master stage. 128 (x8) puts that
+    // combination near -1.5 dBFS with headroom left for HIT, which is the
+    // hottest channel of all (5.1 K summing resistor, 1.96x the rest).
+    parameter int MASTER_VOL = 128;
 
     // ---------------------------------------------------------------
     // Sample-rate generator: clk_sys / 832 = 47,999.4 Hz

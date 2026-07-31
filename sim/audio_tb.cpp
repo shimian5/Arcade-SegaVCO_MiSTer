@@ -49,10 +49,16 @@ struct Harness {
     }
 
     // advance one half clock period
+    // When false, cycles still run but nothing is recorded. Used to let the
+    // power-on thump decay before a scenario starts: the board has been
+    // powered for seconds before the game makes a sound, so capturing that
+    // transient underneath every burst would be the unrealistic choice.
+    bool capture = true;
+
     void half_tick() {
         dut->clk = !dut->clk;
         dut->eval();
-        if (dut->clk && dut->sample_ce) {
+        if (dut->clk && dut->sample_ce && capture) {
             samples.push_back((int16_t)dut->audio_l);
             auto absmax = [](int &acc, int16_t v) {
                 int a = v < 0 ? -(int)v : (int)v;
@@ -84,6 +90,16 @@ struct Harness {
         apply_ports();
         for (int i = 0; i < cycles; i++) tick();
         dut->rst_n = 1;
+    }
+
+    // Run without recording, so the caller's timeline still starts at t=0.
+    // 600 ms is 11.5 of the ALARM high-pass's 52.17 ms tau, which is enough
+    // for the power-on thump to decay back to bit-exact zero and so preserve
+    // phase-1 acceptance criterion 5. (300 ms left a 22 LSB residual.)
+    void settle(double ms = 600.0) {
+        capture = false;
+        run_ms(ms);
+        capture = true;
     }
 
     void pulse_alarm(int which, double low_ms = 1.0) {
@@ -177,6 +193,8 @@ int main(int argc, char **argv) {
 
     Harness h;
     h.reset(100);
+    // Scenario 11 is the power-on thump itself, so it must NOT settle first.
+    if (scen != 11) h.settle();
 
     switch (scen) {
         case 0:
@@ -265,6 +283,15 @@ int main(int argc, char **argv) {
                 h.run_ms(80 - 2);
             }
             h.run_ms(2500);
+            break;
+        // ---- power-on ----
+        case 11:
+            // The power-on thump, captured from the instant reset releases.
+            // C88 starts uncharged, so the ALARM high-pass begins at
+            // -1845 LSB and decays over its 52.17 ms tau -- a +0.90 V pulse
+            // at ALARM MIX after the x(-2) stage. No trigger is asserted;
+            // everything here is the analog tail settling.
+            h.run_ms(400);
             break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
