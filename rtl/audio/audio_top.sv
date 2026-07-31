@@ -12,7 +12,14 @@ module audio_top (
     input  logic         [7:0] ppi1_pb,
     output logic signed [15:0] audio_l,
     output logic signed [15:0] audio_r,
-    output logic               sample_ce
+    output logic               sample_ce,
+    // Per-channel taps, ahead of the mixer. Purely for the Verilator bench:
+    // they make it possible to tell a channel saturating internally from the
+    // master stage clipping, which is otherwise indistinguishable at audio_l.
+    // Leave unconnected in the core; they synthesise away.
+    output logic signed [15:0] dbg_alarm_mix,
+    output logic signed [15:0] dbg_fire_mix,
+    output logic signed [15:0] dbg_exp_mix
 );
 
     parameter int MASTER_VOL = 256;
@@ -97,6 +104,10 @@ module audio_top (
         .exp_mix    (exp_mix)
     );
 
+    assign dbg_alarm_mix = alarm_mix;
+    assign dbg_fire_mix  = fire_mix;
+    assign dbg_exp_mix   = exp_mix;
+
     logic signed [15:0] mix_out;
 
     audio_mixer u_mixer (
@@ -106,13 +117,7 @@ module audio_top (
         .ship_mix    (16'sd0),
         .hit_mix     (16'sd0),
         .fire_mix    (fire_mix),
-        // EXP IS DISABLED. exp_chan drives the mix node hard enough to
-        // saturate the master output even when /EXP has never fired -- with
-        // it connected, every scenario including ALARM-alone clips at full
-        // scale. The channel is left instantiated (so it keeps building and
-        // linting) but disconnected until that is diagnosed. See
-        // docs/audio-rtl-design.md, "EXP: known broken".
-        .exp_mix     (16'sd0),
+        .exp_mix     (exp_mix),
         .rebound_mix (16'sd0),
         .alarm_mix   (alarm_mix),
         .mix_out     (mix_out)

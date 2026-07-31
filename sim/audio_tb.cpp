@@ -26,6 +26,9 @@ struct Harness {
     uint8_t pa = 0xFF;
     uint8_t pb = 0xFF;
     std::vector<int16_t> samples;
+    // per-channel peaks, to separate an internally-saturating channel from
+    // master-stage clipping
+    int pk_alarm = 0, pk_fire = 0, pk_exp = 0;
 
     Harness() {
         dut = new Vaudio_top;
@@ -51,6 +54,13 @@ struct Harness {
         dut->eval();
         if (dut->clk && dut->sample_ce) {
             samples.push_back((int16_t)dut->audio_l);
+            auto absmax = [](int &acc, int16_t v) {
+                int a = v < 0 ? -(int)v : (int)v;
+                if (a > acc) acc = a;
+            };
+            absmax(pk_alarm, (int16_t)dut->dbg_alarm_mix);
+            absmax(pk_fire,  (int16_t)dut->dbg_fire_mix);
+            absmax(pk_exp,   (int16_t)dut->dbg_exp_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -273,8 +283,15 @@ int main(int argc, char **argv) {
         if (s != 0) nonzero++;
     }
 
-    printf("scenario=%d samples=%zu peak=%d nonzero=%llu\n",
-           scen, h.samples.size(), (int)peak, (unsigned long long)nonzero);
+    // channel peaks in volts: 4096 LSB = 1 V. The board is a 12 V single
+    // supply biased at 6 V, so anything much past +/-5.5 V at a channel's
+    // MIX node is not physically reachable on hardware.
+    printf("scenario=%2d samples=%6zu peak=%5d nonzero=%6llu | "
+           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV)\n",
+           scen, h.samples.size(), (int)peak, (unsigned long long)nonzero,
+           h.pk_alarm, h.pk_alarm / 4096.0,
+           h.pk_fire,  h.pk_fire  / 4096.0,
+           h.pk_exp,   h.pk_exp   / 4096.0);
 
     return 0;
 }

@@ -20,9 +20,16 @@ module ttl_74123 #(
 
     wire trigger = a_n_d && !a_n; // falling edge on a_n
 
+    // `a_n_d` must reset to the CURRENT value of `a_n`, not to a hardcoded 1.
+    // Resetting it to 1 is only correct when `a_n` idles high (a PPI line);
+    // when one of these is cascaded into another -- EXP wires sec.B's a_n to
+    // sec.A's q, which idles LOW -- a hardcoded 1 manufactures a falling edge
+    // on the first clock after reset and fires a phantom full-width pulse.
+    // That bug fired EXP's 465 ms rumble one-shot at t=0 in every scenario,
+    // holding its VCA at full +13 dB and clipping the master output.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            a_n_d <= 1'b1;
+            a_n_d <= a_n;
             cnt   <= '0;
             q     <= 1'b0;
         end else begin
