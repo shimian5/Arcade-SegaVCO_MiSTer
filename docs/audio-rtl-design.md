@@ -361,7 +361,28 @@ Candidates, if it is ever worth chasing:
 Not worth chasing until a second channel is built and the relative levels can be judged
 together; a systematic error would show up in EXP the same way.
 
-## Phase 3 — EXP (sheet 2)
+## Phase 3 — EXP (sheet 2) — **KNOWN BROKEN, DISCONNECTED**
+
+> **Status: `exp_chan` is instantiated in `audio_top.sv` but its output is tied off.**
+> Connected, it saturates the master output to full scale *even when `/EXP` has never
+> fired* — every scenario clips at 32767, including ALARM-alone, which is 19904 with EXP
+> disconnected. So it is emitting a large steady signal at idle, not merely mis-scaling
+> its burst.
+>
+> Re-enable by restoring `.exp_mix (exp_mix)` in `audio_top.sv`.
+>
+> **Where to look first.** The channel is silent at idle only if both control voltages sit
+> at 5.0 V (80 dB down). The envelope caps reset to 5.0 V, and the control is
+> `(5 + Vcap)/2`, so idle control should be exactly 5.0 V — verify that first, in
+> isolation, before suspecting the biquads. Second suspect is the rumble low-pass:
+> `b0 = b2 = 0.000785` against `a1 = -1.981145`, a very high-Q pole with tiny numerators,
+> which is precisely the shape that blows up if the coefficient format or the state width
+> is wrong. Third is the −4.700 output weight applied to it.
+>
+> Everything below is the *design contract*, which was checked against the schematic and
+> is believed correct. The bug is in the implementation, not the spec.
+
+
 
 Two **parallel** VCA paths — a bright "crack" and a low "rumble" — summed at IC25 with
 different weights. Both sections of IC19 (the MB4391 = two MC3340s) are used, so the

@@ -81,6 +81,22 @@ module audio_top (
         .fire_mix   (fire_mix)
     );
 
+    // ---------------------------------------------------------------
+    // EXP (crack + rumble). /EXP is ppi1_pb[3].
+    // ---------------------------------------------------------------
+    wire exp_n = ppi1_pb[3];
+
+    logic signed [15:0] exp_mix;
+
+    exp_chan u_exp (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sample_ce  (sample_ce),
+        .exp_n      (exp_n),
+        .noise_b    (noise_b),
+        .exp_mix    (exp_mix)
+    );
+
     logic signed [15:0] mix_out;
 
     audio_mixer u_mixer (
@@ -90,6 +106,12 @@ module audio_top (
         .ship_mix    (16'sd0),
         .hit_mix     (16'sd0),
         .fire_mix    (fire_mix),
+        // EXP IS DISABLED. exp_chan drives the mix node hard enough to
+        // saturate the master output even when /EXP has never fired -- with
+        // it connected, every scenario including ALARM-alone clips at full
+        // scale. The channel is left instantiated (so it keeps building and
+        // linting) but disconnected until that is diagnosed. See
+        // docs/audio-rtl-design.md, "EXP: known broken".
         .exp_mix     (16'sd0),
         .rebound_mix (16'sd0),
         .alarm_mix   (alarm_mix),
