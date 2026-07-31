@@ -1503,6 +1503,51 @@ per-channel WAV dumps, and comparison against recordings of real hardware.
 
 ---
 
+## Fidelity ledger — closing MAME → schematic → RTL gaps
+
+**Standing goal, spanning every phase.** This core is not trying to match MAME; it is
+trying to match the board. MAME is a behavioural cross-check and a convenient reference
+image, nothing more. Wherever MAME and the schematic disagree, the schematic wins and the
+divergence gets recorded here with its evidence.
+
+Three distinct kinds of gap, which need different treatment:
+
+1. **MAME → hardware.** MAME reproduces an *effect* without its *mechanism*. These are the
+   ones that make our output differ from MAME's while being more correct, so they must be
+   documented before anyone "fixes" the core back towards MAME. Buck Rogers' whole-frame
+   `screen_update` (insensitive to mid-frame sprite RAM writes, where the hardware and this
+   core consume sprite RAM live per scanline) is the archetype.
+2. **Schematic → RTL.** We read the board correctly but implemented something else.
+   Ordinary bugs; fix them.
+3. **Unverified inheritance.** We copied MAME without ever checking the board. These are
+   the dangerous ones because they look finished. Anything ported verbatim from
+   `turbo_v.cpp` — including every table in `tools/gen_tables.py` — is in this category
+   until a sheet reference is attached to it.
+
+**Working rule:** any constant, table or algorithm transcribed from MAME carries a comment
+naming the sheet + PDF page + zone that justifies it, or is explicitly marked
+`UNVERIFIED — inherited from MAME`. No silent third-category items.
+
+### Open ledger
+
+| # | Area | Kind | Status | Evidence |
+|---|---|---|---|---|
+| F1 | Sprite ROM address split: does one VCO tick advance a **nibble** (MAME's model, ours) or a **byte**? `CW0 → ROM A0` appears wired directly, yet nibble-select is a separate XOR-driven signal | 3 | **OPEN — highest value.** If hardware differs, horizontal sprite scale is off by exactly 2× | `VCO_schematic_findings.md` §7 |
+| F2 | Nibble-select XOR (LS86 IC23 → LS157 IC103). Pin 13 traced to `CW15` (counter MSB = up/down direction); pin 12 unresolved. MAME has no XOR — uses `~offs&1` unconditionally | 3 | OPEN. If direction-dependent, mirrored sprites emit nibbles in reversed order vs MAME | §7, medium confidence |
+| F3 | VCO → pixel-clock resync (LS109 IC35 ×2, inputs `HP0`/`5M`/`BLANK`). MAME models no resync at all | 3 | OPEN. Decides whether a source pixel can be an odd number of 2× sub-pixels wide | §8, low-medium |
+| F4 | VCO phase reset. MAME zeroes `frac` once per scanline in `prepare_sprites` | 3 | OPEN — is the oscillator free-running with only its output gated? | §5, low-medium |
+| F5 | Does `prepare_sprites` (and its `offset += rowbytes` writeback) run during VBLANK on hardware? MAME only ever calls it for visible scanlines, so MAME cannot answer this | 1/3 | OPEN. Interacts with the `y_target` width bug | `BLANK` into the LS109 network, sheet 3 |
+| F6 | `R4` = **3.9K** on the schematic; MAME hardcodes `3.8e3`, and `gen_tables.py` inherited it | 3 | OPEN, cosmetic (<1% VCO frequency) | §3, high confidence |
+| F7 | Mid-frame sprite RAM writes: hardware and this core read sprite RAM live per scanline; MAME renders the frame in one pass from end-of-frame state | 1 | OPEN — see `INVESTIGATION_title_logo_garbling.md` | verified from `dbg_sprram.hex` |
+| F8 | VCO analogue model: SN74LS626 ×4 = 8 oscillators, 220 pF, CV network R2/R7/R3/R5/R6 | — | **CLOSED — schematic confirms MAME** | §1-3, high confidence |
+| F9 | No divider between `CLKn` and the LS191 counter chain | — | **CLOSED — single unbroken net** | §4, high confidence |
+| F10 | `END` source: data pattern vs counter terminal-count | — | **CLOSED — data-derived.** IC39 (LS20 4-input NAND) on `CDA/CDB/CDC/CDD`, asserts at `pixdata==15`, structurally matching MAME's `plb_end[pixdata]&2` | §8, high confidence |
+
+Closed items stay in the table. A gap that was checked and found to match MAME is a
+result, and deleting it invites someone to re-derive it.
+
+---
+
 ## Deliverables in `docs/`
 
 Everything this work produces lands in `C:\MiSTerDev\Arcade-Z80-3D_MiSTer\docs`:
