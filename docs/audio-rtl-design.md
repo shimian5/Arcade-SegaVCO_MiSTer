@@ -5,9 +5,9 @@ the *implementation* decisions: numeric formats, clocking, module boundaries, an
 place we knowingly depart from the circuit. Nothing here may contradict
 `hardware-audio.md`; if it seems to, the schematic wins and this file is the bug.
 
-Status: **ALARM, FIRE and EXP built and connected.** The mixer is built for all six
-channels from the start (see "Why the mixer is built whole"); SHIP, HIT and REBOUND are
-still tied to zero.
+Status: **all six channels built and connected** — ALARM, FIRE, EXP, HIT, REBOUND, SHIP.
+`MASTER_VOL` is calibrated (see "Output stage"). The mixer was built for all six from the
+start; see "Why the mixer is built whole" for why that was not premature.
 
 ---
 
@@ -89,16 +89,29 @@ the stall offset and gives it a sign.
 
 ```
 rtl/audio/
-  audio_top.sv      PPI1 taps, channel instances, mixer, output scaling
-  ttl_74123.sv      retriggerable monostable        (reused by FIRE/EXP/HIT/REBOUND)
-  ttl_555_astable.sv  free-running astable          (reused by SHIP, REBOUND)
-  alarm_chan.sv      555 + 74393 + 4x74123 + wire-OR NAND -> node bit + analog tail
-  audio_mixer.sv     passive summing node + IC28
+  audio_top.sv      PPI1 taps, IC2/IC6 latches, channel instances, mixer, output scaling
+  ttl_74123.sv      retriggerable monostable        (ALARM/FIRE/EXP/HIT/REBOUND)
+  ttl_555_astable.sv  free-running astable          (ALARM)
+  relax_vco.sv      integrator + Schmitt + transistor relaxation oscillator (SHIP x3)
+  dc_block.sv       one-pole coupling-cap high-pass (SHIP x3)
+  noise_mm5837.sv   17-bit LFSR + the two buffered taps
+  alarm_chan.sv     555 + 74393 + 4x74123 + wire-OR NAND -> node bit + analog tail
+  fire_chan.sv exp_chan.sv hit_chan.sv rebound_chan.sv ship_chan.sv
+  audio_mixer.sv    passive summing node + IC28
 ```
 
 `ttl_74123` and `ttl_555_astable` are written as general parts, parameterised by their
 timing constants, because every remaining channel needs them. Resisting the urge to inline
-them into `alarm_chan` is the whole reason phase 1 is worth doing first.
+them into `alarm_chan` is the whole reason phase 1 is worth doing first — and the EXP
+one-shot bug, which lived in the shared part rather than in EXP, is the proof.
+
+`relax_vco` earns its keep the same way and more cheaply: SHIP instantiates it **three
+times**, because Tr2, Tr4 and Tr5 are one circuit drafted three times.
+
+Note the two 555s are handled differently, and deliberately. `alarm_chan` uses
+`ttl_555_astable` because it wants the square wave. REBOUND and SHIP both leave pin 3
+unconnected and follow the *timing capacitor*, so both model the cap's exponentials inline
+and neither instantiates the part at all.
 
 ---
 
@@ -1174,6 +1187,55 @@ crossing quantisation.
 so all three transistors are saturated by more than 3 orders of magnitude; the real ~50 mV
 `Vce_sat` shifts the rising slew rate by 1–3 % and nothing else.
 
+### Phase 6 results — BUILT AND CONNECTED
+
+Scenario 17 (held mid throttle), 18 (the ACC sweep), 19 (ACC = 0000, then full throttle,
+then the SHIP ON gate), 20 (the gameplay pile-up).
+
+**Frequencies**, measured on scenario 19's ACC = 0000 window — the one place the drone is
+unmodulated and therefore cleanly analysable — by instantaneous frequency of the analytic
+signal in each oscillator's band:
+
+| | measured median | analytic mean | error |
+|---|---|---|---|
+| Tr5 | 104.1 Hz | 103.3 Hz | +0.8 % |
+| Tr2 | 324.4 Hz | 319.2 Hz | +1.6 % |
+| 555 LFO | 7.00 Hz | 6.948 Hz | within the 1 Hz bin |
+
+Peak tracking over one LFO period shows the two in clean **counter-motion**: at the ramp's
+reset Tr5 is at its top and Tr2 at its bottom, and they cross over the 138 ms discharge.
+That is the design intent and it is unambiguous in the data.
+
+**ACC moves spectrum, not level** — the acceptance test for the channel. Scenario 18, per
+400 ms step:
+
+| ACC | 1 | 3 | 5 | 7 | 9 | 11 |
+|---|---|---|---|---|---|---|
+| spectral centroid | 793 Hz | 2139 Hz | 3307 Hz | 4907 Hz | 4420 Hz | 4542 Hz |
+| RMS | 3452 | 3552 | 3548 | 3539 | 3575 | 3543 |
+
+Centroid climbs steeply through the low codes and then flattens above ACC3 — exactly what
+the ladder table predicts, ACC3's 2 K putting everything from 1000 up within 3 % of the top
+step. RMS is flat to ±1.8 % across the whole sweep.
+
+Scenario 19 confirms the ACC = 0000 special case: centroid 645 Hz and RMS **4546**, i.e.
+unmodulated and about 2.2 dB *louder* than any other setting, because Tr4 has stopped and
+the VCA has parked wide open. That is the circuit's real behaviour, not a defect.
+
+**Levels.** `dbg_ship_mix` peaks at **19330 LSB = 4.72 V**, against a prediction of 4.75 V.
+The peak is on the *negative* excursion; the positive side is clamped at `RAIL_HI` = 18432.
+The asymmetric LM324 rails are doing exactly what they are there for, and SHIP is the first
+channel where the asymmetry is visible in the output rather than academic.
+
+> **A probe that lied, recorded so nobody repeats it.** The first frequency check counted
+> zero crossings of the band-passed signal and came out 10 % low on *both* oscillators.
+> A common-mode error on two independent oscillators is a strong tell, and the cause was
+> the instrument: these triangles are 37/63 and 45/55 asymmetric, so their second harmonics
+> are strong and land inside any band wide enough to hold the whole octave sweep. A
+> bit-exact Python replica of `relax_vco` + the 555 gave 103.00 / 318.00 Hz against the
+> analytic 103.3 / 319.2 — 0.3 % — which is what proved the RTL right and the measurement
+> wrong. **Validate the probe before believing a sim-vs-theory discrepancy.**
+
 ## Op-amp output rails — a real clipping mechanism
 
 Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its
@@ -1283,21 +1345,30 @@ because the resistors are fixed — no runtime division.
 
 ## Output stage
 
-`VR1` is a real 20 K panel pot, so a master volume is authentic hardware, not a fudge.
+`VR1` is a real 20 K panel pot, so a master volume is authentic hardware, not a fudge. Its
+*setting* is still the one number in this document chosen by taste rather than by the
+schematic, which is why it is isolated in a single parameter.
 
 ```
 AUDIO_L = AUDIO_R = saturate16( mix_out * MASTER_VOL >>> 4 )
 ```
 
-`MASTER_VOL` defaults to **128** (i.e. ×8). Still a placeholder to be settled once all six
-channels exist and the loudest realistic combination is known — it is the one number in
-this document chosen by taste rather than by the schematic, and it is isolated in one
-parameter for exactly that reason.
+**`MASTER_VOL` = 80 (×5) — now calibrated, not provisional.** The calibration case is
+scenario 20, the actual gameplay pile-up: the engine held under alarms with a laser and
+hits over the top. SHIP is the only *continuous* channel, so it and not scenario 14 sets
+the ceiling. Measured `mix_out` peak there is **5417 LSB**:
 
-It was 256 (×16) through phase 2. With EXP live that is demonstrably too hot: scenario 10
-(EXP + FIRE + ALARM) clipped the master stage. At ×8 that combination peaks at 21720,
-about −3.6 dBFS, leaving headroom for HIT — which will be the hottest channel of all, its
-5.1 K summing resistor giving it 1.96× everything else.
+| MASTER_VOL | scenario 20 | |
+|---|---|---|
+| 256 (×16) | — | scenario 10 already clipped; phase-2 value |
+| 128 (×8) | 32767, clipped hard | phase-5 value, before SHIP existed |
+| 96 (×6) | 32502 | under, by 0.07 dB, which is nothing |
+| **80 (×5)** | **27085 = −1.66 dBFS** | chosen |
+
+What this deliberately does **not** budget for: all six channels railed in the same sample
+and the same direction sums to about 10011 LSB at IC28 and would clip at anything above
+×3.3. EXP and REBOUND both pinned while HIT is also pinned is not a state the game
+produces, and designing for it would cost 4 dB across every normal sound.
 
 `AUDIO_S = 1` (signed), `AUDIO_MIX = 0` (no MiSTer-side blending; the board is mono).
 

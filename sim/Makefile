@@ -70,7 +70,7 @@ clean:
 # `make` / `make run` keep meaning exactly what they always meant.
 #
 #   make audio        build the audio sim
-#   make audio-run    render all six ALARM scenarios to out/audio/scenN.wav
+#   make audio-run    render every scenario to out/audio/scenN.wav
 #   make audio-clean
 #
 # Analyse the results from the repo root with:
@@ -93,7 +93,7 @@ $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP): $(AUDIO_SOURCES) audio_tb.cpp
 
 audio-run: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
 	mkdir -p $(AUDIO_OUT_DIR)
-	for s in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
+	for s in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do ./$(AUDIO_OBJ_DIR)/V$(AUDIO_TOP) $$s; done
 
 audio-clean:
 	rm -rf $(AUDIO_OBJ_DIR) $(AUDIO_OUT_DIR)

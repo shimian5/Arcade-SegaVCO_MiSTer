@@ -295,6 +295,9 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
 set_global_assignment -name TOP_LEVEL_ENTITY sys_top
 set_global_assignment -name VERILOG_FILE rtl/io/i8255.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8279.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/dc_block.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/relax_vco.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/ship_chan.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/rebound_chan.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/hit_chan.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/exp_chan.sv

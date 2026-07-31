@@ -22,16 +22,20 @@ static const int EXP_PB_BIT    = 3;
 static const int HIT_PB_BIT    = 4;
 static const int HITCLK_PA_BIT = 4;   // rising edge strobes IC2 (HIT DIS)
 static const int REBOUND_PB_BIT= 5;
+static const int SHIPON_PB_BIT = 6;   // active-HIGH level, not an edge
+static const int ACCCLK_PA_BIT = 5;   // rising edge strobes IC6 (ACC0-3)
 
 struct Harness {
     Vaudio_top *dut;
     vluint64_t time_ps = 0;
     uint8_t pa = 0xFF;
-    uint8_t pb = 0xFF;
+    // pb[6] = SHIP ON is active HIGH, so it must idle LOW or every scenario
+    // would have the engine running underneath it.
+    uint8_t pb = 0xFF & ~(1 << 6);
     std::vector<int16_t> samples;
     // per-channel peaks, to separate an internally-saturating channel from
     // master-stage clipping
-    int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0, pk_reb = 0;
+    int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0, pk_reb = 0, pk_ship = 0;
 
     Harness() {
         dut = new Vaudio_top;
@@ -72,6 +76,7 @@ struct Harness {
             absmax(pk_exp,   (int16_t)dut->dbg_exp_mix);
             absmax(pk_hit,   (int16_t)dut->dbg_hit_mix);
             absmax(pk_reb,   (int16_t)dut->dbg_rebound_mix);
+            absmax(pk_ship,  (int16_t)dut->dbg_ship_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -159,6 +164,25 @@ struct Harness {
         pa = (uint8_t)((pa & ~0x07) | (dis & 0x07));
         run_ms(0.05);
         pa |= (1 << HITCLK_PA_BIT);
+        run_ms(0.05);
+    }
+
+    // SHIP ON is a level: assert and leave it.
+    void ship_on(bool on) {
+        if (on) pb |= (1 << SHIPON_PB_BIT);
+        else    pb &= ~(1 << SHIPON_PB_BIT);
+        apply_ports();
+    }
+
+    // ACC0-3: drive the shared nibble on port A bits 0-3, then strobe IC6
+    // with a rising edge on port A bit 5. Unlike IC2 this latch uses all four
+    // bits.
+    void set_acc(int a) {
+        pa &= ~(1 << ACCCLK_PA_BIT);
+        run_ms(0.05);
+        pa = (uint8_t)((pa & ~0x0F) | (a & 0x0F));
+        run_ms(0.05);
+        pa |= (1 << ACCCLK_PA_BIT);
         run_ms(0.05);
     }
 
@@ -367,6 +391,60 @@ int main(int argc, char **argv) {
             }
             h.run_ms(2000);
             break;
+        // ---- SHIP (phase 6) ----
+        case 17:
+            // Engine at a mid throttle, held. 2 s -- long enough for 14 cycles
+            // of the 6.95 Hz 555 LFO, so the counter-motion of Tr2 (205->411 Hz)
+            // against Tr5 (143->71 Hz) is unmistakable, and long enough for the
+            // C11 glide (203 ms at this setting) to have finished.
+            h.set_acc(4);
+            h.ship_on(true);
+            h.run_ms(2000);
+            break;
+        case 18:
+            // The throttle sweep, and SHIP's acceptance test. Tr4's chop rate
+            // should climb monotonically 410 -> 3236 Hz across these settings
+            // while the LEVEL stays put: ACC moves spectrum, not amplitude.
+            // 400 ms a step is over twice the worst-case C11 glide.
+            h.ship_on(true);
+            for (int a = 1; a <= 15; a += 2) {
+                h.set_acc(a);
+                h.run_ms(400);
+            }
+            break;
+        case 19:
+            // ACC = 0000, the one code that STOPS Tr4 (Vs = 0 -> both slew
+            // rates zero). C56 then bleeds the frozen offset away over 0.22 s
+            // and the VCA parks wide open, so this is the unmodulated drone --
+            // and the loudest the channel gets. Then step to full throttle to
+            // watch the 55 ms glide, then gate the engine off and on.
+            h.set_acc(0);
+            h.ship_on(true);
+            h.run_ms(1200);
+            h.set_acc(15);
+            h.run_ms(800);
+            h.ship_on(false);
+            h.run_ms(200);
+            h.ship_on(true);
+            h.run_ms(800);
+            break;
+        case 20:
+            // The real gameplay pile-up: engine held under alarms, with a
+            // laser and a hit over the top. SHIP is the only CONTINUOUS
+            // channel, so this -- not scenario 14 -- is what MASTER_VOL has to
+            // be calibrated against.
+            h.set_acc(8);
+            h.ship_on(true);
+            h.set_hit_dis(7);
+            h.run_ms(10);
+            for (int i = 0; i < 10; i++) {
+                h.pulse_alarm(0);
+                if (i % 3 == 0) h.pulse_fire();
+                if (i % 5 == 0) h.pulse_hit();
+                h.run_ms(60 - 1);
+            }
+            h.run_ms(1200);
+            break;
         // ---- power-on ----
         case 11:
             // The power-on thump, captured from the instant reset releases.
@@ -397,13 +475,14 @@ int main(int argc, char **argv) {
     // supply biased at 6 V, so anything much past +/-5.5 V at a channel's
     // MIX node is not physically reachable on hardware.
     printf("scenario=%2d samples=%6zu peak=%5d nonzero=%6llu | "
-           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV) reb=%5d (%.2fV)\n",
+           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV) reb=%5d (%.2fV) ship=%5d (%.2fV)\n",
            scen, h.samples.size(), (int)peak, (unsigned long long)nonzero,
            h.pk_alarm, h.pk_alarm / 4096.0,
            h.pk_fire,  h.pk_fire  / 4096.0,
            h.pk_exp,   h.pk_exp   / 4096.0,
            h.pk_hit,   h.pk_hit   / 4096.0,
-           h.pk_reb,   h.pk_reb   / 4096.0);
+           h.pk_reb,   h.pk_reb   / 4096.0,
+           h.pk_ship,  h.pk_ship  / 4096.0);
 
     return 0;
 }

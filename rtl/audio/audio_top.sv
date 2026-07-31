@@ -1,7 +1,6 @@
-// Discrete audio top level. ALARM, FIRE, EXP, HIT and REBOUND are
-// built; only SHIP is still tied to zero (see docs/audio-rtl-design.md, "why the
-// mixer is built whole"). PPI1 port A/B carry every trigger, plus the
-// shared data nibble and the two latch strobes.
+// Discrete audio top level. All six channels are built. PPI1 port A/B carry
+// every trigger, plus the shared data nibble and the two latch strobes.
+// See docs/audio-rtl-design.md.
 //
 // GAME ON global mute (ppi1_pb[7]) is deliberately NOT implemented in
 // phase 1 -- its muting path (which stage of the analog chain it actually
@@ -22,16 +21,30 @@ module audio_top (
     output logic signed [15:0] dbg_fire_mix,
     output logic signed [15:0] dbg_exp_mix,
     output logic signed [15:0] dbg_hit_mix,
-    output logic signed [15:0] dbg_rebound_mix
+    output logic signed [15:0] dbg_rebound_mix,
+    output logic signed [15:0] dbg_ship_mix
 );
 
-    // VR1 master volume. Still a placeholder to be settled once all six
-    // channels exist and the loudest realistic combination is known -- but
-    // 256 (x16) is now demonstrably too hot: with EXP live, scenario 10
-    // (EXP + FIRE + ALARM) clipped the master stage. 128 (x8) puts that
-    // combination near -1.5 dBFS with headroom left for HIT, which is the
-    // hottest channel of all (5.1 K summing resistor, 1.96x the rest).
-    parameter int MASTER_VOL = 128;
+    // VR1 master volume -- a real 20 K panel pot, so this is authentic
+    // hardware rather than a fudge, but its SETTING is the one number in the
+    // whole design chosen by taste. Now settled, all six channels being built.
+    //
+    // The calibration case is scenario 20, the actual gameplay pile-up: the
+    // engine held under alarms with a laser and hits over the top. SHIP is the
+    // only CONTINUOUS channel, so it -- not scenario 14 -- sets the ceiling.
+    // Measured mix_out peak there is 5417 LSB, so
+    //
+    //   256 (x16)  scenario 10 clipped                    (phase 2 value)
+    //   128 (x8)   scenario 20 clips hard at 32767        (phase 5 value)
+    //    96 (x6)   32502 -- under, but with 0.07 dB spare, which is nothing
+    //    80 (x5)   27085 = -1.66 dBFS                     <- chosen
+    //
+    // Note what is deliberately NOT budgeted for: all six channels railed in
+    // the same sample and the same direction sums to about 10011 at IC28 and
+    // would clip at any setting above x3.3. EXP and REBOUND both pinned while
+    // HIT is also pinned is not a state the game produces, and designing for
+    // it would cost 4 dB of level across every normal sound.
+    parameter int MASTER_VOL = 80;
 
     // ---------------------------------------------------------------
     // Sample-rate generator: clk_sys / 832 = 47,999.4 Hz
@@ -131,7 +144,13 @@ module audio_top (
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             hit_dis       <= 3'd0;
-            hit_dis_clk_d <= 1'b0;
+            // Reset the strobe history to the CURRENT level, never to a
+            // constant. The port idles HIGH (8255 reset -> inputs, RA pull-ups),
+            // so a hardcoded 0 would manufacture a rising edge on the first
+            // clock out of reset and latch whatever happened to be on the
+            // nibble. Exactly the ttl_74123 `a_n_d` bug written up under
+            // "Phase 3 -- EXP" in docs/audio-rtl-design.md.
+            hit_dis_clk_d <= ppi1_pa[4];
         end else begin
             hit_dis_clk_d <= ppi1_pa[4];
             if (!hit_dis_clk_d && ppi1_pa[4])   // rising edge strobes IC2
@@ -167,11 +186,46 @@ module audio_top (
         .rebound_mix (rebound_mix)
     );
 
+    // ---------------------------------------------------------------
+    // SHIP. SHIP ON is ppi1_pb[6] -- an active-high LEVEL, not an edge.
+    //
+    // ACC0-3 is latched on-board by IC6, a 4175B quad D flip-flop, from the
+    // same shared port-A nibble HIT DIS uses, but strobed by the rising edge
+    // of port A bit 5 rather than bit 4. Unlike IC2, IC6 uses all four bits.
+    // ---------------------------------------------------------------
+    wire ship_on = ppi1_pb[6];
+
+    logic [3:0] acc;
+    logic       acc_clk_d;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            acc       <= 4'd0;
+            acc_clk_d <= ppi1_pa[5];   // see the note on hit_dis_clk_d above
+        end else begin
+            acc_clk_d <= ppi1_pa[5];
+            if (!acc_clk_d && ppi1_pa[5])   // rising edge strobes IC6
+                acc <= ppi1_pa[3:0];
+        end
+    end
+
+    logic signed [15:0] ship_mix;
+
+    ship_chan u_ship (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sample_ce  (sample_ce),
+        .ship_on    (ship_on),
+        .acc        (acc),
+        .ship_mix   (ship_mix)
+    );
+
     assign dbg_alarm_mix = alarm_mix;
     assign dbg_fire_mix  = fire_mix;
     assign dbg_exp_mix   = exp_mix;
     assign dbg_hit_mix   = hit_mix;
     assign dbg_rebound_mix = rebound_mix;
+    assign dbg_ship_mix    = ship_mix;
 
     logic signed [15:0] mix_out;
 
@@ -179,7 +233,7 @@ module audio_top (
         .clk         (clk),
         .rst_n       (rst_n),
         .sample_ce   (sample_ce),
-        .ship_mix    (16'sd0),
+        .ship_mix    (ship_mix),
         .hit_mix     (hit_mix),
         .fire_mix    (fire_mix),
         .exp_mix     (exp_mix),
