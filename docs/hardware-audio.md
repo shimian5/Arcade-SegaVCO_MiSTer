@@ -108,6 +108,15 @@ No band shaping happens here — that is downstream, per effect.
 
 ### SHIP — engine drone (sheet 1)
 
+> **This summary is WRONG in its middle. Do not build from it.** The block it calls an
+> "envelope-follower + 2-pole filter chain" is nothing of the kind: Tr2, Tr4 and Tr5 are
+> three instances of one *relaxation oscillator*, SHIP uses no NOISE at all, D1 is in the
+> 555's CHARGE path (not the discharge path), the 4066 inputs tie to +12 V so ACC is a DC
+> level ladder rather than an audio gate, and ACC drives nothing but Tr4 — which is the
+> VCA's control voltage, not audio. The component list below is accurate and useful; the
+> topology around it is not. See `audio-rtl-design.md`, "Phase 6", for the traced circuit.
+> Left in place rather than rewritten so the correction stays visible.
+
 ```
 IC14 555 astable     R24 6.8K charge, R23 200K + D1 discharge, C12 1uF, C88 0.01uF ctrl
   -> IC17 LM324 buffer
