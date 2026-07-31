@@ -19,6 +19,8 @@ static const int ALARM2_PB_BIT = 0;
 static const int ALARM3_PB_BIT = 1;
 static const int FIRE_PB_BIT   = 2;
 static const int EXP_PB_BIT    = 3;
+static const int HIT_PB_BIT    = 4;
+static const int HITCLK_PA_BIT = 4;   // rising edge strobes IC2 (HIT DIS)
 
 struct Harness {
     Vaudio_top *dut;
@@ -28,7 +30,7 @@ struct Harness {
     std::vector<int16_t> samples;
     // per-channel peaks, to separate an internally-saturating channel from
     // master-stage clipping
-    int pk_alarm = 0, pk_fire = 0, pk_exp = 0;
+    int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0;
 
     Harness() {
         dut = new Vaudio_top;
@@ -67,6 +69,7 @@ struct Harness {
             absmax(pk_alarm, (int16_t)dut->dbg_alarm_mix);
             absmax(pk_fire,  (int16_t)dut->dbg_fire_mix);
             absmax(pk_exp,   (int16_t)dut->dbg_exp_mix);
+            absmax(pk_hit,   (int16_t)dut->dbg_hit_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -130,6 +133,24 @@ struct Harness {
         pb &= ~(1 << EXP_PB_BIT);
         run_ms(low_ms);
         pb |= (1 << EXP_PB_BIT);
+    }
+
+    // /HIT is port B bit 4.
+    void pulse_hit(double low_ms = 1.0) {
+        pb &= ~(1 << HIT_PB_BIT);
+        run_ms(low_ms);
+        pb |= (1 << HIT_PB_BIT);
+    }
+
+    // HIT DIS0-2: drive the shared nibble on port A bits 0-2, then strobe
+    // IC2 with a rising edge on port A bit 4, exactly as the CPU does.
+    void set_hit_dis(int dis) {
+        pa &= ~(1 << HITCLK_PA_BIT);
+        run_ms(0.05);
+        pa = (uint8_t)((pa & ~0x07) | (dis & 0x07));
+        run_ms(0.05);
+        pa |= (1 << HITCLK_PA_BIT);
+        run_ms(0.05);
     }
 
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
@@ -284,6 +305,39 @@ int main(int argc, char **argv) {
             }
             h.run_ms(2500);
             break;
+        // ---- HIT (phase 4) ----
+        case 12:
+            // one hit at the closest/brightest setting (all three DIS bits).
+            // 2.5 s: C48 recharges through 2 M with tau = 1.36 s, so the
+            // VCA tail is long.
+            h.set_hit_dis(7);
+            h.run_ms(10);
+            h.pulse_hit();
+            h.run_ms(2500 - 10);
+            break;
+        case 13:
+            // the DIS sweep: same hit at each of the seven non-muted
+            // settings. This is the acceptance test for the distance cue --
+            // level AND brightness should both fall as DIS decreases.
+            for (int d = 7; d >= 1; d--) {
+                h.set_hit_dis(d);
+                h.pulse_hit();
+                h.run_ms(400);
+            }
+            break;
+        case 14:
+            // hits under a sustained ALARM0, the gameplay combination.
+            // HIT has the hottest path into the mixer (R136 5.1 K), so this
+            // is where clipping would show up first.
+            h.set_hit_dis(7);
+            h.run_ms(10);
+            for (int i = 0; i < 8; i++) {
+                h.pulse_alarm(0);
+                if (i % 2 == 0) h.pulse_hit();
+                h.run_ms(80 - 2);
+            }
+            h.run_ms(1500);
+            break;
         // ---- power-on ----
         case 11:
             // The power-on thump, captured from the instant reset releases.
@@ -314,11 +368,12 @@ int main(int argc, char **argv) {
     // supply biased at 6 V, so anything much past +/-5.5 V at a channel's
     // MIX node is not physically reachable on hardware.
     printf("scenario=%2d samples=%6zu peak=%5d nonzero=%6llu | "
-           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV)\n",
+           "alarm=%5d (%.2fV) fire=%5d (%.2fV) exp=%5d (%.2fV) hit=%5d (%.2fV)\n",
            scen, h.samples.size(), (int)peak, (unsigned long long)nonzero,
            h.pk_alarm, h.pk_alarm / 4096.0,
            h.pk_fire,  h.pk_fire  / 4096.0,
-           h.pk_exp,   h.pk_exp   / 4096.0);
+           h.pk_exp,   h.pk_exp   / 4096.0,
+           h.pk_hit,   h.pk_hit   / 4096.0);
 
     return 0;
 }

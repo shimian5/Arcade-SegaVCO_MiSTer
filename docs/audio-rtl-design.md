@@ -500,6 +500,145 @@ IC25 R141 470K feedback, + at 6 V -> C76 2.2uF -> EXP MIX
 
 The rumble is weighted **2.2× hotter** than the crack at the summing junction.
 
+## Phase 4 — HIT (sheet 2)
+
+Re-traced from sheet 2 at high magnification rather than taken from the summary in
+`hardware-audio.md`, per the EXP lesson. `/HIT` is `ppi1_pb[4]`.
+
+### Envelope — same shape as EXP, opposite to FIRE
+
+```
+/HIT -> IC13 74123 sec.1 (pin 1 = A, pin 2 = B tied to 5 V, pin 3 = CLR)
+        R92 47K? / C42 4.7uF   -> tw = 0.45*R*C = 99.4 ms
+        Q-bar (pin 4), pulled up by R93 4.7K
+     -> D3 (CATHODE toward pin 4) -> R91 470 -> C48 0.68uF to ground
+     -> R90 1M -> node -> R96 1M to 5 V -> IC20 sec.2 unity buffer -> IC24 pin 2
+```
+
+**D3's orientation is confirmed visually at high magnification: cathode on the left,
+toward IC13.** That is the same orientation as EXP's D6/D7 and the opposite of FIRE's D8,
+so the cap **discharges** when the one-shot fires:
+
+| | gated (Q̄ low, D3 conducts) | idle (Q̄ high, D3 blocks) |
+|---|---|---|
+| C48 0.68 µF | R91 470 Ω, tau = **0.32 ms** | R90 + R96 = 2 M, tau = **1.36 s** |
+
+R90 and R96 are equal, so the control voltage is again exactly `(5 + Vc48)/2`, spanning
+**2.9 V (full +13 dB) → 5.0 V (80 dB down)**. Structurally identical to both EXP legs;
+the VCA control model ports over unchanged.
+
+> **OPEN — one unresolved value.** The 74123's timing resistor is drawn on sheet 2 with
+> **no reference designator and no value**. R90/R91/R93 all exist, and R92 appears nowhere
+> else, so it is R92 by elimination. The assembly drawing (page 20) is a scan with no
+> extractable text, so confirming it means a visual search. **47 K is assumed**, because
+> every other 74123 timing resistor on this board is 47 K (R2, R3, R14, R15, R7, R16, R17,
+> R47) and this one is drawn identically — with C42 = 4.7 µF that gives tw = 99.4 ms,
+> exactly EXP's crack. Flagged rather than presented as traced.
+
+### Shaping filter — Sallen-Key, resonant
+
+NOISE·B → C47 4.7 µF → **R84 15 K, R88 15 K, C49 = C50 = 0.0033 µF**, IC20 sec.1, with
+R86 100 K to the 6 V rail and R85 150 K feedback:
+
+```
+K  = 1 + R85/R86 = 1 + 150/100 = 2.5
+f0 = 1 / (2*pi*15K*0.0033u) = 3215 Hz
+Q  = 1 / (3 - K) = 2.0
+```
+
+The same topology and the same **gain of 2.5** as EXP's rumble, an octave-and-a-half
+higher. The designer reused the block; Q = 2.0 is again deliberate and unambiguous.
+
+Then C38 2.2 µF → R80 33 K → R81 10 K to ground → C71 2.2 µF into IC24 pin 1:
+
+```
+input attenuator = 10 / (33 + 10) = 0.23256
+```
+
+### HIT DIS0-2 is a DISTANCE cue, not a volume control
+
+IC24's output → C13 2.2 µF → three 4066 sections (IC10) gated by HIT DIS0-2, each in
+series with its own resistor into a common node:
+
+```
+HIT DIS0 -> R25 100K    HIT DIS1 -> R26 22K    HIT DIS2 -> R27 10K
+node: C9 0.01uF to ground, R28 100K to +12 V, R135 100K into IC28
+IC28: R134 680K feedback, + at 6 V -> gain -R134/R135 = -6.8 -> C73 2.2uF -> HIT MIX
+```
+
+The node is **not** a virtual ground. R28 (to 12 V, an AC ground) and R135 (to IC28's
+virtual ground at 6 V) put **50 K** across it, and C9 shunts it. So the selected resistors
+form a one-pole low-pass whose corner *and* gain both move together:
+
+| enabled | R_sel | LF gain | corner |
+|---|---|---|---|
+| DIS0 | 100 K | 0.333 | 478 Hz |
+| DIS1 | 22 K | 0.694 | 1042 Hz |
+| DIS2 | 10 K | 0.833 | 1910 Hz |
+| DIS0+1 | 18.03 K | 0.735 | 1201 Hz |
+| DIS0+2 | 9.09 K | 0.846 | 2069 Hz |
+| DIS1+2 | 6.88 K | 0.879 | 2633 Hz |
+| all three | 6.43 K | 0.886 | 2792 Hz |
+| none | ∞ | 0 | — (muted) |
+
+Only 8.5 dB of level across that range, but a **5.8:1 spread in corner frequency**. A distant
+hit is quieter *and* duller, which is why the latch is named DIS — distance, not volume.
+Modelling it as a plain gain would throw away most of what the circuit does.
+
+Note HIT also has the hottest path into the master mixer: R136 is 5.1 K against everyone
+else's 10 K, giving it 1.96× the weight (see the mixer table).
+
+### Phase 4 results — and a cross-channel level problem worth resolving
+
+Scenario 12 (one hit, DIS = 7), 13 (the DIS sweep), 14 (hits under ALARM0). Measured at
+`dbg_hit_mix`:
+
+| DIS | RMS | spectral centroid |
+|---|---|---|
+| 7 (all three) | −3.8 dB | 2947 Hz |
+| 4 (DIS2) | −4.3 dB | 2834 Hz |
+| 2 (DIS1) | −5.6 dB | 2459 Hz |
+| 1 (DIS0) | −12.9 dB | 1935 Hz |
+
+Level and brightness both fall monotonically as DIS decreases, which is the acceptance
+test for the distance cue. It passes.
+
+**But HIT pins the −6.00 V rail at every DIS setting** — the peak is an identical 27496 in
+all seven, i.e. the rail, not the signal. Working the chain at full envelope:
+
+```
+noise_b 5895 LSB -> Sallen-Key (ENBW ~10.1 kHz, G 2.5) ~9550 RMS
+  x 0.2326 atten  x 4.466 VCA  x 0.886 DIS  x 6.8 output  =  ~59,800 LSB = 14.6 V RMS
+```
+
+against a rail of 6 V. That is **~3× over**, so the channel is clipped essentially flat.
+
+This is now a cross-channel pattern rather than a HIT quirk, and it is exactly the
+comparison the FIRE section said to wait for:
+
+| channel | peak at its MIX node | vs rails |
+|---|---|---|
+| ALARM | 4.26 V | under |
+| FIRE | 1.53 V | 3× under |
+| EXP | 6.00 V | clipped |
+| HIT | 6.00 V | clipped, ~3× over |
+
+All three VCA channels share `NOISE_VPP` and the MC3340 LUT, so a systematic error would
+land on EXP and HIT together — which is what we see. Two candidates, neither yet tested:
+
+* **`NOISE_VPP` = 9.5 V is too high.** It is the datasheet *midpoint* of a 7.0–12.0 V
+  bound, chosen because it also made FIRE sit alongside ALARM. But FIRE is the channel
+  that is 3× *under*, so that corroboration is weaker than it looked.
+* **The MC3340 knee.** Documented as the one tuning knob for all three VCA channels, with
+  ±0.5 V of part spread. EXP and HIT both sit at V2 = 2.9 V at full open, which is below
+  the 3.1 V knee and therefore pinned at the full +13 dB. FIRE bottoms out at 2.82 V, also
+  below the knee — so the knee position alone does not explain the split.
+
+Note the split is partly *by design*: FIRE's input attenuator is 0.0991 against HIT's
+0.2326, and its output gain is −2.2 against HIT's −6.8, so FIRE is ~10× quieter straight
+off the schematic. Resolve this before the LA4460 stage, not after — it changes what the
+output stage is being asked to reproduce.
+
 ## Op-amp output rails — a real clipping mechanism
 
 Every op-amp on this board (LM324 / MB3614) runs on the **12 V single supply** with its

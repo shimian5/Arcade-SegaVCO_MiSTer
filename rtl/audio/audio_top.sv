@@ -1,6 +1,7 @@
-// Discrete audio top level. Phase 1: ALARM channel only, SHIP/HIT/FIRE/
-// EXP/REBOUND tied to zero (see docs/audio-rtl-design.md, "why the mixer
-// is built whole"). PPI1 port A/B carry the four /ALARMn lines.
+// Discrete audio top level. ALARM, FIRE, EXP and HIT are built; SHIP and
+// REBOUND are still tied to zero (see docs/audio-rtl-design.md, "why the
+// mixer is built whole"). PPI1 port A/B carry every trigger, plus the
+// shared data nibble and the two latch strobes.
 //
 // GAME ON global mute (ppi1_pb[7]) is deliberately NOT implemented in
 // phase 1 -- its muting path (which stage of the analog chain it actually
@@ -19,7 +20,8 @@ module audio_top (
     // Leave unconnected in the core; they synthesise away.
     output logic signed [15:0] dbg_alarm_mix,
     output logic signed [15:0] dbg_fire_mix,
-    output logic signed [15:0] dbg_exp_mix
+    output logic signed [15:0] dbg_exp_mix,
+    output logic signed [15:0] dbg_hit_mix
 );
 
     // VR1 master volume. Still a placeholder to be settled once all six
@@ -110,9 +112,48 @@ module audio_top (
         .exp_mix    (exp_mix)
     );
 
+    // ---------------------------------------------------------------
+    // HIT. /HIT is ppi1_pb[4].
+    //
+    // HIT DIS0-2 is not a direct signal: it is latched on-board by IC2, a
+    // 4175B quad D flip-flop, from the shared 4-bit data nibble on port A
+    // bits 0-3, strobed by the RISING edge of port A bit 4. (IC6 latches
+    // ACC0-3 from the same nibble on bit 5; SHIP will need that one.) IC2
+    // ignores D3, so only bits 2:0 are captured. See the connector pinout
+    // and CPU-side latch bits in docs/hardware-audio.md.
+    // ---------------------------------------------------------------
+    wire hit_n = ppi1_pb[4];
+
+    logic [2:0] hit_dis;
+    logic       hit_dis_clk_d;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            hit_dis       <= 3'd0;
+            hit_dis_clk_d <= 1'b0;
+        end else begin
+            hit_dis_clk_d <= ppi1_pa[4];
+            if (!hit_dis_clk_d && ppi1_pa[4])   // rising edge strobes IC2
+                hit_dis <= ppi1_pa[2:0];
+        end
+    end
+
+    logic signed [15:0] hit_mix;
+
+    hit_chan u_hit (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sample_ce  (sample_ce),
+        .hit_n      (hit_n),
+        .hit_dis    (hit_dis),
+        .noise_b    (noise_b),
+        .hit_mix    (hit_mix)
+    );
+
     assign dbg_alarm_mix = alarm_mix;
     assign dbg_fire_mix  = fire_mix;
     assign dbg_exp_mix   = exp_mix;
+    assign dbg_hit_mix   = hit_mix;
 
     logic signed [15:0] mix_out;
 
@@ -121,7 +162,7 @@ module audio_top (
         .rst_n       (rst_n),
         .sample_ce   (sample_ce),
         .ship_mix    (16'sd0),
-        .hit_mix     (16'sd0),
+        .hit_mix     (hit_mix),
         .fire_mix    (fire_mix),
         .exp_mix     (exp_mix),
         .rebound_mix (16'sd0),
