@@ -311,11 +311,18 @@ module exp_chan (
     // a 12 V rail can reach) both misses the distortion and lets the channel
     // run ~5 dB hotter than the circuit permits.
     //
-    // PROVISIONAL: the 1.5 V headroom figure is the light-load typical, and
-    // the summing loads here are 100 K - 470 K, i.e. very light. There is no
-    // LM324 or MB3614 datasheet in docs/reference yet, so confirm V_OH before
-    // treating these two constants as settled. Everything else in this file
-    // is primary-sourced; these two are not.
+    // Both figures are datasheet-backed (docs/reference/LM324.pdf p11,
+    // docs/reference/MB3614.pdf p2):
+    //   LM324  V_OH = VCC - 1.5 V at RL = 2K, 25 C -> 10.5 V -> +4.50 V
+    //   LM324  V_OL = 5 mV typ / 20 mV max         ->  0.0 V -> -6.00 V
+    //   MB3614 V_OH typ = 28 V at VCC = 30 V, i.e. VCC - 2.0 V -> +4.00 V
+    // The V_OH spec is quoted at RL = 2K while the loads here are 100K-470K,
+    // an order of magnitude lighter, so +4.50 V is conservative.
+    //
+    // Residual uncertainty is 0.5 V on the POSITIVE rail only: the IC roster
+    // in docs/hardware-audio.md lists IC17/IC20-IC22/IC25/IC26/IC29 as
+    // "LM324 / MB3614" without saying which socket holds which, and the two
+    // parts differ by exactly that. Taking the LM324 figure.
     localparam signed [31:0] RAIL_HI = 32'sd18432;   // +4.50 V * 4096
     localparam signed [31:0] RAIL_LO = -32'sd24576;  // -6.00 V * 4096
 

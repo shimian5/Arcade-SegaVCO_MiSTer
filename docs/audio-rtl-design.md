@@ -527,10 +527,19 @@ demonstrably reached. ALARM peaks at 4.26 V and FIRE at 1.53 V, both under RAIL_
 adding it there today would be a no-op — but it belongs on every op-amp output stage, and
 must be added as each channel lands rather than retrofitted once levels drift.
 
-> **PROVISIONAL — the one number here that is not primary-sourced.** The 1.5 V headroom is
-> the light-load typical (the summing loads are 100 K–470 K, i.e. very light). There is no
-> LM324 or MB3614 datasheet in `docs/reference/` yet. Get one and confirm V_OH before
-> treating RAIL_HI as settled; RAIL_LO is the safer of the two.
+**Both figures are now datasheet-backed** (`docs/reference/LM324.pdf` p11,
+`docs/reference/MB3614.pdf` p2):
+
+| | V_OH | V_OL |
+|---|---|---|
+| LM324 | VCC − 1.5 V at RL = 2 K, 25 °C → +4.50 V | 5 mV typ / 20 mV max → −6.00 V |
+| MB3614 | typ 28 V at VCC = 30 V, i.e. VCC − 2.0 V → +4.00 V | 5 mV typ / 20 mV max → −6.00 V |
+
+The V_OH spec is quoted at RL = 2 K while the loads here are 100 K–470 K, an order of
+magnitude lighter, so +4.50 V is conservative. The remaining uncertainty is **0.5 V on the
+positive rail only**: the IC roster lists IC17/IC20–IC22/IC25/IC26/IC29 as "LM324 /
+MB3614" without saying which socket holds which, and that is exactly the spread between
+the two parts. We take the LM324 figure. V_OL is identical for both, so RAIL_LO is firm.
 
 ## Power-on thump — modelled deliberately
 
