@@ -32,10 +32,19 @@ sim/out/
 
 # copyrighted game data - MAME romsets and any binary dumps derived from
 # them never belong in this repo (actual sets live in an external MAME
-# install; see tools/verify_mra_stream.py MAME_ROMS_DIR). roms/*.hex stays
-# tracked - those are our own generated lookup tables, not game ROM dumps.
+# install; see tools/verify_mra_stream.py MAME_ROMS_DIR).
 *.rom
 *.zip
+
+# roms/*.hex are our own generated lookup tables (tools/gen_tables.py),
+# not game ROM dumps, but the whole folder stays out of the repo -
+# regenerate them locally before building.
+roms/
+
+# Releases/ is the MiSTer convention for distributable .rbf + .mra pairs -
+# exempt it from the blanket *.rbf ignore above.
+!Releases/
+!Releases/**
 
 # Verilator sim output
 sim/obj_dir/
