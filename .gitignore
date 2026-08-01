@@ -30,8 +30,12 @@ sim/out/
 *.vcd
 *.ppm
 
-# built ROM images (produced from MRA + MAME sets, never checked in)
+# copyrighted game data - MAME romsets and any binary dumps derived from
+# them never belong in this repo (actual sets live in an external MAME
+# install; see tools/verify_mra_stream.py MAME_ROMS_DIR). roms/*.hex stays
+# tracked - those are our own generated lookup tables, not game ROM dumps.
 *.rom
+*.zip
 
 # Verilator sim output
 sim/obj_dir/
