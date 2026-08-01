@@ -10,7 +10,7 @@ set_global_assignment -name VERILOG_FILE rtl/video/fg_tilemap.v
 set_global_assignment -name VERILOG_FILE rtl/video/sprite_engine.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8255.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8279.v
-set_global_assignment -name VERILOG_FILE rtl/z80_3d.v
+set_global_assignment -name VERILOG_FILE rtl/segavco.v
 
-set_global_assignment -name SDC_FILE Arcade-Z80-3D.sdc
-set_global_assignment -name SYSTEMVERILOG_FILE Arcade-Z80-3D.sv
+set_global_assignment -name SDC_FILE Arcade-SegaVCO.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE Arcade-SegaVCO.sv

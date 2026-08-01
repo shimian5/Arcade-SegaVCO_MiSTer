@@ -16,7 +16,7 @@
 // see VIDEO_PIPE_LATENCY, which delay-matches hblank/vblank/hsync/vsync/
 // ce_pix so the sync bundle output stays aligned with the pixel data it
 // describes.
-module z80_3d
+module segavco
 (
     input  wire        clk,             // core clock, ~39.936 MHz nominal
     input  wire        reset,
@@ -668,7 +668,7 @@ module z80_3d
     // PPI1: buckrog_state's out_pc_callback is ppi1c_w (docs/reference/
     // turbo.cpp lines 393-405) -- OBCH0-2, coin meters (bits 4/5), start
     // lamp (bit 6). Left as internal wires (no top-level MiSTer port for
-    // coin meters/lamp exists yet in Arcade-Z80-3D.sv) -- TODO if/when one
+    // coin meters/lamp exists yet in Arcade-SegaVCO.sv) -- TODO if/when one
     // is added. Port A/B are the sound-generator interface (phase 2, not
     // acted on here beyond decoding the writes).
     wire [7:0] ppi1_dout, ppi1_pa, ppi1_pb, ppi1_pc;

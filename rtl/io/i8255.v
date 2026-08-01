@@ -111,7 +111,7 @@ module i8255
             // module models that "nothing driven yet" state as the output
             // latches idling high (0xFF, this project's standard idle-bus
             // convention) rather than 0x00: callers that tap a port's
-            // output latch directly for a control line (e.g. z80_3d.v's
+            // output latch directly for a control line (e.g. segavco.v's
             // sub_int_n from PPI0 port C bit 7) need that idle level to be
             // "not asserted", not "asserted" -- getting this backwards
             // means a consumer CPU sees its interrupt line asserted from

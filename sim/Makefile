@@ -1,4 +1,4 @@
-# Verilator harness for rtl/z80_3d.v (phase 1a).
+# Verilator harness for rtl/segavco.v (phase 1a).
 #
 # Requires Verilator (WSL2/Linux -- this repo has it under the "archlinux"
 # WSL distro; there is no Windows-native Verilator in this environment).
@@ -8,12 +8,12 @@
 # removed from the project entirely; see rtl/cpu_z80.v.
 
 VERILATOR ?= verilator
-TOP = z80_3d
+TOP = segavco
 
 RTL_DIR = ../rtl
 
 SOURCES = \
-	$(RTL_DIR)/z80_3d.v \
+	$(RTL_DIR)/segavco.v \
 	$(RTL_DIR)/cpu_z80.v \
 	$(RTL_DIR)/rom_download.v \
 	$(RTL_DIR)/video/video_timing.v \
@@ -28,8 +28,8 @@ SOURCES = \
 	$(RTL_DIR)/tv80/rtl/core/tv80_reg.v
 
 # TV80_REFRESH: real Z80 I/R (memory-refresh) register behavior -- must
-# match the Quartus build (Arcade-Z80-3D.qsf's VERILOG_MACRO) so sim results
-# stay representative of hardware. See Arcade-Z80-3D.qsf's comment: without
+# match the Quartus build (Arcade-SegaVCO.qsf's VERILOG_MACRO) so sim results
+# stay representative of hardware. See Arcade-SegaVCO.qsf's comment: without
 # this, `LD A,R` is hardcoded to 0, which broke Buck Rogers' sub-CPU
 # star-field LFSR (it seeds from R).
 VFLAGS = --cc --exe --build -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-CASEINCOMPLETE \
@@ -40,7 +40,7 @@ all: obj_dir/V$(TOP)
 obj_dir/V$(TOP): $(SOURCES) tb_z80_3d.cpp
 	$(VERILATOR) $(VFLAGS) $(SOURCES) tb_z80_3d.cpp
 
-# z80_3d.v does $readmemh("roms/palette_buckrog.hex", ...) relative to the
+# segavco.v does $readmemh("roms/palette_buckrog.hex", ...) relative to the
 # repo root, so the built binary must be run with cwd = repo root, not sim/.
 run: obj_dir/V$(TOP) buckrogn.rom
 	mkdir -p out
@@ -65,7 +65,7 @@ clean:
 .PHONY: all run dump clean
 
 # ---------------------------------------------------------------------------
-# Discrete-audio harness (rtl/audio -> WAV). Independent of the z80_3d rules
+# Discrete-audio harness (rtl/audio -> WAV). Independent of the segavco rules
 # above: separate obj dir, separate output dir, separate target names, so
 # `make` / `make run` keep meaning exactly what they always meant.
 #

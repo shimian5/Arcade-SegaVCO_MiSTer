@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify every RTL source on disk is listed in the Quartus project file.
 
-Quartus needs each file named explicitly in Arcade-Z80-3D.qsf, while the
+Quartus needs each file named explicitly in Arcade-SegaVCO.qsf, while the
 Verilator harnesses glob the directory. That asymmetry silently bites: a new
 channel simulates perfectly and then fails to synthesise, and the gap is only
 found at compile time.
@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-QSF = REPO / "Arcade-Z80-3D.qsf"
+QSF = REPO / "Arcade-SegaVCO.qsf"
 
 # Directories whose contents must appear in the qsf. tv80 is vendored and
 # already listed file-by-file; pll is pulled in via pll.qip.

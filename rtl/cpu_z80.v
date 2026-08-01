@@ -118,7 +118,7 @@ module cpu_z80
             // the ungated tv80s does (there T3 is one clock). Under `cen`
             // T3 lasts 8 core clocks and this ran on all of them, so
             // last-write-wins latched di long after iorq_n_r had been
-            // driven back high -- i.e. after z80_3d.v's
+            // driven back high -- i.e. after segavco.v's
             // `~sub_iorq_n ? ppi0_pa : memory` mux reverted to memory.
             if (tstate_w[2] && !ts3_d && wait_n == 1'b1 && !write_w && !no_read_w)
                 di_reg <= di;

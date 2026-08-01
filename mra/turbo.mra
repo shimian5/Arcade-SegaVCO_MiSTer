@@ -3,7 +3,7 @@
   <setname>turbo</setname>
   <year>1981</year>
   <manufacturer>Sega</manufacturer>
-  <rbf>Arcade-Z80-3D</rbf>
+  <rbf>Arcade-SegaVCO</rbf>
   <rom index="0" zip="turbo.zip" md5="none">
     <!-- maincpu @ 0x000000, 0x8000 bytes -->
     <part name="epr-1513.cpu-ic76" crc="0326adfc"/>

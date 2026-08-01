@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate MRA files for the Z80-3D core from the ROM lists transcribed out of
+"""Generate MRA files for the SegaVCO core from the ROM lists transcribed out of
 docs/reference/turbo.cpp's ROM_START blocks.
 
 Each game's ROM regions are laid out at fixed offsets in the ioctl download
@@ -101,7 +101,7 @@ def build_mra(game):
   <setname>{game["setname"]}</setname>
   <year>{game["year"]}</year>
   <manufacturer>{game["manufacturer"]}</manufacturer>
-  <rbf>Arcade-Z80-3D</rbf>
+  <rbf>Arcade-SegaVCO</rbf>
 {rom_xml}
 {dip_xml}
 </misterromdescription>

@@ -3,7 +3,7 @@
   <setname>buckrog</setname>
   <year>1982</year>
   <manufacturer>Sega</manufacturer>
-  <rbf>Arcade-Z80-3D</rbf>
+  <rbf>Arcade-SegaVCO</rbf>
   <rom index="0" zip="buckrog.zip" md5="none">
     <!-- maincpu @ 0x000000, 0x8000 bytes -->
     <part name="epr-5265.cpu-ic3" crc="f0055e97"/>
@@ -49,7 +49,7 @@
   </rom>
 
   <!--
-    Button names, in "J1,..." order from Arcade-Z80-3D.sv: the named buttons
+    Button names, in "J1,..." order from Arcade-SegaVCO.sv: the named buttons
     start at joystick bit [4], so [4]=Fire, [5]=Accel Fast, [6]=Accel Slow,
     [7]=Start, [8]=Coin. Start and Coin are last by convention, and P2 reads
     its own controller's copies of those same two positions.

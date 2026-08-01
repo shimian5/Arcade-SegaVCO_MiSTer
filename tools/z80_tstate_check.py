@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Check TV80's measured per-instruction T-state costs (sim/out/optrace.txt,
-produced by rtl/z80_3d.v's OPTRACE probe under SIM_DEBUG_TRACE) against the
+produced by rtl/segavco.v's OPTRACE probe under SIM_DEBUG_TRACE) against the
 real Zilog Z80 timing tables.
 
 Each OPTRACE line is one M1 opcode-fetch event: "frame=N pc=XXXX op=XX

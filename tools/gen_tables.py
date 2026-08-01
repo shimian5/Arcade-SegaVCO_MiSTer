@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the sprite X-scale and palette lookup tables for the Z80-3D core.
+"""Generate the sprite X-scale and palette lookup tables for the SegaVCO core.
 
 Both tables replace floating-point maths that the real hardware did in the analog
 domain and that MAME does with doubles at runtime. We precompute them once here

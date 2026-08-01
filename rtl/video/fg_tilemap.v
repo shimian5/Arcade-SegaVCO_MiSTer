@@ -18,7 +18,7 @@
 // native-pixel boundary -- those fields disagree by one native pixel, which
 // renders the leftmost pixel of the wrong (neighbouring) tile column. To
 // avoid that, xx/y are captured once at stage 1 and threaded through a delay
-// chain so every stage consumes the SAME (xx,y) sample. z80_3d.v
+// chain so every stage consumes the SAME (xx,y) sample. segavco.v
 // delay-matches hblank/vblank/hsync/vsync/ce_pix by the same total pipeline
 // depth (this module's 4, plus its own color-table and palette lookups) so
 // the sync bundle stays aligned with the pixel data it describes. See

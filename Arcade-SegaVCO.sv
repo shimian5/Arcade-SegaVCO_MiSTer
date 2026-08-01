@@ -60,7 +60,7 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"Z80-3D;;",
+	"SegaVCO;;",
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"-;",
@@ -174,7 +174,7 @@ wire [7:0] in0 = {~joystick_0[3], ~joystick_0[2], ~joystick_0[6], ~joystick_0[5]
 wire [7:0] in1 = {~joystick_0[8], ~joystick_1[8], 1'b1, 1'b1, ~joystick_0[7], ~joystick_0[4], ~joystick_0[0], ~joystick_0[1]};
 
 // DSW assembly. Bit positions are buckrog's DSW1/DSW2 as read through
-// port_2_r/port_3_r (the 4-bit bitswaps live in rtl/z80_3d.v, not here).
+// port_2_r/port_3_r (the 4-bit bitswaps live in rtl/segavco.v, not here).
 //
 // SW1:7, SW1:8, "Accel by", "Difficulty" and "Cabinet" are INVERTED: their
 // factory setting is a 1 bit (DSW1 = 0xC0, DSW2 = 0x92 per
@@ -239,7 +239,7 @@ wire [7:0] video_r, video_g, video_b;
 // Sound board output, straight from the discrete model in rtl/audio.
 wire signed [15:0] audio_l, audio_r;
 
-z80_3d z80_3d
+segavco segavco
 (
 	.clk(clk_sys),
 	.reset(reset),

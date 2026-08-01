@@ -1,11 +1,11 @@
-// Verilator testbench for rtl/z80_3d.v (phase 1a/1b/1c).
+// Verilator testbench for rtl/segavco.v (phase 1a/1b/1c).
 //
 // Loads a flat ROM blob (built by sim/build_rom.py, same layout rom_download.v
 // expects) via the ioctl_download port, free-runs the core, and dumps one PPM
 // per frame for the 512x224 active area -- for diffing against
 // `mame buckrogn -snapshot` (see docs/PLAN.md "Verilator frame diff").
 //
-// Phase 1c: drives IN0/IN1/DSW1/DSW2 directly (z80_3d.v's top-level ports,
+// Phase 1c: drives IN0/IN1/DSW1/DSW2 directly (segavco.v's top-level ports,
 // not through the HPS/OSD machinery Arcade-Z80-3D.sv uses on real hardware)
 // and pulses coin-in then start1 partway through the run, to exercise the
 // sub CPU/bitmap/mixer path far enough to reach actual gameplay instead of
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 #include "verilated.h"
-#include "Vz80_3d.h"
+#include "Vsegavco.h"
 
 static const int HTOTAL = 640, VTOTAL = 264;
 static const int ACTIVE_W = 512, ACTIVE_H = 224;
@@ -58,7 +58,7 @@ static void write_wav(const std::string &path, const std::vector<int16_t> &sampl
     fclose(f);
 }
 
-static void tick(Vz80_3d *top)
+static void tick(Vsegavco *top)
 {
     top->clk = 1; top->eval();
     main_time++;
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
     // Phase0-1a sprite debug harness: --dumpframe N dumps the real-time
     // sprite_engine outputs (sprbits/plb) for every active pixel of frame N
     // to sim/out/dbg_rtl_spr.bin, 512*224*5 bytes (sprbits LE32 + plb byte),
-    // in raster order -- see rtl/z80_3d.v's VERILATOR_SIM dbg_* ports and
+    // in raster order -- see rtl/segavco.v's VERILATOR_SIM dbg_* ports and
     // rtl/video/sprite_engine.v's matching dbg_rtl_levels.txt dump. Frame
     // numbering here (tb's own `frame` counter, below) is driven by the same
     // hpos/vpos wraps sprite_engine.v's dbg_cur_frame counts, so the two are
@@ -178,7 +178,7 @@ int main(int argc, char **argv)
     if (fread(rom.data(), 1, rom_size, rf) != (size_t)rom_size) { fprintf(stderr, "short read\n"); return 1; }
     fclose(rf);
 
-    Vz80_3d *top = new Vz80_3d;
+    Vsegavco *top = new Vsegavco;
 
     // Reset. IN0/IN1 idle-high (active low, no buttons pressed); DSW1 = 0
     // (default coinage), DSW2 = 0x80 (Upright, MAME's real default).
@@ -221,7 +221,7 @@ int main(int argc, char **argv)
     // dbg_hpos/dbg_vpos ports every ce_pix. See the RASTER ALIGNMENT report
     // printed at the end of the run.
     //
-    // MEASURED (not assumed) relationship: `top->ce_pix` is z80_3d.v's
+    // MEASURED (not assumed) relationship: `top->ce_pix` is segavco.v's
     // *delayed* ce_pix (ce_pix_pipe[VIDEO_PIPE_LATENCY-1], deliberately
     // re-timed to line up with rgb_reg), and this tb's x/y only advance when
     // that delayed pulse fires -- so the lag between tb's (x,y) and the RTL's
@@ -237,7 +237,7 @@ int main(int argc, char **argv)
     // the wrap (one delay line over the coordinate pair, not two independent
     // per-axis offsets). VIDEO_PIPE_LATENCY became 9 when the fg-tier/
     // sprite/star-bg mixer paths were re-timed from a 6-clk/1.5-pixel common
-    // depth to an 8-clk/2-pixel one (see z80_3d.v's SPR_TO_MIX_DELAY
+    // depth to an 8-clk/2-pixel one (see segavco.v's SPR_TO_MIX_DELAY
     // comment) -- naively that predicts lag 4+(9-7)=6, but re-measuring the
     // same way gives 5, not 6 (RASTER_ALIGNMENT confirms 0/N deviations at
     // 5). Re-derive by measurement, don't extrapolate, whenever
