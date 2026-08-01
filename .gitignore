@@ -43,6 +43,6 @@ sim/obj_dir_audio/
 sim/out/
 sim/*.rom
 
-# derived from buckrog_cabinet_recording.mp4, regenerate with the ffmpeg
-# command in docs/hardware-audio.md rather than committing 3.4 MB of PCM
-docs/reference/buckrog_cabinet_audio.wav
+# design notes, schematics, datasheets, MAME source references, cabinet
+# recordings - working material for this repo, not part of the release
+docs/
