@@ -31,11 +31,24 @@ module exp_chan (
 
     // ---------------------------------------------------------------
     // Fixed-point conventions, identical to fire_chan.sv / alarm_chan.sv:
-    //   envelope / filter state: signed [31:0], SCALE = 4096*256 =
+    //   envelope / filter state: signed [26:0] (27-bit), SCALE = 4096*256 =
     //   1,048,576 LSB/V (same units for both the envelope caps and the
     //   V2 control-voltage LUT index, so no conversion is needed between
     //   them -- see fire_chan.sv's v2_scaled for precedent).
     //   fs = clk_sys/832 = 39,935,064/832 = 47,998.875 Hz.
+    //
+    // WIDTH CHOICE -- see docs/audio-rtl-design.md "DSP block budget": every
+    // coefficient/state operand that feeds a multiply here is 27 bits, not
+    // 32. Cyclone V DSP blocks natively do 27x27; a 32-bit operand needs 2
+    // DSP blocks (or gets decomposed into 18x18 sub-multiplies) AND defeats
+    // packing the multiplier's output register into the DSP, forcing a
+    // soft-logic adder tree afterward. Derived bounds: this file's own
+    // RUMBLE_A1_Q24 (33,237,369) is the worst-case Q24 coefficient across
+    // both HIT and EXP and needs 26 bits signed; filter states at this
+    // design's voltage scale need ~24 bits signed (rails -6.00/+4.50 V *
+    // 1,048,576 LSB/V < 2^23). Both fit in 27 bits with margin, which is
+    // also the DSP's native operand width. VCA gain values (from
+    // VCA_GAIN_LUT, max 292,739) get their own narrower signed [20:0].
     // ---------------------------------------------------------------
     // SCALE = 1,048,576 LSB/V; folded directly into the localparam
     // constants below (VLOW_SCALED, VHIGH_SCALED, V2_MIN/MAX_SCALED)
@@ -107,38 +120,40 @@ module exp_chan (
     //   codes, -371/-80, land at +0.229%/-0.696%, i.e. worse, confirming
     //   these are the nearest representable codes.)
     // ---------------------------------------------------------------
-    localparam signed [31:0] VLOW_SCALED  = 32'sd838861;   // 0.8V * SCALE
-    localparam signed [31:0] VHIGH_SCALED = 32'sd5242880;  // 5.0V * SCALE
+    localparam signed [26:0] VLOW_SCALED  = 27'sd838861;   // 0.8V * SCALE
+    localparam signed [26:0] VHIGH_SCALED = 27'sd5242880;  // 5.0V * SCALE
 
-    localparam signed [31:0] A_CRACK_DISCHARGE_Q16  = 32'sd65400;
-    localparam signed [31:0] B_CRACK_DISCHARGE_Q16  = 32'sd136;   // 65536 - A
-    localparam signed [31:0] A_RUMBLE_DISCHARGE_Q16 = 32'sd64224;
-    localparam signed [31:0] B_RUMBLE_DISCHARGE_Q16 = 32'sd1312;  // 65536 - A
+    localparam signed [26:0] A_CRACK_DISCHARGE_Q16  = 27'sd65400;
+    localparam signed [26:0] B_CRACK_DISCHARGE_Q16  = 27'sd136;   // 65536 - A
+    localparam signed [26:0] A_RUMBLE_DISCHARGE_Q16 = 27'sd64224;
+    localparam signed [26:0] B_RUMBLE_DISCHARGE_Q16 = 27'sd1312;  // 65536 - A
 
-    localparam signed [63:0] A_CRACK_RECHARGE_Q24  = 64'sd16776844;
-    localparam signed [63:0] B_CRACK_RECHARGE_Q24  = 64'sd372;      // 16777216 - A
-    localparam signed [63:0] A_RUMBLE_RECHARGE_Q24 = 64'sd16777137;
-    localparam signed [63:0] B_RUMBLE_RECHARGE_Q24 = 64'sd79;       // 16777216 - A
+    localparam signed [26:0] A_CRACK_RECHARGE_Q24  = 27'sd16776844;
+    localparam signed [26:0] B_CRACK_RECHARGE_Q24  = 27'sd372;      // 16777216 - A
+    localparam signed [26:0] A_RUMBLE_RECHARGE_Q24 = 27'sd16777137;
+    localparam signed [26:0] B_RUMBLE_RECHARGE_Q24 = 27'sd79;       // 16777216 - A
 
-    logic signed [31:0] env_crack, env_crack_next;
-    logic signed [31:0] env_rumble, env_rumble_next;
+    logic signed [26:0] env_crack, env_crack_next;
+    logic signed [26:0] env_rumble, env_rumble_next;
 
-    wire signed [63:0] crack_dis_sum = 64'(A_CRACK_DISCHARGE_Q16) * 64'(env_crack)
-                                      + 64'(B_CRACK_DISCHARGE_Q16) * 64'(VLOW_SCALED);
-    wire signed [63:0] crack_rec_sum = A_CRACK_RECHARGE_Q24 * 64'(env_crack)
-                                      + B_CRACK_RECHARGE_Q24 * 64'(VHIGH_SCALED);
-    assign env_crack_next = q_a ? crack_dis_sum[47:16] : crack_rec_sum[55:24];
+    // Products are 27x27 -> 54-bit (not 64): one coefficient operand times
+    // one state operand, both narrowed to the DSP's native 27-bit width.
+    wire signed [53:0] crack_dis_sum = A_CRACK_DISCHARGE_Q16 * env_crack
+                                      + B_CRACK_DISCHARGE_Q16 * VLOW_SCALED;
+    wire signed [53:0] crack_rec_sum = A_CRACK_RECHARGE_Q24 * env_crack
+                                      + B_CRACK_RECHARGE_Q24 * VHIGH_SCALED;
+    assign env_crack_next = q_a ? 27'(crack_dis_sum >>> 16) : 27'(crack_rec_sum >>> 24);
 
-    wire signed [63:0] rumble_dis_sum = 64'(A_RUMBLE_DISCHARGE_Q16) * 64'(env_rumble)
-                                       + 64'(B_RUMBLE_DISCHARGE_Q16) * 64'(VLOW_SCALED);
-    wire signed [63:0] rumble_rec_sum = A_RUMBLE_RECHARGE_Q24 * 64'(env_rumble)
-                                       + B_RUMBLE_RECHARGE_Q24 * 64'(VHIGH_SCALED);
-    assign env_rumble_next = q_b ? rumble_dis_sum[47:16] : rumble_rec_sum[55:24];
+    wire signed [53:0] rumble_dis_sum = A_RUMBLE_DISCHARGE_Q16 * env_rumble
+                                       + B_RUMBLE_DISCHARGE_Q16 * VLOW_SCALED;
+    wire signed [53:0] rumble_rec_sum = A_RUMBLE_RECHARGE_Q24 * env_rumble
+                                       + B_RUMBLE_RECHARGE_Q24 * VHIGH_SCALED;
+    assign env_rumble_next = q_b ? 27'(rumble_dis_sum >>> 16) : 27'(rumble_rec_sum >>> 24);
 
     // Control voltage = (5.0 + Vcap) / 2, fed directly (no inversion) into
     // the VCA LUT below.
-    wire signed [31:0] v2_crack_scaled  = (VHIGH_SCALED + env_crack)  >>> 1;
-    wire signed [31:0] v2_rumble_scaled = (VHIGH_SCALED + env_rumble) >>> 1;
+    wire signed [26:0] v2_crack_scaled  = (VHIGH_SCALED + env_crack)  >>> 1;
+    wire signed [26:0] v2_rumble_scaled = (VHIGH_SCALED + env_rumble) >>> 1;
 
     // ---------------------------------------------------------------
     // Stage 3: MC3340 VCA gain LUT -- identical table, indexing and
@@ -160,12 +175,16 @@ module exp_chan (
         32'd9
     };
 
-    localparam signed [31:0] V2_MIN_SCALED = 32'sd2097152;      // 2.0V * SCALE
-    localparam signed [31:0] V2_MAX_SCALED = 32'sd6291455;      // 6.0V * SCALE - 1
+    localparam signed [26:0] V2_MIN_SCALED = 27'sd2097152;      // 2.0V * SCALE
+    localparam signed [26:0] V2_MAX_SCALED = 27'sd6291455;      // 6.0V * SCALE - 1
 
-    function automatic logic signed [31:0] vca_lut_lookup(input logic signed [31:0] v2_in);
-        logic signed [31:0] v2_clamped;
-        logic        [31:0] v2_off;
+    // Gain values top out at 292,739 (19 bits unsigned) -- signed [20:0]
+    // holds them with margin; this multiply was already small enough not
+    // to be a DSP-budget driver, but the return path is narrowed too so it
+    // doesn't force a wide operand on whatever multiplies it downstream.
+    function automatic logic signed [20:0] vca_lut_lookup(input logic signed [26:0] v2_in);
+        logic signed [26:0] v2_clamped;
+        logic        [26:0] v2_off;
         logic        [6:0]  lut_idx;
         logic        [15:0] lut_frac;
         logic        [31:0] gain_lo, gain_hi;
@@ -179,13 +198,10 @@ module exp_chan (
             lut_frac = v2_off[15:0];
             gain_lo  = VCA_GAIN_LUT[lut_idx];
             gain_hi  = VCA_GAIN_LUT[lut_idx + 7'd1];
-            gain_interp_prod = 64'($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * 64'($signed({16'd0, lut_frac}));
-            vca_lut_lookup = 32'($signed({1'b0, gain_lo}) + gain_interp_prod[47:16]);
+            gain_interp_prod = ($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * $signed({1'b0, lut_frac});
+            vca_lut_lookup = 21'($signed({1'b0, gain_lo}) + gain_interp_prod[47:16]);
         end
     endfunction
-
-    wire signed [31:0] vca_gain_crack  = vca_lut_lookup(v2_crack_scaled);
-    wire signed [31:0] vca_gain_rumble = vca_lut_lookup(v2_rumble_scaled);
 
     // ---------------------------------------------------------------
     // Stage 4: shaping filters on noise_b, standard RBJ 2-pole biquads
@@ -236,66 +252,165 @@ module exp_chan (
     // constants must be regenerated by the formula above rather than by
     // editing the parameter. The parameter is retained only to document the
     // Q the constants were built at.
-    localparam signed [31:0] CRACK_B0_Q24 =  32'sd15006246; // +0.894441964
-    localparam signed [31:0] CRACK_B1_Q24 = -32'sd30012492; // -1.788883929
-    localparam signed [31:0] CRACK_B2_Q24 =  32'sd15006246; // +0.894441964
-    localparam signed [31:0] CRACK_A1_Q24 = -32'sd29825028; // -1.777710217
-    localparam signed [31:0] CRACK_A2_Q24 =  32'sd13422740; // +0.800057641
+    localparam signed [26:0] CRACK_B0_Q24 =  27'sd15006246; // +0.894441964
+    localparam signed [26:0] CRACK_B1_Q24 = -27'sd30012492; // -1.788883929
+    localparam signed [26:0] CRACK_B2_Q24 =  27'sd15006246; // +0.894441964
+    localparam signed [26:0] CRACK_A1_Q24 = -27'sd29825028; // -1.777710217
+    localparam signed [26:0] CRACK_A2_Q24 =  27'sd13422740; // +0.800057641
 
-    localparam signed [31:0] RUMBLE_B0_Q24 =  32'sd13175;      // +0.000785275
-    localparam signed [31:0] RUMBLE_B1_Q24 =  32'sd26349;      // +0.001570550
-    localparam signed [31:0] RUMBLE_B2_Q24 =  32'sd13175;      // +0.000785275
-    localparam signed [31:0] RUMBLE_A1_Q24 = -32'sd33237369;   // -1.981101551
-    localparam signed [31:0] RUMBLE_A2_Q24 =  32'sd16481232;   // +0.982357991
+    localparam signed [26:0] RUMBLE_B0_Q24 =  27'sd13175;      // +0.000785275
+    localparam signed [26:0] RUMBLE_B1_Q24 =  27'sd26349;      // +0.001570550
+    localparam signed [26:0] RUMBLE_B2_Q24 =  27'sd13175;      // +0.000785275
+    localparam signed [26:0] RUMBLE_A1_Q24 = -27'sd33237369;   // -1.981101551
+    localparam signed [26:0] RUMBLE_A2_Q24 =  27'sd16481232;   // +0.982357991
 
     // noise_b, scaled from the audio SCALE (4096 LSB/V) to the filter
     // SCALE (4096*256 LSB/V), same convention as fire_chan's noise_scaled.
-    wire signed [31:0] noise_scaled = {{16{noise_b[15]}}, noise_b} <<< 8;
+    // Sign-extend and shift in a full-width wire FIRST (per fire_chan.sv's
+    // header note: a bare multiply/shift isn't context-widened by a narrow
+    // assignment target), then cast down to 27 bits -- the shifted value
+    // only ever needs ~24 bits, so the cast is a safe truncation, not a
+    // silent overflow.
+    wire signed [31:0] noise_ext    = {{16{noise_b[15]}}, noise_b};
+    wire signed [26:0] noise_scaled = 27'(noise_ext <<< 8);
 
-    logic signed [31:0] crack_x1, crack_x2, crack_y1, crack_y2;
-    logic signed [31:0] rumble_x1, rumble_x2, rumble_y1, rumble_y2;
+    logic signed [26:0] crack_x1, crack_x2, crack_y1, crack_y2;
+    logic signed [26:0] rumble_x1, rumble_x2, rumble_y1, rumble_y2;
+    logic signed [26:0] crack_y_next, rumble_y_next;
 
-    wire signed [63:0] crack_acc =
-          64'(CRACK_B0_Q24) * 64'(noise_scaled)
-        + 64'(CRACK_B1_Q24) * 64'(crack_x1)
-        + 64'(CRACK_B2_Q24) * 64'(crack_x2)
-        - 64'(CRACK_A1_Q24) * 64'(crack_y1)
-        - 64'(CRACK_A2_Q24) * 64'(crack_y2);
-    wire signed [31:0] crack_y_next = crack_acc[55:24];
+    // ---------------------------------------------------------------
+    // PIPELINED -- this file used to run the whole crack/rumble biquad ->
+    // atten -> VCA -> output-gain -> sum tail as one combinational cloud
+    // between sample_ce edges, the same five-term mixed add/subtract MAC
+    // shape that produced a genuine 98-node COMBINATIONAL LOOP in
+    // rebound_chan.sv under real Quartus synthesis (not just a deep-but-
+    // acyclic timing violation). See docs/audio-rtl-design.md, "Real
+    // hardware sounded like static" and "DSP block budget". Same discipline
+    // as ship_chan.sv/rebound_chan.sv/fire_chan.sv/hit_chan.sv: one multiply
+    // per register-to-register hop, free-running on `clk` (832 clk_sys
+    // cycles exist per audio sample, so a 6-deep pipeline is inaudible).
+    // Every bit-select that feeds a later multiply or shift is first routed
+    // through its own signed-declared wire, and every product is narrowed
+    // (27x27 -> 54-bit, 27x21 -> 48-bit) rather than left at 64 bits --
+    // see this file's header note above and hit_chan.sv's for why both
+    // matter to the DSP budget, not just correctness.
+    // ---------------------------------------------------------------
 
-    wire signed [63:0] rumble_acc =
-          64'(RUMBLE_B0_Q24) * 64'(noise_scaled)
-        + 64'(RUMBLE_B1_Q24) * 64'(rumble_x1)
-        + 64'(RUMBLE_B2_Q24) * 64'(rumble_x2)
-        - 64'(RUMBLE_A1_Q24) * 64'(rumble_y1)
-        - 64'(RUMBLE_A2_Q24) * 64'(rumble_y2);
-    wire signed [31:0] rumble_y_next = rumble_acc[55:24];
+    // Pipe stage 0 (every clk): the ten biquad products (five per leg) and
+    // the two VCA lookups share a stage; none depends on another's result
+    // this cycle.
+    logic signed [53:0] e0_crack_b0, e0_crack_b1, e0_crack_b2, e0_crack_a1, e0_crack_a2;
+    logic signed [53:0] e0_rumble_b0, e0_rumble_b1, e0_rumble_b2, e0_rumble_a1, e0_rumble_a2;
+    logic signed [20:0] e0_vca_gain_crack, e0_vca_gain_rumble;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            e0_crack_b0 <= '0; e0_crack_b1 <= '0; e0_crack_b2 <= '0;
+            e0_crack_a1 <= '0; e0_crack_a2 <= '0;
+            e0_rumble_b0 <= '0; e0_rumble_b1 <= '0; e0_rumble_b2 <= '0;
+            e0_rumble_a1 <= '0; e0_rumble_a2 <= '0;
+            e0_vca_gain_crack <= '0; e0_vca_gain_rumble <= '0;
+        end else begin
+            e0_crack_b0 <= CRACK_B0_Q24 * noise_scaled;
+            e0_crack_b1 <= CRACK_B1_Q24 * crack_x1;
+            e0_crack_b2 <= CRACK_B2_Q24 * crack_x2;
+            e0_crack_a1 <= CRACK_A1_Q24 * crack_y1;
+            e0_crack_a2 <= CRACK_A2_Q24 * crack_y2;
+
+            e0_rumble_b0 <= RUMBLE_B0_Q24 * noise_scaled;
+            e0_rumble_b1 <= RUMBLE_B1_Q24 * rumble_x1;
+            e0_rumble_b2 <= RUMBLE_B2_Q24 * rumble_x2;
+            e0_rumble_a1 <= RUMBLE_A1_Q24 * rumble_y1;
+            e0_rumble_a2 <= RUMBLE_A2_Q24 * rumble_y2;
+
+            e0_vca_gain_crack  <= vca_lut_lookup(v2_crack_scaled);
+            e0_vca_gain_rumble <= vca_lut_lookup(v2_rumble_scaled);
+        end
+    end
+
+    // Pipe stage 1: sum the five products per leg (cheap add/sub) ->
+    // crack_y_next / rumble_y_next.
+    logic signed [20:0] e1_vca_gain_crack, e1_vca_gain_rumble;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            crack_y_next  <= '0;
+            rumble_y_next <= '0;
+            e1_vca_gain_crack  <= '0;
+            e1_vca_gain_rumble <= '0;
+        end else begin
+            crack_y_next  <= 27'((e0_crack_b0 + e0_crack_b1 + e0_crack_b2 - e0_crack_a1 - e0_crack_a2) >>> 24);
+            rumble_y_next <= 27'((e0_rumble_b0 + e0_rumble_b1 + e0_rumble_b2 - e0_rumble_a1 - e0_rumble_a2) >>> 24);
+            e1_vca_gain_crack  <= e0_vca_gain_crack;
+            e1_vca_gain_rumble <= e0_vca_gain_rumble;
+        end
+    end
 
     // ---------------------------------------------------------------
     // Stage 5: input attenuator 0.2481 on both VCA inputs, x VCA gain,
     // output gains -2.136 (crack) / -4.700 (rumble), sum, saturate.
     // ---------------------------------------------------------------
-    localparam signed [31:0] ATTEN_Q16          = 32'sd16261;   // 0.2481 * 65536
-    localparam signed [31:0] OUT_GAIN_CRACK_Q16  = -32'sd140004; // -2.136 * 65536
-    localparam signed [31:0] OUT_GAIN_RUMBLE_Q16 = -32'sd308019; // -4.700 * 65536
+    localparam signed [26:0] ATTEN_Q16          = 27'sd16261;   // 0.2481 * 65536
+    localparam signed [26:0] OUT_GAIN_CRACK_Q16  = -27'sd140004; // -2.136 * 65536
+    localparam signed [26:0] OUT_GAIN_RUMBLE_Q16 = -27'sd308019; // -4.700 * 65536
 
-    wire signed [63:0] crack_atten_prod  = 64'(ATTEN_Q16) * 64'(crack_y_next);
-    wire signed [31:0] crack_atten       = crack_atten_prod[47:16];
-    wire signed [63:0] rumble_atten_prod = 64'(ATTEN_Q16) * 64'(rumble_y_next);
-    wire signed [31:0] rumble_atten      = rumble_atten_prod[47:16];
+    // Pipe stage 2: the atten multiply, one per leg.
+    logic signed [53:0] e2_crack_atten_prod, e2_rumble_atten_prod;
+    logic signed [20:0] e2_vca_gain_crack, e2_vca_gain_rumble;
 
-    wire signed [63:0] crack_vca_prod  = 64'(crack_atten)  * 64'(vca_gain_crack);
-    wire signed [31:0] crack_vca       = crack_vca_prod[47:16];
-    wire signed [63:0] rumble_vca_prod = 64'(rumble_atten) * 64'(vca_gain_rumble);
-    wire signed [31:0] rumble_vca      = rumble_vca_prod[47:16];
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            e2_crack_atten_prod  <= '0;
+            e2_rumble_atten_prod <= '0;
+            e2_vca_gain_crack  <= '0;
+            e2_vca_gain_rumble <= '0;
+        end else begin
+            e2_crack_atten_prod  <= ATTEN_Q16 * crack_y_next;
+            e2_rumble_atten_prod <= ATTEN_Q16 * rumble_y_next;
+            e2_vca_gain_crack  <= e1_vca_gain_crack;
+            e2_vca_gain_rumble <= e1_vca_gain_rumble;
+        end
+    end
 
-    wire signed [63:0] crack_out_prod  = 64'(OUT_GAIN_CRACK_Q16)  * 64'(crack_vca);
-    wire signed [31:0] crack_out       = crack_out_prod[47:16];
-    wire signed [63:0] rumble_out_prod = 64'(OUT_GAIN_RUMBLE_Q16) * 64'(rumble_vca);
-    wire signed [31:0] rumble_out      = rumble_out_prod[47:16];
+    // Pipe stage 3: the VCA multiply itself, one per leg. 27x21 -> 48-bit.
+    wire signed [26:0] e2_crack_atten  = 27'(e2_crack_atten_prod  >>> 16);
+    wire signed [26:0] e2_rumble_atten = 27'(e2_rumble_atten_prod >>> 16);
 
-    wire signed [31:0] sum_full = crack_out + rumble_out;
-    wire signed [31:0] mix_full = sum_full >>> 8; // filter scale -> audio scale (4096 LSB/V)
+    logic signed [47:0] e3_crack_vca_prod, e3_rumble_vca_prod;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            e3_crack_vca_prod  <= '0;
+            e3_rumble_vca_prod <= '0;
+        end else begin
+            e3_crack_vca_prod  <= e2_crack_atten  * e2_vca_gain_crack;
+            e3_rumble_vca_prod <= e2_rumble_atten * e2_vca_gain_rumble;
+        end
+    end
+
+    // Pipe stage 4: the output-gain multiply, one per leg.
+    wire signed [26:0] e3_crack_vca  = 27'(e3_crack_vca_prod  >>> 16);
+    wire signed [26:0] e3_rumble_vca = 27'(e3_rumble_vca_prod >>> 16);
+
+    logic signed [53:0] e4_crack_out_prod, e4_rumble_out_prod;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            e4_crack_out_prod  <= '0;
+            e4_rumble_out_prod <= '0;
+        end else begin
+            e4_crack_out_prod  <= OUT_GAIN_CRACK_Q16  * e3_crack_vca;
+            e4_rumble_out_prod <= OUT_GAIN_RUMBLE_Q16 * e3_rumble_vca;
+        end
+    end
+
+    // Pipe stage 5 (below, alongside the rail clip): sum the two legs
+    // (cheap add) and register exp_mix.
+    wire signed [26:0] e4_crack_out  = 27'(e4_crack_out_prod  >>> 16);
+    wire signed [26:0] e4_rumble_out = 27'(e4_rumble_out_prod >>> 16);
+
+    wire signed [26:0] sum_full = e4_crack_out + e4_rumble_out;
+    wire signed [26:0] mix_full = sum_full >>> 8; // filter scale -> audio scale (4096 LSB/V)
 
     // IC25 OUTPUT RAILS -- a real clipping mechanism, not a format guard.
     //
@@ -331,19 +446,30 @@ module exp_chan (
         (mix_full < RAIL_LO) ? RAIL_LO[15:0] :
         mix_full[15:0];
 
+    // exp_mix free-runs on `clk`, same reasoning as the other three
+    // pipelined channels: by the time it is next read (the following
+    // sample_ce, at least ~826 clk_sys cycles after this one given the
+    // 6-stage pipeline above) it has long since settled.
+    always_ff @(posedge clk) begin
+        if (!rst_n) exp_mix <= 16'sd0;
+        else        exp_mix <= mix_sat;
+    end
+
+    // env_crack/env_rumble / crack_x1,x2,y1,y2 / rumble_x1,x2,y1,y2 remain
+    // sample_ce-gated: they are the recursive one-pole/filter states
+    // themselves and must only advance once per audio sample.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             env_crack  <= VHIGH_SCALED; // idle = cap fully charged = 5V = silent
             env_rumble <= VHIGH_SCALED;
-            crack_x1   <= 32'sd0;
-            crack_x2   <= 32'sd0;
-            crack_y1   <= 32'sd0;
-            crack_y2   <= 32'sd0;
-            rumble_x1  <= 32'sd0;
-            rumble_x2  <= 32'sd0;
-            rumble_y1  <= 32'sd0;
-            rumble_y2  <= 32'sd0;
-            exp_mix    <= 16'sd0;
+            crack_x1   <= 27'sd0;
+            crack_x2   <= 27'sd0;
+            crack_y1   <= 27'sd0;
+            crack_y2   <= 27'sd0;
+            rumble_x1  <= 27'sd0;
+            rumble_x2  <= 27'sd0;
+            rumble_y1  <= 27'sd0;
+            rumble_y2  <= 27'sd0;
         end else if (sample_ce) begin
             env_crack  <= env_crack_next;
             env_rumble <= env_rumble_next;
@@ -357,8 +483,6 @@ module exp_chan (
             rumble_x2  <= rumble_x1;
             rumble_y1  <= rumble_y_next;
             rumble_y2  <= rumble_y1;
-
-            exp_mix    <= mix_sat;
         end
     end
 

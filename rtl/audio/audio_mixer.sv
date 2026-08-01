@@ -32,7 +32,7 @@ module audio_mixer (
 
     wire signed [31:0] hit_ext = $signed({{16{hit_mix[15]}}, hit_mix});
 
-    wire signed [63:0] prod = 64'(sum_10k) * 64'(GAIN_10K) + 64'(hit_ext) * 64'(GAIN_5K1);
+    wire signed [63:0] prod = sum_10k * GAIN_10K + hit_ext * GAIN_5K1;
 
     wire signed [31:0] acc_shifted = prod[47:16];
 

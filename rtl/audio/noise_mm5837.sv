@@ -62,8 +62,8 @@ module noise_mm5837 #(
     wire signed [15:0] noise_raw = lfsr[17] ? NOISE_HALF : -NOISE_HALF;
 
     // widen to 64 bits so the >>>16 is a real Q0.16 fixed-point multiply
-    wire signed [63:0] prod_a = 64'(noise_raw) * 64'(GAIN_A);
-    wire signed [63:0] prod_b = 64'(noise_raw) * 64'(GAIN_B);
+    wire signed [63:0] prod_a = noise_raw * GAIN_A;
+    wire signed [63:0] prod_b = noise_raw * GAIN_B;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin

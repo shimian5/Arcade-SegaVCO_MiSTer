@@ -64,9 +64,12 @@ module ship_chan (
     // The extreme asymmetry is the point: a fast rise and a slow fall is what
     // makes the engine a lumpy putt rather than a hum.
     // ---------------------------------------------------------------
-    localparam signed [63:0] A_555_CH_Q24  = 64'sd16725893;  // tau 6.800 ms  (+0.0006%)
-    localparam signed [63:0] B_555_CH_Q24  = 64'sd51323;
-    localparam signed [63:0] A_555_DIS_Q24 = 64'sd16775468;  // tau 199.95 ms (-0.024%)
+    // Declared at 32 bits, not 64: both fit in ~25 bits, and a DSP-block
+    // multiplier is sized off the operand width Verilog presents to `*`.
+    // See docs/audio-rtl-design.md, "DSP block budget".
+    localparam signed [31:0] A_555_CH_Q24  = 32'sd16725893;  // tau 6.800 ms  (+0.0006%)
+    localparam signed [31:0] B_555_CH_Q24  = 32'sd51323;
+    localparam signed [31:0] A_555_DIS_Q24 = 32'sd16775468;  // tau 199.95 ms (-0.024%)
 
     localparam signed [39:0] V_CHG_TARGET = 40'sd191260262;  // 11.4 V * 2^24
     localparam signed [39:0] TH_HI_555    = 40'sd134217728;  //  8.0 V * 2^24
@@ -76,10 +79,10 @@ module ship_chan (
     logic signed [39:0] v_c12;
     logic               c12_charging;
 
-    wire signed [63:0] c12_chg_sum = A_555_CH_Q24 * 64'(v_c12)
-                                   + B_555_CH_Q24 * 64'(V_CHG_TARGET)
+    wire signed [63:0] c12_chg_sum = A_555_CH_Q24 * v_c12
+                                   + B_555_CH_Q24 * V_CHG_TARGET
                                    + 64'sd8388608;
-    wire signed [63:0] c12_dis_sum = A_555_DIS_Q24 * 64'(v_c12) + 64'sd8388608;
+    wire signed [63:0] c12_dis_sum = A_555_DIS_Q24 * v_c12 + 64'sd8388608;
 
     wire signed [39:0] v_c12_next = c12_charging ? 40'(c12_chg_sum >>> 24)
                                                  : 40'(c12_dis_sum >>> 24);
@@ -102,6 +105,17 @@ module ship_chan (
     // rather than step, faster at high throttle because the selected
     // resistance is lower. Full derivation and the whole 16-row table are in
     // the design doc.
+    //
+    // UNLIKE every other one-pole update in this design (one multiply, one
+    // constant term), this leaky integrator has TWO live multiplies summed in
+    // the same step -- acc_a*v_acc AND acc_b*acc_target, both operands
+    // register-fed, neither foldable to a constant. Timed as a single
+    // combinational cycle (as first written) that pair puts a Cyclone V build
+    // ~140 ns over the 25 ns clk_sys budget -- see the timing-closure note at
+    // the top of this file. Split across three clk_sys cycles instead of one:
+    // one multiply per cycle is the same budget every other channel's
+    // one-pole filters already run at, and 3 extra clk_sys ticks is nothing
+    // against the 832-tick sample period.
     // ---------------------------------------------------------------
     localparam logic signed [39:0] ACC_V_LUT [0:15] = '{
         40'sd0,         40'sd21883325,  40'sd50331648,  40'sd62984856,
@@ -120,12 +134,31 @@ module ship_chan (
     logic signed [39:0] v_acc;
 
     wire signed [39:0] acc_target = ACC_V_LUT[acc];
-    wire signed [63:0] acc_a      = 64'(ACC_A_LUT[acc]);
-    wire signed [63:0] acc_b      = 64'sd16777216 - acc_a;
+    wire signed [31:0] acc_a      = ACC_A_LUT[acc];
+    wire signed [31:0] acc_b      = 32'sd16777216 - acc_a;
 
-    wire signed [63:0] acc_sum = acc_a * 64'(v_acc) + acc_b * 64'(acc_target)
-                               + 64'sd8388608;
-    wire signed [39:0] v_acc_next = 40'(acc_sum >>> 24);
+    // Glide pipeline, one multiply per clk_sys cycle:
+    //   cyc 0 (every clk): form the two products
+    //   cyc 1: add them
+    //   cyc 2: shift down to Q24 -- this is v_acc_next, latched into v_acc at
+    //          the NEXT sample_ce (which is guaranteed at least 829 clk_sys
+    //          cycles away, since sample_ce itself only just fired to get here)
+    logic signed [63:0] acc_prod_a, acc_prod_b;
+    logic signed [63:0] acc_sum_r;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            acc_prod_a <= '0;
+            acc_prod_b <= '0;
+            acc_sum_r  <= '0;
+        end else begin
+            acc_prod_a <= acc_a * v_acc;
+            acc_prod_b <= acc_b * acc_target + 64'sd8388608;
+            acc_sum_r  <= acc_prod_a + acc_prod_b;
+        end
+    end
+
+    wire signed [39:0] v_acc_next = 40'(acc_sum_r >>> 24);
 
     // ---------------------------------------------------------------
     // Stage 3: the three VCOs. Each takes Vs/2 because that is where its
@@ -144,23 +177,24 @@ module ship_chan (
     wire signed [39:0] vs_half_tr4 = v_acc >>> 1;
 
     logic signed [39:0] vint_tr2, vint_tr4, vint_tr5;
+    logic               vint_tr2_ce, vint_tr4_ce, vint_tr5_ce;
 
     // R59 150K / C22 0.01uF / R58 68K
     relax_vco #(.K_UP_Q40(22133960), .K_DN_Q40(18354991)) u_tr2 (
         .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
-        .vs_half(vs_half_tr2), .vint_avg(vint_tr2)
+        .vs_half(vs_half_tr2), .vint_avg(vint_tr2), .vint_avg_ce(vint_tr2_ce)
     );
 
     // R112 100K / C64 0.0022uF / R114 51K
     relax_vco #(.K_UP_Q40(120239916), .K_DN_Q40(125147668)) u_tr4 (
         .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
-        .vs_half(vs_half_tr4), .vint_avg(vint_tr4)
+        .vs_half(vs_half_tr4), .vint_avg(vint_tr4), .vint_avg_ce(vint_tr4_ce)
     );
 
     // R116 150K / C66 0.033uF / R111 56K
     relax_vco #(.K_UP_Q40(9336413), .K_DN_Q40(5562119)) u_tr5 (
         .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
-        .vs_half(vs_half_tr5), .vint_avg(vint_tr5)
+        .vs_half(vs_half_tr5), .vint_avg(vint_tr5), .vint_avg_ce(vint_tr5_ce)
     );
 
     // ---------------------------------------------------------------
@@ -180,62 +214,108 @@ module ship_chan (
     logic signed [31:0] ac_tr2, ac_tr4, ac_tr5;   // 2^20 LSB/V
 
     // C65 2.2uF / R118 220K, tau = 0.484 s
+    //
+    // sample_ce here is u_tr2's vint_avg_ce, NOT the system sample_ce: this
+    // dc_block's x_in (vint_tr2) only becomes valid a few clk_sys cycles
+    // after the real sample_ce fires, so it must capture on the same
+    // delayed pulse relax_vco.sv used to publish that value.
     dc_block #(.A_Q24(16776494)) u_dc_tr2 (
-        .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
+        .clk(clk), .rst_n(rst_n), .sample_ce(vint_tr2_ce),
         .x_in(vint_tr2), .x_reset(TRI_MEAN), .y_out(ac_tr2)
     );
 
     // C56 2.2uF / R102 100K, tau = 0.220 s
     dc_block #(.A_Q24(16775627)) u_dc_tr4 (
-        .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
+        .clk(clk), .rst_n(rst_n), .sample_ce(vint_tr4_ce),
         .x_in(vint_tr4), .x_reset(TRI_MEAN), .y_out(ac_tr4)
     );
 
     // C59 2.2uF / R120 220K, tau = 0.484 s
     dc_block #(.A_Q24(16776494)) u_dc_tr5 (
-        .clk(clk), .rst_n(rst_n), .sample_ce(sample_ce),
+        .clk(clk), .rst_n(rst_n), .sample_ce(vint_tr5_ce),
         .x_in(vint_tr5), .x_reset(TRI_MEAN), .y_out(ac_tr5)
     );
 
     // ---------------------------------------------------------------
-    // Stage 5: IC26 sec.C, the audio summing amp. R118 and R120 are both
-    // 220 K into an R119 30 K feedback with + at the 6 V rail, so both
-    // oscillators get the same -30/220 = -0.136364. Peak when they align is
-    // +/-3.546 V * 0.136364 = +/-0.4836 V.
+    // Stages 5-8: audio sum -> VCA control leg -> MB4391 lookup -> VCA
+    // multiply -> SHIP ON gate -> IC28 output gain -> rail clip.
     //
-    // There is NO input attenuator between here and the VCA -- SHIP is the
-    // only channel without one.
+    // TIMING-CLOSURE NOTE. As first written this whole tail (five serial
+    // 64-bit multiplies: IC26's gain, IC22 sec.C's control gain, the MB4391
+    // LUT's interpolation, the VCA multiply itself, and IC28's output gain)
+    // was pure combinational logic between one sample_ce edge and the next,
+    // registered only once at the very end. A real Quartus build of this
+    // exact RTL came back with clk_sys (39.935 MHz, 25.04 ns period) missing
+    // setup by -142 ns on its worst path and -17.6 us of total negative slack
+    // -- Fmax on that domain restricted to 5.98 MHz. Verilator cannot show
+    // this: it evaluates a combinational cloud to its final value regardless
+    // of depth, so every scenario WAV and the full-game sim both sound
+    // correct while a real board latches whatever the flip-flops caught
+    // mid-settle -- which is what "solid static" is. SHIP has by far the
+    // longest chain of any channel (three VCOs feeding a 5-multiply serial
+    // tail vs. one or two multiplies elsewhere), which is why it was the
+    // worst-hit rather than merely mistuned.
+    //
+    // Fix: spread the tail over multiple clk_sys cycles, one multiply (or
+    // one cheap add/mux) per register-to-register hop, exactly the budget
+    // every other channel's one-pole filters already keep to. There are 832
+    // clk_sys cycles per audio sample and this pipeline is 5 deep, so the
+    // extra latency is inaudible and every intermediate register can simply
+    // free-run on `clk` -- the upstream values it is reading are already
+    // stable for hundreds of cycles either side of any one sample boundary.
     // ---------------------------------------------------------------
+
+    // IC26 sec.C, the audio summing amp -- R118/R120 both 220 K into an R119
+    // 30 K feedback with + at the 6 V rail: both oscillators get the same
+    // -30/220 = -0.136364. Peak when they align is +/-3.546 V * 0.136364 =
+    // +/-0.4836 V. There is NO input attenuator ahead of the VCA here -- SHIP
+    // is the only channel without one.
     localparam signed [31:0] IC26_GAIN_Q24 = -32'sd2287697;   // -30/220
 
-    wire signed [31:0] tri_sum = ac_tr2 + ac_tr5;
-
-    wire signed [63:0] vca_in_prod = 64'(IC26_GAIN_Q24) * 64'(tri_sum)
-                                   + 64'sd8388608;
-    wire signed [31:0] vca_in      = 32'(vca_in_prod >>> 24);
-
-    // ---------------------------------------------------------------
-    // Stage 6: IC22 sec.C, the VCA control leg. Inverting, R102 100 K in,
-    // R103 51 K feedback, + at 12 * 33/(100+33) = 2.977444 V from R106/R104
-    // with C57 33 uF decoupling -- the same reference FIRE uses.
-    //
+    // IC22 sec.C, the VCA control leg. Inverting, R102 100 K in, R103 51 K
+    // feedback, + at 12 * 33/(100+33) = 2.977444 V from R106/R104 with C57
+    // 33 uF decoupling -- the same reference FIRE uses.
     //   V2 = 2.977444 - 0.51 * Vtr4_ac,   Vtr4_ac = +/-1.773179 V
     //      -> V2 sweeps 2.0731 .. 3.8818 V
-    //
     // Against the MC3340 curve that is fully open (+13 dB) below 3.1 V and
-    // about 35 dB down at 3.88 V, open for 56.8% of the voltage swing. So this
-    // is a deep asymmetric CHOP at Tr4's frequency, not a gentle tremolo -- a
-    // ring modulator in all but name. Its rate tracks throttle; its depth does
-    // not move at all.
-    // ---------------------------------------------------------------
+    // about 35 dB down at 3.88 V, open for 56.8% of the voltage swing -- a
+    // deep asymmetric CHOP at Tr4's frequency, a ring modulator in all but
+    // name. Its rate tracks throttle; its depth does not move at all.
     localparam signed [31:0] CTRL_GAIN_Q24 = -32'sd8556380;  // -51/100
     localparam signed [31:0] VREF_SCALED   =  32'sd3122076;  // 2.977444 V * 2^20
 
-    wire signed [63:0] v2_prod = 64'(CTRL_GAIN_Q24) * 64'(ac_tr4) + 64'sd8388608;
-    wire signed [31:0] v2      = VREF_SCALED + 32'(v2_prod >>> 24);
+    // Pipe stage 0 (every clk): form the audio sum, the two multiplies feeding
+    // it and V2 are independent so they share a stage.
+    logic signed [31:0] p0_tri_sum;
+    logic signed [63:0] p0_vca_in_prod, p0_v2_prod;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            p0_tri_sum     <= '0;
+            p0_vca_in_prod <= '0;
+            p0_v2_prod     <= '0;
+        end else begin
+            p0_tri_sum     <= ac_tr2 + ac_tr5;
+            p0_vca_in_prod <= IC26_GAIN_Q24 * (ac_tr2 + ac_tr5) + 64'sd8388608;
+            p0_v2_prod     <= CTRL_GAIN_Q24 * ac_tr4 + 64'sd8388608;
+        end
+    end
+
+    // Pipe stage 1: shift both products down to their working scales.
+    logic signed [31:0] p1_vca_in, p1_v2;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            p1_vca_in <= '0;
+            p1_v2     <= VREF_SCALED;
+        end else begin
+            p1_vca_in <= 32'(p0_vca_in_prod >>> 24);
+            p1_v2     <= VREF_SCALED + 32'(p0_v2_prod >>> 24);
+        end
+    end
 
     // ---------------------------------------------------------------
-    // Stage 7: IC24 MB4391 (= two MC3340s). Identical table, indexing and
+    // IC24 MB4391 (= two MC3340s). Identical table, indexing and
     // interpolation as hit_chan.sv / rebound_chan.sv -- 65 points, V2 =
     // 2.0..6.0 V step 0.0625 V, gain in Q0.16 -- copied verbatim. C68 680 pF
     // on RO is negligible at audio rates and modelled as a wire.
@@ -256,6 +336,14 @@ module ship_chan (
     localparam signed [31:0] V2_MIN_SCALED = 32'sd2097152;      // 2.0V * 2^20
     localparam signed [31:0] V2_MAX_SCALED = 32'sd6291455;      // 6.0V * 2^20 - 1
 
+    // NOTE: a Verilog bit-select like `signal[47:16]` is ALWAYS UNSIGNED, even
+    // when `signal` itself is declared signed -- caught by instrumenting
+    // fire_chan.sv's identical VCA path and comparing against a hand trace,
+    // not visible from the RTL alone (see fire_chan.sv's header note on this
+    // function). Here `gain_interp_prod[47:16]` below is safe only because it
+    // feeds straight into a signed addition/assignment with no intervening
+    // `>>>` or width cast of its own -- if a future edit inserts one, route
+    // the bit-select through its own signed-declared wire first.
     function automatic logic signed [31:0] vca_lut_lookup(input logic signed [31:0] v2_in);
         logic signed [31:0] v2_clamped;
         logic        [31:0] v2_off;
@@ -272,18 +360,47 @@ module ship_chan (
             lut_frac = v2_off[15:0];
             gain_lo  = VCA_GAIN_LUT[lut_idx];
             gain_hi  = VCA_GAIN_LUT[lut_idx + 7'd1];
-            gain_interp_prod = 64'($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * 64'($signed({16'd0, lut_frac}));
+            gain_interp_prod = ($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * $signed({1'b0, lut_frac});
             vca_lut_lookup = 32'($signed({1'b0, gain_lo}) + gain_interp_prod[47:16]);
         end
     endfunction
 
-    wire signed [31:0] vca_gain = vca_lut_lookup(v2);
+    // Pipe stage 2: the LUT read + interpolation multiply (one multiply,
+    // inside the function), carrying vca_in forward alongside it.
+    logic signed [31:0] p2_vca_in, p2_vca_gain;
 
-    wire signed [63:0] vca_out_prod = 64'(vca_in) * 64'(vca_gain) + 64'sd32768;
-    wire signed [31:0] vca_out      = 32'(vca_out_prod >>> 16);
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            p2_vca_in   <= '0;
+            p2_vca_gain <= '0;
+        end else begin
+            p2_vca_in   <= p1_vca_in;
+            p2_vca_gain <= vca_lut_lookup(p1_v2);
+        end
+    end
+
+    // Pipe stage 3: the VCA multiply itself.
+    //
+    // NOTE: a bare multiply feeding straight into `>>>` with no other wide
+    // operand in the same expression is NOT context-widened by the eventual
+    // narrow assignment target the way a direct `wire signed[63:0] x = a*b;`
+    // is -- this was a real bug caught in rebound_chan.sv/fire_chan.sv (see
+    // their header notes) that silently truncated the product before the
+    // shift. The `+ 64'sd32768` rounding term below is what keeps this line
+    // safe: it is a 64-bit operand in the SAME expression as the multiply, so
+    // it forces the whole sum (multiply included) to be evaluated at 64 bits
+    // before the `>>>` and the final `32'(...)` cast narrow it. Don't drop
+    // that term, or split the multiply out into its own line, without first
+    // re-declaring it through an explicitly-wide wire.
+    logic signed [31:0] p3_vca_out;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) p3_vca_out <= '0;
+        else        p3_vca_out <= 32'((p2_vca_in * p2_vca_gain + 64'sd32768) >>> 16);
+    end
 
     // ---------------------------------------------------------------
-    // Stage 8: IC10 4066 gate and IC28 output amp.
+    // IC10 4066 gate and IC28 output amp.
     //
     // SHIP ON is an active-high LEVEL, not an edge, and the 4066 is a hard
     // gate with no ramp -- so the real board clicks when it switches. C10 and
@@ -293,13 +410,18 @@ module ship_chan (
     // ---------------------------------------------------------------
     localparam signed [31:0] OUT_GAIN_Q16 = -32'sd144179;   // -R125/R124 = -2.200
 
-    wire signed [31:0] gated = ship_on ? vca_out : 32'sd0;
+    wire signed [31:0] p3_gated = ship_on ? p3_vca_out : 32'sd0;
 
-    wire signed [63:0] out_prod = 64'(OUT_GAIN_Q16) * 64'(gated) + 64'sd32768;
-    wire signed [31:0] out_20   = 32'(out_prod >>> 16);
+    // Pipe stage 4: IC28's output-gain multiply.
+    logic signed [31:0] p4_out_20;
 
-    // 2^20 -> 4096 LSB/V, rounded
-    wire signed [31:0] mix_full = (out_20 + 32'sd128) >>> 8;
+    always_ff @(posedge clk) begin
+        if (!rst_n) p4_out_20 <= '0;
+        else        p4_out_20 <= 32'((OUT_GAIN_Q16 * p3_gated + 64'sd32768) >>> 16);
+    end
+
+    // 2^20 -> 4096 LSB/V, rounded (cheap -- shares stage 4's register hop)
+    wire signed [31:0] mix_full = (p4_out_20 + 32'sd128) >>> 8;
 
     // IC28 OUTPUT RAILS -- a real clipping mechanism, not a format guard. See
     // docs/audio-rtl-design.md, "Op-amp output rails". Predicted SHIP peak is
@@ -313,17 +435,31 @@ module ship_chan (
         (mix_full < RAIL_LO) ? RAIL_LO[15:0] :
         mix_full[15:0];
 
+    // ship_mix free-runs on `clk` like the rest of this pipeline rather than
+    // waiting for sample_ce: by the time it is next read (at the following
+    // sample_ce, at least 826 clk_sys cycles after this one) the ~6-cycle
+    // pipeline above has long since settled to the steady-state value for the
+    // CURRENT sample. Gating it on sample_ce would only recreate a version of
+    // the exact timing hazard this rework removes -- collapsing five
+    // multiplies' worth of settling time into the single cycle sample_ce is
+    // asserted on.
+    always_ff @(posedge clk) begin
+        if (!rst_n) ship_mix <= 16'sd0;
+        else        ship_mix <= mix_sat;
+    end
+
+    // v_c12 / c12_charging / v_acc remain sample_ce-gated: they are the
+    // recursive one-pole states themselves (see the pipelines above that feed
+    // v_acc_next), and must only advance once per audio sample.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             v_c12        <= 40'sd0;
             c12_charging <= 1'b1;
             v_acc        <= 40'sd0;
-            ship_mix     <= 16'sd0;
         end else if (sample_ce) begin
             v_c12        <= v_c12_next;
             c12_charging <= c12_charging_next;
             v_acc        <= v_acc_next;
-            ship_mix     <= mix_sat;
         end
     end
 

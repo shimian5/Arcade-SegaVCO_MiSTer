@@ -303,10 +303,11 @@ Two buffered taps via IC29:
       -> IC20 sec.1 unity buffer (10+, 9-, 8 out) = Venv
 ```
 
-`Venv` peak is **3.16 V**. That is the 74123's V_OH less D8's drop, and it is confirmed
-by fire.wav: the recording holds flat for ~0.30 s before decaying, and 3.16 V is the peak
-that puts the control voltage at the MC3340 knee at exactly that moment. Two independent
-routes to the same number.
+`Venv` peak was first taken as 3.16 V (the 74123's V_OH less D8's drop, fit against fire.wav
+holding flat for ~0.30 s). **Revised to 3.80 V** — see "FIRE decays faster than the
+recording" below: 3.16 V fit the same V_OH-less-D8 reading against the MC3340's 3.5 V knee
+point, while 3.80 V fits it against the 3.1 V point instead, equally schematic-plausible,
+and matches a real cabinet recording far better than 3.16 V did.
 
 `Venv` then splits two ways.
 
@@ -378,7 +379,7 @@ Q0.24 the realised tau is 1.0191 s. This is the identical trap already flagged f
 ALARM high-pass, and it will recur in every channel with a slow envelope — SHIP and EXP
 both have one. **Check the pole precision before believing any envelope.**
 
-### Open: FIRE decays faster than the recording
+### Open (RE-OPENED, then partially fixed): FIRE decays faster than the recording
 
 Our decay reaches −20 dB at t ≈ 0.29 s. MAME's `fire.wav` reaches −20 dB at t ≈ 0.78 s —
 roughly **2.7× slower**. The shapes differ in character too: ours falls immediately and
@@ -401,6 +402,40 @@ Candidates, if it is ever worth chasing:
 
 Not worth chasing until a second channel is built and the relative levels can be judged
 together; a systematic error would show up in EXP the same way.
+
+**Update: this is exactly what happened, and the condition for revisiting is now met.**
+Once SHIP, REBOUND, ALARM and LA4460 all existed and were timing-closed, a real hardware
+test surfaced this as a *user-audible* bug, not a curiosity: FIRE was effectively inaudible
+in actual gameplay, while every other channel sounded correct. A real cabinet recording
+(`docs/reference/buckrog_cabinet_audio.wav`, a phone/camera capture of a real cabinet in
+play) was isolated by cross-correlation and windowed-envelope analysis against MAME's own
+sample WAVs (`mame/samples/buckrog/*.wav`) and confirms
+FIRE sits at a comparable local peak/RMS to SHIP's engine and the explosion sound in that
+recording — not the ~9-17 dB-down "thin, quiet laser" the old atten/gain-only comparison in
+Phase 4 predicted. Re-tracing the attenuator (R67 30K / R68 3.3K = 0.0991), output gain
+(R69 100K / R142 220K = −2.2) and the NOISE·A front-end tap directly against the schematic
+scans (`tools/render_sheets.py buck 47`) confirmed all three are correct as coded — the gap
+is upstream of them, in the envelope.
+
+Fixed by taking the **V_peak candidate** from the list above: `VPEAK_SCALED` changed from
+3.16 V to **3.80 V** (fitting the 74123's V_OH-less-D8 reading against the MC3340's 3.1 V
+knee instead of the 3.5 V point — equally schematic-plausible, not a fit to the recording).
+This is not just a level change: `V2 = 5.475 - 0.839*Venv` crosses the MC3340's 3.1 V knee
+(full gain below it, i.e. the "flat" part of the envelope) at a **fixed** `Venv = 2.83 V`
+regardless of `VPEAK` — so raising `VPEAK` doesn't move the knee, it lengthens how long the
+envelope takes to decay down to it, directly reproducing the recording's own "holds flat,
+then collapses" shape rather than the smooth immediate decay the old value produced.
+
+Measured (scenario 6, one shot, `dbg`-node comparison against `fire.wav` using the same
+−20 dB windowed-RMS method the original finding used): decay reaches −20 dB at **t ≈ 0.40 s**
+(was 0.29 s), against MAME's 0.70 s (re-measured with the same method; the 0.78 s figure
+above used a coarser method) — closes roughly a third of the 2.7× gap from a single
+schematically-defensible constant change, not a curve fit. **Not fully closed** — the
+remaining gap is still open, and the other two candidates (MC3340 part-to-part spread,
+`fire.wav` itself being a possibly-processed asset) remain plausible contributors on top of
+this. Verified: 112/112 DSP unchanged, Fitter Successful (only a constant changed, no width
+or structure); all non-FIRE channels bit-exact across all 23 scenarios; the 700-frame
+full-game regression is unaffected because that scripted playback never triggers `/FIRE`.
 
 ## Phase 3 — EXP (sheet 2) — **BUILT AND CONNECTED**
 
@@ -626,7 +661,16 @@ Modelling it as a plain gain would throw away most of what the circuit does.
 Note HIT also has the hottest path into the master mixer: R136 is 5.1 K against everyone
 else's 10 K, giving it 1.96× the weight (see the mixer table).
 
-### Phase 4 results, and the cross-channel level question — RESOLVED
+### Phase 4 results, and the cross-channel level question — RESOLVED, then partially revised
+
+> **Note, added when FIRE's envelope was revisited (Phase 2 update).** The "FIRE really is a
+> thin, quiet laser" conclusion below compares only the atten/output-gain stages and was
+> correct as far as it went, but it doesn't set FIRE's *actual* peak level — the envelope's
+> `VPEAK` does, and that value changed from 3.16 V to 3.80 V after this was written (see
+> Phase 2). FIRE's MIX level and the 8.9 dB-below-ALARM figure quoted here are therefore
+> stale; the structural gain-stage comparison (atten×gain ratios between FIRE/EXP/HIT) is
+> still accurate and still a real, schematic-confirmed difference — it just isn't the whole
+> story for how loud FIRE ends up.
 
 Scenario 12 (one hit, DIS = 7), 13 (the DIS sweep), 14 (hits under ALARM0). Measured at
 `dbg_hit_mix`:
@@ -1239,6 +1283,273 @@ channel where the asymmetry is visible in the output rather than academic.
 > bit-exact Python replica of `relax_vco` + the 555 gave 103.00 / 318.00 Hz against the
 > analytic 103.3 / 319.2 — 0.3 % — which is what proved the RTL right and the measurement
 > wrong. **Validate the probe before believing a sim-vs-theory discrepancy.**
+
+### Real hardware sounded like static; simulation is not proof against that
+
+Everything above was validated in Verilator, including a full-system sim (real ROM, real
+Z80 cores, coin+start driven through the actual game) — and it all sounds correct. A real
+Quartus build of the same RTL did not: on a DE10-Nano the engine channel came out as solid
+static while every other channel was merely in need of tuning. **This is not a contradiction
+of Phase 6's results, because Verilator cannot see the failure mode at all.**
+
+`ship_chan.sv`'s Stage 5-8 tail (IC26's gain, IC22 sec.C's control-leg gain, the MB4391
+LUT's interpolation, the VCA multiply, IC28's output gain — five serial 64-bit multiplies)
+was written as one combinational cloud between sample_ce edges, registered only once at the
+end. A Quartus build of exactly this RTL missed setup timing on `clk_sys` (39.935 MHz,
+25.04 ns period) by **-142 ns on its worst path**, with **-17.6 µs of total negative slack**
+across the domain — Fmax restricted to 5.98 MHz, roughly a sixth of what the design is
+clocked at. Verilator has no concept of gate delay: it resolves a combinational expression
+to its final value regardless of depth, so a functionally-correct netlist and a
+timing-broken one produce byte-identical WAVs in simulation. On real silicon, a flip-flop
+sampling a signal that hasn't settled by the clock edge latches whatever it caught
+mid-transition — which is what "solid static" is. SHIP was the worst-hit channel because it
+chains more multiplies in one cycle than any other (three VCOs feeding a five-multiply
+serial tail; the others have one or two), not because its logic was wrong.
+
+**Fix, not a tuning knob:** the tail is now pipelined across multiple `clk_sys` cycles, one
+multiply (or one cheap add/mux) per register hop — the same per-stage budget every other
+channel's one-pole filters already keep to. There are 832 `clk_sys` cycles per audio sample
+and the new pipeline is about 6 deep, so the added latency is inaudible; every intermediate
+register free-runs on `clk` rather than waiting for `sample_ce`, because the values it reads
+are already stable for hundreds of cycles on either side of any one sample boundary. The
+ACC glide update (Stage 2) got the same treatment for the same reason — it sums two live
+multiplies (`acc_a*v_acc` and `acc_b*acc_target`) in one step, the only other place in SHIP
+that isn't a single-multiply one-pole.
+
+**Lesson for the remaining channels.** `hit_chan.sv`, `exp_chan.sv` and `rebound_chan.sv`
+each chain at least two multiplies (a VCA lookup plus one or more gain stages) in a single
+combinational step the same way SHIP originally did, just shallower. They were not the
+channel reported as broken, but "less broken" is not "correct" — the same Quartus build's
+-17.6 µs of total negative slack almost certainly has contributions from all of them, and
+each should get the same one-multiply-per-register-hop treatment before trusting its level
+or timbre on real hardware, not just in Verilator. Re-run `quartus_sta` after each and
+confirm the `clk_sys` domain's slack, not just that the audio sounds right — sounding right
+in the WAV is necessary but was never sufficient.
+
+## DSP block budget — the 32-bit mistake, and the fix
+
+Pipelining SHIP/FIRE/REBOUND/HIT (the section above) fixed the *timing* failure mode but
+created a second, independent one: a real Quartus build of that pipelined RTL came back
+**129 / 112 DSP blocks (115 %)** — Fitter status `Failed`, over budget before placement even
+starts — with `clk_sys` setup slack still at **-45.324 ns / -6974.228 ns TNS**. Both numbers
+trace back to a single decision: every pipeline register introduced above was declared
+`signed [31:0]` (and every product `signed [63:0]`), a width chosen for headroom, not
+derived from the actual signal ranges.
+
+**Why 32 bits is the worst choice on this device, not a neutral one.** Cyclone V's DSP
+hard-block multiplies natively at **27×27** (or two independent 18×18s, or one sum-of-two
+18×18). A 32-bit × 32-bit multiply doesn't fit either mode, so Quartus decomposes it —
+`Arcade-Z80-3D.fit.rpt`'s DSP Block Usage Summary on the over-budget build showed the 129
+blocks split as 62 `Independent 27x27`, 34 `Two Independent 18x18`, 33 `Sum of two 18x18`:
+Quartus was already spending 2–3 blocks per 32-bit multiply where a right-sized operand
+would spend one. Worse, a 32-bit operand also **defeats packing the multiplier's output
+register into the DSP block itself** — the DSP Block Details table for the over-budget
+build shows entries like `hit_chan:u_hit|Mult11~24` and `~365` as two *separate* DSP
+instances for what should be one multiply-then-register hop, with `Output Register: no` on
+every entry. When Quartus can't fold the register into the DSP, it falls back to a
+soft-logic register plus a soft-logic adder tree to recombine the split multiply's partial
+products — and *that* soft adder tree, not the multiply itself, is what was still blowing
+the 25.04 ns `clk_sys` budget even after pipelining separated the multiplies onto their own
+register hops.
+
+**The fix is narrowing to the DSP's native width, derived from real signal ranges, not
+copied.** Across every coefficient in HIT and EXP (the two files worked in this pass), the
+worst-case Q24 coefficient is EXP's `RUMBLE_A1_Q24` at 33,237,369 — this needs 26 bits
+signed (2^25 = 33,554,432 covers it; 2^24 does not). Filter/envelope state at this design's
+voltage scale (`SCALE` = 4096×256 = 1,048,576 LSB/V, rails -6.00/+4.50 V) tops out under
+2^23, needing about 24 bits signed. Both fit in **27 bits** with margin — which is also
+exactly the DSP block's native operand width, so 27 is the target, not an arbitrary
+round number picked for looking tidy. VCA gain values (from the shared 65-point
+`VCA_GAIN_LUT`, max 292,739) get their own narrower `signed [20:0]`, since that multiply
+was already small enough not to be a budget driver but still shouldn't force a wide operand
+on whatever reads its result.
+
+Concretely, in `hit_chan.sv` and `exp_chan.sv`:
+- every coefficient/state `localparam` and pipeline register: `signed [31:0]` → `signed [26:0]`
+- every raw product register: `signed [63:0]` → `signed [53:0]` (27×27 → 54-bit, not 64)
+- the VCA gain path: `signed [31:0]` → `signed [20:0]`, its one 27×21 product → `signed [47:0]`
+- `exp_chan.sv` additionally needed the same one-multiply-per-register-hop pipelining
+  SHIP/FIRE/REBOUND/HIT already got — it was still "NOT YET PIPELINED" combinational MAC
+  going into this pass, the same five-term shape that caused REBOUND's 98-node
+  combinational loop, just narrowed at the operand-width level and never split into stages.
+
+**What did *not* need to change:** the raw-product-then-narrow-next-stage pattern
+established by SHIP/FIRE/REBOUND (`prod <= A * B;` in one stage, `y <= N'(prod >>> shift)`
+in the next) was already the *correct* shape for DSP output-register packing — a bare
+multiply feeding an assignment directly is exactly what Quartus's DSP inference looks for.
+The 32-bit operand width, not the pipeline structure, was the defect. Narrowing without
+also re-pipelining `exp_chan.sv` would not have been enough, since Quartus cannot safely
+pack a register across a genuinely combinational 5-term MAC regardless of operand width.
+
+**Verification order matters here more than usual.** Rebuilding the Verilator sim and
+matching every scenario's per-channel peak against the pre-narrowing baseline (bit-exact,
+all 23 scenarios) only proves the *arithmetic* survived the width change — narrower
+operands with the same fixed-point scaling produce identical results as long as no real
+value exceeds the new width, which the derivation above establishes. It says nothing about
+DSP block count or timing, which can only be checked by an actual Quartus recompile; that
+is why this file exists.
+
+Before this pass (SHIP/FIRE/REBOUND/HIT pipelined, all still 32-bit): **129 / 112 DSP
+blocks (115 %)**, `clk_sys` setup slack **-45.324 ns / -6974.228 ns TNS**, Fitter status
+`Failed`.
+
+After narrowing HIT and EXP to 27 bits (and pipelining EXP): **112 / 112 DSP blocks
+(100 %)**, Fitter status **Successful** — the placement-time failure is gone, exactly at
+budget with zero spare blocks. `clk_sys` setup slack improved to **-35.675 ns /
+-4342.676 ns TNS**: real progress (from -45.324 ns and -6974.228 ns) but timing is not
+closed yet.
+
+**The new worst path is not in HIT or EXP anymore, and not in any of the five files
+flagged below either.** `quartus_sta -t sim/report_worst_paths.tcl` puts it in
+`alarm_chan.sv`: `acc[7]` to `alarm_mix[5]`, 60.277 ns data delay, the same -35.675 ns
+that is now the domain's worst slack. ALARM was never pipelined or narrowed in any pass
+so far — it predates the whole SHIP/timing-closure investigation — and this result says it
+now needs the identical one-multiply-per-register-hop and 27-bit-operand treatment as
+everything else in this file, not just the five below. Check `alarm_chan.sv` first the
+next time this section's plan is revisited; it may turn out to be a bigger win than any
+of the five.
+
+REBOUND, FIRE, SHIP, `relax_vco.sv` and `la4460.sv` are flagged with a pointer to this
+section but not yet narrowed — narrow them next, re-measuring after each, the same way
+this pass followed HIT/EXP. Do not narrow all of them at once without an intermediate
+Quartus recompile: DSP budget is already at zero spare blocks, so any narrowing pass that
+widens anything by mistake will overflow it again immediately, and it's cheaper to catch
+that after one file than after six.
+
+**Update, after ALARM/LA4460/SHIP's own passes (see their subsections above): clk_sys
+closes cleanly (+5.121 ns, 0 setup violations) without ever touching REBOUND or FIRE.**
+Re-measuring after each fix, as this section already insisted on, is what caught that —
+REBOUND and FIRE were never actually on the worst-path list once ALARM, then LA4460, then
+SHIP were done; the plan to narrow them unconditionally would have been unnecessary work.
+Leave them alone unless a future change reopens a violation that traces back to one of them.
+
+### ALARM pass — division removed, not narrowed
+
+`alarm_chan.sv`'s worst path was NOT a width/DSP-packing problem like HIT/EXP's — it was a
+genuine runtime **division** (`(X_SPAN * acc) / 32'sd832`, a non-power-of-2 constant
+divisor), which Verilog synthesizes as an iterative soft-logic divider regardless of
+operand width. `acc` only takes 833 distinct values (0..832), so the division was replaced
+with a precomputed 833-entry lookup table — exact, not an approximation, costing block RAM
+instead of any multiplier (critical since DSP was already at 112/112 with zero spare
+blocks). `hp_sum`/`y_state` were deliberately left at 32 bits, not narrowed to HIT/EXP's
+27-bit width: this channel's own SCALE is 4096×65536 (not 4096×256), chosen specifically to
+avoid a leaky-integrator rounding stall documented in the RTL, and needs ~31 bits regardless
+of any DSP-packing concern.
+
+One correctness trap surfaced during this pass, worth restating because it will recur: a
+brand-new pipeline register (`acc_latched`) needs a reset value consistent with the design's
+own assumed idle condition, not the "obvious" zero. `acc_latched <= 0` would mean "the wire-OR
+node has been continuously LOW since power-on" — a state the board is never in — and it
+corrupted the power-on-thump scenario (5.16 V measured against an expected 0.90 V) because
+that scenario deliberately skips the settle time and captures the reset transient itself,
+the one case where a wrong reset value doesn't get 800+ cycles to wash out before it matters.
+Fixed by resetting `acc_latched` to 832 (idle, node continuously HIGH) and deriving every
+downstream pipeline register's reset value from that same assumption via ordinary
+elaboration-time constant arithmetic — not by hand-computing decimal constants, which is
+exactly the kind of arithmetic a person gets subtly wrong and a synthesis tool does not.
+
+Also hit, and worth flagging for whoever narrows the next file: Quartus 17.0 rejects
+`localparam signed [N:0] NAME [0:M] = '{...}` (aggregate-initialized unpacked array)
+with `parameter with complex/aggregate value must have a type` — it needs the explicit
+`logic` keyword, `localparam logic signed [N:0] NAME [0:M] = '{...}`, matching every
+existing LUT elsewhere in this codebase (`VCA_GAIN_LUT`, `ACC_V_LUT`). Verilator accepts
+the form without `logic` and gives no diagnostic either way, so this only surfaces in a
+real Quartus build — one more entry in the "sounds right in the WAV, wrong on real
+hardware" category, though this one is a hard compile error rather than a silent one.
+
+Before this pass: 112/112 DSP (100%, Successful), `clk_sys` slack -35.675 ns / -4342.676 ns
+TNS. After: **112/112 DSP unchanged** (confirms the LUT approach added zero DSP blocks),
+`clk_sys` slack improved to **-32.095 ns / -2678.023 ns TNS**. The new worst path moved
+again, this time to `la4460.sv` (`x2_d[23]` to `audio_out[14]`, 56.311 ns data delay) —
+already on the list below, next in line.
+
+### LA4460 pass — narrowed and pipelined, same recipe as HIT/EXP
+
+`la4460.sv`'s three cascaded highpass sections (C69/C83/CNF) plus the Cx lowpass and the
+final output-gain multiply were all still one combinational expression per sample — the
+same "settles fine in Verilator's zero-delay model, blows timing on real silicon" failure
+mode as HIT/EXP, not a division like ALARM. Fix followed the established recipe: the five
+filter/gain coefficients (`A_C69_Q24`, `A_C83_Q24`, `A_CNF_Q24`, `B_CX_Q24`,
+`OUT_GAIN_Q16`) were narrowed from `signed [31:0]` to `signed [26:0]` (Cyclone V's native
+27×27 DSP width), and the chain was split into one multiply per register-to-register hop —
+four filter stages plus the output-gain stage, roughly nine pipeline registers total, all
+free-running on `clk` since the 832-cycle sample window gives ample settling time for a
+handful of extra clk-domain hops.
+
+The recursive filter states themselves (`x1_d`/`y1`, `x2_d`/`y2`, `x3_d`/`y3`, `y4`, all
+`signed [47:0]`) were deliberately **not** narrowed to 27 bits, unlike HIT/EXP's states —
+this file's own header note already documents that the 0.282 Hz lowpass pole needs the
+extra width to avoid a rounding stall floor, so cutting it back down would reopen a bug
+this file was written to avoid. `audio_out` was changed from sample_ce-gated to
+free-running-on-clk, matching every other channel's `_mix` output register
+(`hit_mix`/`ship_mix`/`alarm_mix`/`exp_mix`); this shifted scenario 21's
+`first_nonzero` by exactly one sample (73495 → 73494), which is `dc_mute`'s release now
+landing on the clk cycle it actually happens rather than snapping forward to the next
+sample_ce boundary — a resolution improvement, not a regression, and confirmed as such
+because every per-channel level in that scenario (and all 22 others) stayed bit-exact.
+
+No reset-value re-derivation was needed here, unlike ALARM: this file's recursive states
+already reset to plain zero, and that genuinely is the board's true idle state (uncharged
+coupling caps) rather than a non-zero idle condition needing careful arithmetic — and the
+one scenario that captures reset-transient behavior (mute-release timing) has `audio_out`
+forced to hard zero by `dc_mute` for the entire window that would matter, so no warm-up
+transient could leak through even if the states were wrong.
+
+Before this pass: 112/112 DSP (100%, Successful), `clk_sys` slack -32.095 ns / -2678.023 ns
+TNS. After: **112/112 DSP unchanged**, `clk_sys` slack improved to **-10.787 ns**. The new
+worst path moved to `ship_chan.sv` (`relax_vco:u_tr2|acc[40]` to `p0_vca_in_prod[55]`,
+the VCA input multiply in SHIP's relaxation-oscillator chain) — next in line below.
+
+### SHIP pass — three combinational multiplies in series, and a DSP-budget detour
+
+SHIP's worst path wasn't inside `ship_chan.sv` itself but spanned three modules:
+`relax_vco.sv`'s box-average divide (`acc * RECIP832_Q32`, a live 56x32 multiply straight
+off a bare `assign`, valid only on the single clk_sys cycle sample_ce fires on and garbage
+every other cycle) fed directly into `dc_block.sv`'s own one-pole multiply, which fed
+directly into `ship_chan.sv`'s stage-0 gain multiply — three serial multiplies settling in
+one clk_sys hop, worse than anything HIT/EXP/ALARM/LA4460 had. Fixed with the same
+`acc_latched`-then-free-run pipeline as `alarm_chan.sv`, applied at each of the three
+boundaries, with one correctness trap and one budget trap along the way:
+
+**Correctness trap.** `dc_block.sv`'s recursive state update (`x_d`/`y_state`) must capture
+a *prompt* pulse (`relax_vco.sv`'s new `vint_avg_ce`, firing a few clk_sys cycles after the
+real sample_ce), not a full-audio-sample-late one the way `alarm_chan.sv` accepts for its
+own near-DC control signal — Tr2/Tr4/Tr5 are oscillators down to ~15 samples/cycle, so a
+full-sample lag there would be a real, audible phase error. Separately, `dc_block.sv`'s
+output tap (`y_out`) must read off the *stable* `y_state` register (only changes at
+`sample_ce`, held for the whole window), not off the continuously free-running
+hp_sum/hp_prod/y_next chain — that chain sees `x_d` and the fresh `x_scaled_pA` momentarily
+equal right after a capture (both just set to the same window's x[n]) and computes a pure
+decay step (`y <= a*y`) on every one of the ~825 remaining clk_sys cycles if wired to it
+directly, a ~3.5% amplitude error on SHIP's peak. Neither of these was caught by inspection
+— both surfaced only via full-game regression, and were traced by directly comparing
+instrumented traces of `vint_tr2`/`ac_tr2` against the same probe built from the unmodified
+HEAD RTL to separate a genuine bug from an initially-suspected (and ultimately nonexistent)
+one: the first regression run flagged looked like a real ~1.6% SHIP amplitude error, but it
+turned out the comparison baseline itself was stale — the true HEAD baseline already
+produced the "wrong" numbers. Rebuilding HEAD unmodified with the same debug probe and
+diffing against it directly is what confirmed which discrepancies were real.
+
+**DSP-budget trap.** With DSP already at 112/112 and zero spare blocks, turning these three
+combinational multiplies into registered ones let Quartus DSP-infer computations that
+previously cost nothing (soft logic, since they were never a clean register-to-register
+multiply). Narrowing the *coefficient* operand of each multiply (`RECIP832_Q32`,
+`A_Q24`, 32→27 bits, the usual playbook) was not sufficient and DSP count stayed at
+121/112 (Fitter Failed) — because a Cyclone V 27x27 DSP packs an operand in
+`ceil(width/27)` chunks, and it's the *wider* of the two operands that sets the chunk
+count. `relax_vco.sv`'s `acc`/`acc_latched` was declared at 56 bits (needing 3 chunks)
+despite only ever holding a ~38-bit value, because as a bare combinational divide its
+declared width cost nothing either way. Narrowing it to 40 bits (2 chunks, matching
+`vint`/`vs_half`'s own width) is what actually closed the gap.
+
+Before this pass: 112/112 DSP (100%, Successful), `clk_sys` slack -10.787 ns. After:
+**112/112 DSP unchanged**, `clk_sys` slack improved to **+5.121 ns** — the first *positive*
+slack this whole pass has produced, and `quartus_sta`'s worst-path report confirms **0
+setup violations remain on clk_sys** (new worst path is `exp_chan.sv`'s `exp_mix` into
+`audio_mixer.sv`, already comfortably positive). REBOUND and FIRE, both still on the
+original flagged list, never needed touching — clk_sys closes cleanly without them. The
+only remaining setup violation in the whole design is on `pll_hdmi`'s divclk domain
+(-3.222 ns), an HDMI video-timing domain unrelated to audio.
 
 ## Op-amp output rails — a real clipping mechanism
 

@@ -10,6 +10,7 @@
 // and pulses coin-in then start1 partway through the run, to exercise the
 // sub CPU/bitmap/mixer path far enough to reach actual gameplay instead of
 // just the attract loop.
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,39 @@ static const int ACTIVE_W = 512, ACTIVE_H = 224;
 
 static vluint64_t main_time = 0;
 double sc_time_stamp() { return main_time; }
+
+// --wav diagnostic: audio_l only changes once per audio sample (registered on
+// audio_top's sample_ce, which isn't exposed at this port level), so recording
+// on every VALUE CHANGE reconstructs the real 48 kHz stream with no need to
+// re-derive the /832 divider here.
+static void write_wav(const std::string &path, const std::vector<int16_t> &samples, uint32_t sample_rate = 48000) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "failed to open %s for write\n", path.c_str()); return; }
+    uint32_t data_bytes = (uint32_t)samples.size() * 2;
+    uint32_t byte_rate = sample_rate * 2;
+    uint16_t block_align = 2;
+    uint16_t bits_per_sample = 16;
+    uint32_t riff_size = 36 + data_bytes;
+
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    uint32_t fmt_size = 16;
+    fwrite(&fmt_size, 4, 1, f);
+    uint16_t audio_format = 1; // PCM
+    uint16_t num_channels = 1;
+    fwrite(&audio_format, 2, 1, f);
+    fwrite(&num_channels, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bits_per_sample, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+    if (!samples.empty()) fwrite(samples.data(), 2, samples.size(), f);
+    fclose(f);
+}
 
 static void tick(Vz80_3d *top)
 {
@@ -93,6 +127,7 @@ int main(int argc, char **argv)
     // Accel-by-Pedal, which made the sim harder than the same ROM in MAME
     // and made every sim-vs-MAME game-state comparison invalid.
     int dsw1v = 0xC0, dsw2v = 0x92;
+    std::string wav_path;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -110,6 +145,7 @@ int main(int argc, char **argv)
         else if (a == "--vramrange" && i + 2 < argc) { vramlo = atoi(argv[++i]); vramhi = atoi(argv[++i]); }
         else if (a == "--dsw1" && i + 1 < argc) dsw1v = (int)strtol(argv[++i], nullptr, 0);
         else if (a == "--dsw2" && i + 1 < argc) dsw2v = (int)strtol(argv[++i], nullptr, 0);
+        else if (a == "--wav" && i + 1 < argc) wav_path = argv[++i];
     }
 
     FILE *hudf = nullptr;
@@ -244,6 +280,14 @@ int main(int argc, char **argv)
     // video_timing.v's HBSTART=512/VBSTART=224 -- no translation needed).
     int prev_dbg_hpos = -1, prev_dbg_vpos = -1;
 
+    // Downsample audio_l by the same /832 ratio audio_top.sv's sample_ce
+    // divider uses (clk_sys / 832 = 48 kHz) -- sample_ce itself isn't exposed
+    // at this port level, and change-detection would silently collapse any
+    // sustained-silence or sustained-level stretch to a single sample,
+    // desyncing the WAV's timeline. A free-running counter is exact instead.
+    std::vector<int16_t> audio_samples;
+    int audio_div = 0;
+
     while (frame < frames && tick_count < max_ticks) {
         // Coin1 (IN1 bit 7) pulsed frames 90-99; Start1 (IN1 bit 3) pulsed
         // frames 150-159 -- matches tools/mame/dump_frames.lua's schedule
@@ -258,6 +302,11 @@ int main(int argc, char **argv)
 
         tick(top);
         tick_count++;
+
+        if (!wav_path.empty()) {
+            if (audio_div == 0) audio_samples.push_back((int16_t)top->audio_l);
+            audio_div = (audio_div + 1) % 832;
+        }
 
         {
             int rhp = (int)top->dbg_hpos, rvp = (int)top->dbg_vpos;
@@ -428,6 +477,12 @@ int main(int argc, char **argv)
     }
 
     if (hudf) fclose(hudf);
+
+    if (!wav_path.empty()) {
+        write_wav(wav_path, audio_samples);
+        printf("wrote %s (%zu samples, %.2fs)\n", wav_path.c_str(), audio_samples.size(),
+               audio_samples.size() / 48000.0);
+    }
 
     top->final();
     delete top;

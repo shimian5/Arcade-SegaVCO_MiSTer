@@ -86,15 +86,15 @@ module rebound_chan (
     localparam signed [31:0] A_DISCHARGE_Q16 = 32'sd64229;
     localparam signed [31:0] B_DISCHARGE_Q16 = 32'sd1307;   // 65536 - A
 
-    localparam signed [63:0] A_RECHARGE_Q24 = 64'sd16777017;
-    localparam signed [63:0] B_RECHARGE_Q24 = 64'sd199;     // 16777216 - A
+    localparam signed [31:0] A_RECHARGE_Q24 = 32'sd16777017;
+    localparam signed [31:0] B_RECHARGE_Q24 = 32'sd199;     // 16777216 - A
 
     logic signed [31:0] env_reb, env_reb_next;
 
-    wire signed [63:0] reb_dis_sum = 64'(A_DISCHARGE_Q16) * 64'(env_reb)
-                                    + 64'(B_DISCHARGE_Q16) * 64'(VLOW_SCALED);
-    wire signed [63:0] reb_rec_sum = A_RECHARGE_Q24 * 64'(env_reb)
-                                    + B_RECHARGE_Q24 * 64'(VHIGH_SCALED);
+    wire signed [63:0] reb_dis_sum = A_DISCHARGE_Q16 * env_reb
+                                    + B_DISCHARGE_Q16 * VLOW_SCALED;
+    wire signed [63:0] reb_rec_sum = A_RECHARGE_Q24 * env_reb
+                                    + B_RECHARGE_Q24 * VHIGH_SCALED;
     assign env_reb_next = q_reb ? reb_dis_sum[47:16] : reb_rec_sum[55:24];
 
     // ---------------------------------------------------------------
@@ -108,7 +108,7 @@ module rebound_chan (
     localparam signed [31:0] CTRL_SLOPE_Q24 = 32'sd9856614;   // 0.5875
     localparam signed [31:0] CTRL_OFFS      = 32'sd2162688;   // 2.0625V * SCALE
 
-    wire signed [63:0] ctrl_prod = 64'(env_reb) * 64'(CTRL_SLOPE_Q24);
+    wire signed [63:0] ctrl_prod = env_reb * CTRL_SLOPE_Q24;
     wire signed [31:0] ctrl      = (ctrl_prod[55:24]) + CTRL_OFFS;
 
     // ---------------------------------------------------------------
@@ -134,17 +134,17 @@ module rebound_chan (
     // ---------------------------------------------------------------
     localparam signed [31:0] VCC_SCALED = 32'sd5242880;  // 5.0V * SCALE
 
-    localparam signed [63:0] A_CHARGE_Q24    = 64'sd16769089;
-    localparam signed [63:0] B_CHARGE_Q24    = 64'sd8127;    // 16777216 - A
-    localparam signed [63:0] A_DISCHARGE555_Q24 = 64'sd16766627;
-    localparam signed [63:0] B_DISCHARGE555_Q24 = 64'sd10589; // 16777216 - A
+    localparam signed [31:0] A_CHARGE_Q24    = 32'sd16769089;
+    localparam signed [31:0] B_CHARGE_Q24    = 32'sd8127;    // 16777216 - A
+    localparam signed [31:0] A_DISCHARGE555_Q24 = 32'sd16766627;
+    localparam signed [31:0] B_DISCHARGE555_Q24 = 32'sd10589; // 16777216 - A
 
     logic signed [31:0] v_c31, v_c31_next;
     logic                charging, charging_next;
 
-    wire signed [63:0] v_c31_chg_sum = A_CHARGE_Q24 * 64'(v_c31)
-                                      + B_CHARGE_Q24 * 64'(VCC_SCALED);
-    wire signed [63:0] v_c31_dis_sum = A_DISCHARGE555_Q24 * 64'(v_c31);
+    wire signed [63:0] v_c31_chg_sum = A_CHARGE_Q24 * v_c31
+                                      + B_CHARGE_Q24 * VCC_SCALED;
+    wire signed [63:0] v_c31_dis_sum = A_DISCHARGE555_Q24 * v_c31;
 
     always_comb begin
         if (charging) begin
@@ -162,16 +162,40 @@ module rebound_chan (
     end
 
     // ---------------------------------------------------------------
-    // Stage 5: Tr3 gate. Base fed through R37 12K / R36 4.7K = 0.281437,
-    // emitter grounded. Piecewise-linear conduction like fire_chan's
-    // Tr1 (off below Vbe 0.60, saturated at 0.75), driven off the C31
-    // node voltage.
+    // Stages 5-8: Tr3 gate -> band-pass biquad -> MC3340 VCA -> output gain
+    // -> rail clip.
+    //
+    // TIMING-CLOSURE / NETLIST-CORRECTNESS NOTE. As first written this whole
+    // tail was one combinational cloud between sample_ce edges (same pattern
+    // `ship_chan.sv` originally used -- see its header comment and
+    // docs/audio-rtl-design.md, "Real hardware sounded like static"). SHIP
+    // turned out not to be the worst case: a real Quartus build of this exact
+    // RTL raised a Critical Warning of a **98-node combinational loop**
+    // rooted in this file's Stage-6 biquad accumulator (`reb_acc`, five
+    // multiplies combined with mixed add/subtract in one step) -- Quartus's
+    // automatic multiply-accumulate inference produced a malformed,
+    // genuinely cyclic netlist there, not just a deep-but-acyclic path.
+    // TimeQuest has to *estimate* delays through a loop it cannot resolve,
+    // which taints every other reported number anywhere near it -- so this
+    // is not a "nice to have", it has to be fixed before any other timing
+    // number in the design can be trusted.
+    //
+    // Fix: the same discipline as SHIP's tail -- one multiply (or one cheap
+    // compare/add/mux) per register-to-register hop, explicit pipeline
+    // registers so Quartus's synthesizer has no ambiguous multi-term
+    // sum-of-products left to try to auto-chain into a MAC. 832 clk_sys
+    // cycles exist per audio sample; this pipeline is about 10 deep, so the
+    // added latency is inaudible.
+    // ---------------------------------------------------------------
+
+    // Tr3 gate. Base fed through R37 12K / R36 4.7K = 0.281437, emitter
+    // grounded. Piecewise-linear conduction like fire_chan's Tr1 (off below
+    // Vbe 0.60, saturated at 0.75), driven off the C31 node voltage.
     //   GATE_OFF_THRESH: ramp giving Vbe = 0.60 -> 2.13193V
     //   GATE_SAT_THRESH: ramp giving Vbe = 0.75 -> 2.66491V
     //   frac = ((v_c31 - OFF) * GATE_SLOPE) >>> 20, Q0.16, clamped 0..65535
     //   factor: v_c31 <= OFF -> open (0dB), v_c31 >= SAT -> saturated
     //     (-36.6dB), between -> linear interpolation
-    // ---------------------------------------------------------------
     localparam signed [31:0] GATE_OFF_THRESH = 32'sd2235480;
     localparam signed [31:0] GATE_SAT_THRESH = 32'sd2794349;
     localparam signed [31:0] GATE_SLOPE      = 32'sd122961;
@@ -179,42 +203,87 @@ module rebound_chan (
     localparam signed [31:0] GATE_SAT_Q16    = 32'sd969;
     localparam signed [31:0] GATE_SPAN_Q16   = 32'sd64567;   // OPEN - SAT
 
-    logic signed [31:0] gate_factor;
+    // Pipe stage 0 (every clk): the gate's own interpolation had TWO serial
+    // multiplies (frac_prod feeding span_prod) -- split across a register.
+    // ctrl is carried alongside for the VCA lookup several stages downstream.
+    logic signed [63:0] g0_frac_prod;
+    logic signed [31:0] g0_v_c31, g0_ctrl;
 
-    always_comb begin
-        if (v_c31 <= GATE_OFF_THRESH) begin
-            gate_factor = GATE_OPEN_Q16;
-        end else if (v_c31 >= GATE_SAT_THRESH) begin
-            gate_factor = GATE_SAT_Q16;
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g0_frac_prod <= '0;
+            g0_v_c31     <= '0;
+            g0_ctrl      <= '0;
         end else begin
-            logic signed [63:0] frac_prod;
-            logic signed [31:0] frac_raw, frac_clamped;
-            logic signed [63:0] span_prod;
-            frac_prod    = (64'(v_c31) - 64'(GATE_OFF_THRESH)) * 64'(GATE_SLOPE);
-            frac_raw     = frac_prod[51:20];
-            frac_clamped = (frac_raw < 32'sd0)     ? 32'sd0     :
-                            (frac_raw > 32'sd65535) ? 32'sd65535 :
-                            frac_raw;
-            span_prod    = 64'(GATE_SPAN_Q16) * 64'(frac_clamped);
-            gate_factor  = GATE_OPEN_Q16 - span_prod[47:16];
+            g0_frac_prod <= (v_c31 - GATE_OFF_THRESH) * GATE_SLOPE;
+            g0_v_c31     <= v_c31;
+            g0_ctrl      <= ctrl;
+        end
+    end
+
+    // Pipe stage 1: clamp the fraction (cheap compare, no multiply).
+    logic signed [31:0] g1_frac_clamped, g1_v_c31, g1_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g1_frac_clamped <= '0;
+            g1_v_c31        <= '0;
+            g1_ctrl         <= '0;
+        end else begin
+            logic signed [31:0] frac_raw;
+            frac_raw        = g0_frac_prod[51:20];
+            g1_frac_clamped <= (frac_raw < 32'sd0)     ? 32'sd0     :
+                               (frac_raw > 32'sd65535) ? 32'sd65535 :
+                               frac_raw;
+            g1_v_c31        <= g0_v_c31;
+            g1_ctrl         <= g0_ctrl;
+        end
+    end
+
+    // Pipe stage 2: the gate's second multiply (span_prod).
+    logic signed [63:0] g2_span_prod;
+    logic signed [31:0] g2_v_c31, g2_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g2_span_prod <= '0;
+            g2_v_c31     <= '0;
+            g2_ctrl      <= '0;
+        end else begin
+            g2_span_prod <= GATE_SPAN_Q16 * g1_frac_clamped;
+            g2_v_c31     <= g1_v_c31;
+            g2_ctrl      <= g1_ctrl;
+        end
+    end
+
+    // Pipe stage 3: resolve gate_factor from the three regions (cheap mux).
+    logic signed [31:0] g3_gate_factor, g3_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g3_gate_factor <= GATE_OPEN_Q16;
+            g3_ctrl        <= '0;
+        end else begin
+            g3_gate_factor <= (g2_v_c31 <= GATE_OFF_THRESH) ? GATE_OPEN_Q16 :
+                              (g2_v_c31 >= GATE_SAT_THRESH) ? GATE_SAT_Q16  :
+                              (GATE_OPEN_Q16 - g2_span_prod[47:16]);
+            g3_ctrl        <= g2_ctrl;
         end
     end
 
     // ---------------------------------------------------------------
-    // Stage 6: band-pass on noise_a. NOISE.A -> C41 4.7uF -> R39 10K
-    // injects at node M, the midpoint of C51/C40 (0.022uF each) in
-    // series across R38 51K, IC12's feedback. Tr3 + R40 shunt that SAME
-    // node (see the header note on the gate/detune simplification).
-    // Solving the network gives a BAND-PASS (this is NOT fire_chan's
-    // switchable lowpass -- FIRE injects at the inverting input
-    // instead):
+    // Band-pass on noise_a. NOISE.A -> C41 4.7uF -> R39 10K injects at node
+    // M, the midpoint of C51/C40 (0.022uF each) in series across R38 51K,
+    // IC12's feedback. Tr3 + R40 shunt that SAME node (see the header note
+    // on the gate/detune simplification). Solving the network gives a
+    // BAND-PASS (this is NOT fire_chan's switchable lowpass -- FIRE injects
+    // at the inverting input instead):
     //   Vo/Vin = -s*C51*R38 / [1 + s*R39*(C51+C40) + s^2*R39*R38*C40*C51]
     //   f0 = 320.3Hz, Q = 1.129, peak gain 2.55
-    // RBJ biquad, direct form I, s32 state, filter SCALE units,
-    // coefficients precomputed the same way as exp_chan.sv's (Quartus
-    // rejects $sin/$cos for synthesis, so no elaboration-time trig
-    // here). Verified: |H(f0)| = 2.55000, with exact nulls at DC and
-    // Nyquist.
+    // RBJ biquad, direct form I, s32 state, filter SCALE units, coefficients
+    // precomputed the same way as exp_chan.sv's (Quartus rejects $sin/$cos
+    // for synthesis, so no elaboration-time trig here). Verified:
+    // |H(f0)| = 2.55000, with exact nulls at DC and Nyquist.
     //
     // Regenerate at fs = 47998.875 with:
     //   w0 = 2*pi*f0/fs; alpha = sin(w0)/(2*Q); a0 = 1+alpha
@@ -232,24 +301,80 @@ module rebound_chan (
     // SCALE (4096*256 LSB/V), same convention as exp_chan's noise_scaled.
     wire signed [31:0] noise_scaled = {{16{noise_a[15]}}, noise_a} <<< 8;
 
-    wire signed [63:0] gate_prod = 64'(gate_factor) * 64'(noise_scaled);
-    wire signed [31:0] gated_in  = gate_prod[47:16];
-
     logic signed [31:0] reb_x1, reb_x2, reb_y1, reb_y2;
 
-    wire signed [63:0] reb_acc =
-          64'(REB_B0_Q24) * 64'(gated_in)
-        + 64'(REB_B1_Q24) * 64'(reb_x1)
-        + 64'(REB_B2_Q24) * 64'(reb_x2)
-        - 64'(REB_A1_Q24) * 64'(reb_y1)
-        - 64'(REB_A2_Q24) * 64'(reb_y2);
-    wire signed [31:0] reb_y_next = reb_acc[55:24];
+    // Pipe stage 4: the gate multiply itself.
+    //
+    // NOTE: this product is deliberately routed through its own
+    // explicitly-64-bit-declared wire rather than written inline as
+    // `32'((a * b) >>> 16)`. A bare multiply feeding straight into a shift
+    // with no other wide operand in the same expression is NOT
+    // context-widened by the eventual narrow assignment target the way a
+    // direct `wire signed [63:0] x = a * b;` is -- Verilog only propagates
+    // assignment-context width to `*` across a direct assignment, not
+    // through an intervening `>>>`. Fusing them, as an earlier draft of
+    // this rework did, silently truncated the product before the shift and
+    // dropped REBOUND to near silence (24576 -> 128 in scenario 15/16) with
+    // no warning from either Verilator or Quartus. See docs/audio-rtl-design.md,
+    // "DSP block budget".
+    wire signed [63:0] g4_gate_prod = g3_gate_factor * noise_scaled;
+
+    logic signed [31:0] g4_gated_in, g4_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g4_gated_in <= '0;
+            g4_ctrl     <= '0;
+        end else begin
+            g4_gated_in <= 32'(g4_gate_prod >>> 16);
+            g4_ctrl     <= g3_ctrl;
+        end
+    end
+
+    // Pipe stage 5: the biquad's four live products (B1 is a constant 0 and
+    // folds away), computed in independent lanes -- no term depends on
+    // another's result this cycle, so this is exactly as deep as any other
+    // channel's single-multiply one-pole, just four of them side by side.
+    // This is the fix for the combinational loop: Quartus never sees five
+    // terms it might try to auto-chain into one MAC, only four independent
+    // register-fed multiplies.
+    logic signed [63:0] g5_prod_b0, g5_prod_b2, g5_prod_a1, g5_prod_a2;
+    logic signed [31:0] g5_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g5_prod_b0 <= '0;
+            g5_prod_b2 <= '0;
+            g5_prod_a1 <= '0;
+            g5_prod_a2 <= '0;
+            g5_ctrl    <= '0;
+        end else begin
+            g5_prod_b0 <= REB_B0_Q24 * g4_gated_in;
+            g5_prod_b2 <= REB_B2_Q24 * reb_x2;
+            g5_prod_a1 <= REB_A1_Q24 * reb_y1;
+            g5_prod_a2 <= REB_A2_Q24 * reb_y2;
+            g5_ctrl    <= g4_ctrl;
+        end
+    end
+
+    // Pipe stage 6: sum the four products (cheap add/sub) -> reb_y_next.
+    logic signed [31:0] reb_y_next, g6_ctrl;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            reb_y_next <= '0;
+            g6_ctrl    <= '0;
+        end else begin
+            reb_y_next <= 32'((g5_prod_b0 + g5_prod_b2 - g5_prod_a1 - g5_prod_a2) >>> 24);
+            g6_ctrl    <= g5_ctrl;
+        end
+    end
 
     // ---------------------------------------------------------------
-    // Stage 7: MC3340 VCA gain LUT -- identical table, indexing and
-    // interpolation as hit_chan.sv's VCA_GAIN_LUT (65 points, V2 =
-    // 2.0..6.0V step 0.0625V), copied verbatim. Its input is the
-    // Stage-3 ctrl node directly (no inversion).
+    // MC3340 VCA gain LUT -- identical table, indexing and interpolation as
+    // hit_chan.sv's VCA_GAIN_LUT (65 points, V2 = 2.0..6.0V step 0.0625V),
+    // copied verbatim. Its input is the Stage-3 ctrl node directly (no
+    // inversion) -- carried forward through the gate pipeline as g*_ctrl.
     // ---------------------------------------------------------------
     localparam int LUT_SIZE = 65;
     localparam logic [31:0] VCA_GAIN_LUT [0:LUT_SIZE-1] = '{
@@ -283,34 +408,62 @@ module rebound_chan (
             lut_frac = v2_off[15:0];
             gain_lo  = VCA_GAIN_LUT[lut_idx];
             gain_hi  = VCA_GAIN_LUT[lut_idx + 7'd1];
-            gain_interp_prod = 64'($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * 64'($signed({16'd0, lut_frac}));
+            gain_interp_prod = ($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * $signed({1'b0, lut_frac});
             vca_lut_lookup = 32'($signed({1'b0, gain_lo}) + gain_interp_prod[47:16]);
         end
     endfunction
 
-    wire signed [31:0] vca_gain_reb = vca_lut_lookup(ctrl);
-
     // ---------------------------------------------------------------
-    // Stage 8: output. IC12 out -> C45 -> R82 3.3K / R83 10K divider ->
-    // C24 -> IC18 VCA; IC18 out -> C20 -> R62 100K -> IC22 (R128 330K
-    // fb, + at 6V). Order: biquad out -> OUT_DIV -> VCA gain ->
-    // OUT_GAIN -> (>>>8) to audio scale -> rails.
+    // Output. IC12 out -> C45 -> R82 3.3K / R83 10K divider -> C24 -> IC18
+    // VCA; IC18 out -> C20 -> R62 100K -> IC22 (R128 330K fb, + at 6V).
+    // Order: biquad out -> OUT_DIV -> VCA gain -> OUT_GAIN -> (>>>8) to
+    // audio scale -> rails.
     // ---------------------------------------------------------------
     localparam signed [31:0] OUT_DIV_Q16  =  32'sd49275;    // R83/(R82+R83) = 0.751880 --
                                                               // note this is the INVERSE of
                                                               // EXP/HIT's 0.248/0.233
     localparam signed [31:0] OUT_GAIN_Q16 = -32'sd216269;   // -R128/R62 = -3.30
 
-    wire signed [63:0] reb_div_prod = 64'(OUT_DIV_Q16) * 64'(reb_y_next);
-    wire signed [31:0] reb_div      = reb_div_prod[47:16];
+    // Pipe stage 7: the VCA lookup (1 mult, inside the function) and the
+    // output divider (1 mult) are independent of each other -- share a stage.
+    // reb_div_prod is routed through its own 64-bit wire for the same
+    // reason g4_gate_prod is above: a bare multiply feeding straight into
+    // `>>>` is not context-widened by a narrow assignment target.
+    wire signed [63:0] reb_div_prod = OUT_DIV_Q16 * reb_y_next;
 
-    wire signed [63:0] reb_vca_prod = 64'(reb_div) * 64'(vca_gain_reb);
-    wire signed [31:0] reb_vca      = reb_vca_prod[47:16];
+    logic signed [31:0] g7_vca_gain, g7_reb_div;
 
-    wire signed [63:0] reb_out_prod = 64'(OUT_GAIN_Q16) * 64'(reb_vca);
-    wire signed [31:0] reb_out      = reb_out_prod[47:16];
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            g7_vca_gain <= '0;
+            g7_reb_div  <= '0;
+        end else begin
+            g7_vca_gain <= vca_lut_lookup(g6_ctrl);
+            g7_reb_div  <= 32'(reb_div_prod >>> 16);
+        end
+    end
 
-    wire signed [31:0] mix_full = reb_out >>> 8; // filter scale -> audio scale (4096 LSB/V)
+    // Pipe stage 8: the VCA multiply itself.
+    wire signed [63:0] reb_vca_prod = g7_reb_div * g7_vca_gain;
+
+    logic signed [31:0] g8_reb_vca;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) g8_reb_vca <= '0;
+        else        g8_reb_vca <= 32'(reb_vca_prod >>> 16);
+    end
+
+    // Pipe stage 9: IC22's output-gain multiply.
+    wire signed [63:0] reb_out_prod = OUT_GAIN_Q16 * g8_reb_vca;
+
+    logic signed [31:0] g9_reb_out;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) g9_reb_out <= '0;
+        else        g9_reb_out <= 32'(reb_out_prod >>> 16);
+    end
+
+    wire signed [31:0] mix_full = g9_reb_out >>> 8; // filter scale -> audio scale (4096 LSB/V)
 
     // IC22 OUTPUT RAILS -- a real clipping mechanism, not a format guard.
     //
@@ -330,28 +483,40 @@ module rebound_chan (
         (mix_full < RAIL_LO) ? RAIL_LO[15:0] :
         mix_full[15:0];
 
+    // rebound_mix free-runs on `clk`, same reasoning as ship_mix in
+    // ship_chan.sv: by the time it is next read (at the following
+    // sample_ce, at least ~822 clk_sys cycles after this one, given the
+    // ~10-stage pipeline above) it has long since settled to the current
+    // sample's steady-state value.
+    always_ff @(posedge clk) begin
+        if (!rst_n) rebound_mix <= 16'sd0;
+        else        rebound_mix <= mix_sat;
+    end
+
+    // env_reb / v_c31 / charging / reb_x1,x2,y1,y2 remain sample_ce-gated:
+    // they are the recursive one-pole/filter states themselves and must only
+    // advance once per audio sample. reb_x1/reb_y1 now source from the
+    // pipeline's registered g4_gated_in/reb_y_next rather than bare
+    // combinational wires -- see the pipeline stages above.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            env_reb      <= VHIGH_SCALED; // idle = cap fully charged = 5V = silent
-            v_c31        <= 32'sd0;
-            charging     <= 1'b1;
-            reb_x1       <= 32'sd0;
-            reb_x2       <= 32'sd0;
-            reb_y1       <= 32'sd0;
-            reb_y2       <= 32'sd0;
-            rebound_mix  <= 16'sd0;
+            env_reb  <= VHIGH_SCALED; // idle = cap fully charged = 5V = silent
+            v_c31    <= 32'sd0;
+            charging <= 1'b1;
+            reb_x1   <= 32'sd0;
+            reb_x2   <= 32'sd0;
+            reb_y1   <= 32'sd0;
+            reb_y2   <= 32'sd0;
         end else if (sample_ce) begin
             env_reb  <= env_reb_next;
 
             v_c31    <= v_c31_next;
             charging <= charging_next;
 
-            reb_x1   <= gated_in;
+            reb_x1   <= g4_gated_in;
             reb_x2   <= reb_x1;
             reb_y1   <= reb_y_next;
             reb_y2   <= reb_y1;
-
-            rebound_mix <= mix_sat;
         end
     end
 
