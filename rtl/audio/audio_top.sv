@@ -98,6 +98,30 @@ module audio_top (
     wire exp_n = ppi1_pb[3];
 
     logic signed [15:0] exp_mix;
+    logic                exp_mul_req_valid, exp_mul_req_ready;
+    logic signed [63:0]  exp_mul_req_a, exp_mul_req_b;
+    logic [6:0]          exp_mul_req_a_width, exp_mul_req_b_width;
+    logic [7:0]          exp_mul_req_tag;
+    logic                exp_mul_rsp_valid;
+    logic signed [127:0] exp_mul_rsp_product;
+    logic [7:0]          exp_mul_rsp_tag;
+
+    // Lane 1 is dedicated to EXP for this migration step.  The same tagged
+    // interface as lane 0 keeps the clients ready for a later arbiter.
+    shared_mul_lane u_shared_mul1 (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .req_valid   (exp_mul_req_valid),
+        .req_ready   (exp_mul_req_ready),
+        .req_a       (exp_mul_req_a),
+        .req_b       (exp_mul_req_b),
+        .req_a_width (exp_mul_req_a_width),
+        .req_b_width (exp_mul_req_b_width),
+        .req_tag     (exp_mul_req_tag),
+        .rsp_valid   (exp_mul_rsp_valid),
+        .rsp_product (exp_mul_rsp_product),
+        .rsp_tag     (exp_mul_rsp_tag)
+    );
 
     exp_chan u_exp (
         .clk        (clk),
@@ -105,7 +129,17 @@ module audio_top (
         .sample_ce  (sample_ce),
         .exp_n      (exp_n),
         .noise_b    (noise_b),
-        .exp_mix    (exp_mix)
+        .exp_mix    (exp_mix),
+        .mul_req_valid   (exp_mul_req_valid),
+        .mul_req_ready   (exp_mul_req_ready),
+        .mul_req_a       (exp_mul_req_a),
+        .mul_req_b       (exp_mul_req_b),
+        .mul_req_a_width (exp_mul_req_a_width),
+        .mul_req_b_width (exp_mul_req_b_width),
+        .mul_req_tag     (exp_mul_req_tag),
+        .mul_rsp_valid   (exp_mul_rsp_valid),
+        .mul_rsp_product (exp_mul_rsp_product),
+        .mul_rsp_tag     (exp_mul_rsp_tag)
     );
 
     // ---------------------------------------------------------------
@@ -253,13 +287,46 @@ module audio_top (
 
     logic signed [15:0] amp_out;
 
+    logic                amp_mul_req_valid, amp_mul_req_ready;
+    logic signed [63:0]  amp_mul_req_a, amp_mul_req_b;
+    logic [6:0]          amp_mul_req_a_width, amp_mul_req_b_width;
+    logic [7:0]          amp_mul_req_tag;
+    logic                amp_mul_rsp_valid;
+    logic signed [127:0] amp_mul_rsp_product;
+    logic [7:0]          amp_mul_rsp_tag;
+
+    shared_mul_lane u_shared_mul0 (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .req_valid   (amp_mul_req_valid),
+        .req_ready   (amp_mul_req_ready),
+        .req_a       (amp_mul_req_a),
+        .req_b       (amp_mul_req_b),
+        .req_a_width (amp_mul_req_a_width),
+        .req_b_width (amp_mul_req_b_width),
+        .req_tag     (amp_mul_req_tag),
+        .rsp_valid   (amp_mul_rsp_valid),
+        .rsp_product (amp_mul_rsp_product),
+        .rsp_tag     (amp_mul_rsp_tag)
+    );
+
     la4460 u_amp (
         .clk       (clk),
         .rst_n     (rst_n),
         .sample_ce (sample_ce),
         .dc_mute   (dc_mute),
         .mix_in    (mix_out),
-        .audio_out (amp_out)
+        .audio_out (amp_out),
+        .mul_req_valid   (amp_mul_req_valid),
+        .mul_req_ready   (amp_mul_req_ready),
+        .mul_req_a       (amp_mul_req_a),
+        .mul_req_b       (amp_mul_req_b),
+        .mul_req_a_width (amp_mul_req_a_width),
+        .mul_req_b_width (amp_mul_req_b_width),
+        .mul_req_tag     (amp_mul_req_tag),
+        .mul_rsp_valid   (amp_mul_rsp_valid),
+        .mul_rsp_product (amp_mul_rsp_product),
+        .mul_rsp_tag     (amp_mul_rsp_tag)
     );
 
     always_ff @(posedge clk) begin

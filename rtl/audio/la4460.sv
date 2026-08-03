@@ -66,7 +66,20 @@ module la4460 (
     input  logic               sample_ce,
     input  logic               dc_mute,   // from mute_ctl, 1 = muted
     input  logic signed [15:0] mix_in,    // 4096 LSB = 1 V
-    output logic signed [15:0] audio_out
+    output logic signed [15:0] audio_out,
+
+    // Shared exact multiplier client. LA4460 has a strictly dependent chain,
+    // so it can have at most one request outstanding.
+    output logic                mul_req_valid,
+    input  logic                mul_req_ready,
+    output logic signed [63:0]  mul_req_a,
+    output logic signed [63:0]  mul_req_b,
+    output logic          [6:0] mul_req_a_width,
+    output logic          [6:0] mul_req_b_width,
+    output logic          [7:0] mul_req_tag,
+    input  logic                mul_rsp_valid,
+    input  logic signed [127:0] mul_rsp_product,
+    input  logic          [7:0] mul_rsp_tag
 );
 
     // Poles at fs = 47,998.875 Hz, all Q0.24. exp(-1/(fs*tau)) for the
@@ -179,127 +192,56 @@ module la4460 (
     // warm-up transient even in principle.
     // ---------------------------------------------------------------
 
-    // Pipe stage 0: hp1's product.
-    wire signed [39:0] hp1_sum = 40'(y1) + 40'(x1) - 40'(x1_d);
+    // The old free-running pipeline instantiated all five multipliers at once.
+    // This micro-sequencer evaluates the identical dependency chain through one
+    // shared lane after each sample_ce. All state commits together after the
+    // fifth response, well before the next sample_ce (832 clocks later).
+    localparam logic [7:0] TAG_HP1 = 8'hA0;
+    localparam logic [7:0] TAG_HP2 = 8'hA1;
+    localparam logic [7:0] TAG_HP3 = 8'hA2;
+    localparam logic [7:0] TAG_LP  = 8'hA3;
+    localparam logic [7:0] TAG_OUT = 8'hA4;
 
-    logic signed [63:0] hp1_prod;
+    logic [2:0] op_index;
+    logic waiting_response;
+    logic [6:0] settle_count;
+    logic next_valid;
+    logic signed [47:0] x1_sample;
+    logic signed [47:0] y1_work, y2_work, y3_work, y4_work;
+    logic signed [15:0] amp_sample;
 
-    always_ff @(posedge clk) begin
-        if (!rst_n) hp1_prod <= '0;
-        else        hp1_prod <= A_C69_Q24 * hp1_sum + 64'sd8388608;
-    end
+    wire signed [127:0] rounded_q24 = mul_rsp_product + 128'sd8388608;
+    wire signed [47:0] rsp_q24 = 48'(rounded_q24 >>> 24);
+    wire signed [127:0] rounded_out = mul_rsp_product + 128'sd34359738368;
+    wire signed [127:0] rsp_out_full = rounded_out >>> 36;
+    wire signed [15:0] rsp_out_sat =
+        (rsp_out_full > 128'sd32767)  ?  16'sd32767 :
+        (rsp_out_full < -128'sd32768) ? -16'sd32768 :
+        rsp_out_full[15:0];
+    wire signed [39:0] hp1_sum_start = 40'(y1) + 40'(x1) - 40'(x1_d);
+    wire signed [39:0] hp2_sum_rsp   = 40'(y2) + 40'(rsp_q24) - 40'(x2_d);
+    wire signed [39:0] hp3_sum_rsp   = 40'(y3) + 40'(rsp_q24) - 40'(x3_d);
+    wire signed [39:0] lp_diff_rsp   = 40'(rsp_q24) - 40'(y4);
 
-    // Pipe stage 1: narrow hp1_prod -> y1_next.
-    logic signed [47:0] y1_next;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) y1_next <= '0;
-        else        y1_next <= 48'(hp1_prod >>> 24);
-    end
-
-    // Pipe stage 2: hp2's product.
-    wire signed [39:0] hp2_sum = 40'(y2) + 40'(y1_next) - 40'(x2_d);
-
-    logic signed [63:0] hp2_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) hp2_prod <= '0;
-        else        hp2_prod <= A_C83_Q24 * hp2_sum + 64'sd8388608;
-    end
-
-    // Pipe stage 3: narrow hp2_prod -> y2_next.
-    logic signed [47:0] y2_next;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) y2_next <= '0;
-        else        y2_next <= 48'(hp2_prod >>> 24);
-    end
-
-    // Pipe stage 4: hp3's product.
-    wire signed [39:0] hp3_sum = 40'(y3) + 40'(y2_next) - 40'(x3_d);
-
-    logic signed [63:0] hp3_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) hp3_prod <= '0;
-        else        hp3_prod <= A_CNF_Q24 * hp3_sum + 64'sd8388608;
-    end
-
-    // Pipe stage 5: narrow hp3_prod -> y3_next.
-    logic signed [47:0] y3_next;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) y3_next <= '0;
-        else        y3_next <= 48'(hp3_prod >>> 24);
-    end
-
-    // Pipe stage 6: the lowpass gain's product. y += (b * (x - y)) >> 24,
-    // rounded to nearest.
-    wire signed [39:0] lp_diff = 40'(y3_next) - 40'(y4);
-
-    logic signed [63:0] lp_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) lp_prod <= '0;
-        else        lp_prod <= B_CX_Q24 * lp_diff + 64'sd8388608;
-    end
-
-    // Pipe stage 7: narrow and add -> y4_next.
-    logic signed [47:0] y4_next;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) y4_next <= '0;
-        else        y4_next <= y4 + 48'(lp_prod >>> 24);
-    end
-
-    // ---------------------------------------------------------------
-    // Output stage. Spec form is
-    //     sat16( (filtered * OUT_GAIN_Q16 + 32768) >>> 16 )
-    // with `filtered` at 4096 LSB/V. Here the filter state is 20 bits finer, so
-    // the two shifts are FOLDED into one >>> 36 rather than rounding down to
-    // 4096 LSB/V first and then multiplying by 5.16 -- which would multiply the
-    // intermediate rounding error by the gain for no reason. Identical intent,
-    // one rounding instead of two.
-    // ---------------------------------------------------------------
-
-    // Pipe stage 8: the output-gain product.
-    logic signed [63:0] out_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) out_prod <= '0;
-        else        out_prod <= y4_next * OUT_GAIN_Q16
-                                + 64'sd34359738368;          // 2^35, round to nearest
-    end
-
-    wire signed [63:0] out_full = out_prod >>> 36;
-
-    wire signed [15:0] out_sat =
-        (out_full >  64'sd32767) ?  16'sd32767 :
-        (out_full < -64'sd32768) ? -16'sd32768 :
-        out_full[15:0];
-
-    // audio_out free-runs on `clk`, same reasoning as hit_mix/ship_mix/
-    // alarm_mix/exp_mix: by the time it is next read (the following
-    // sample_ce, at least ~823 clk_sys cycles after this one given the
-    // 9-stage pipeline above) it has long since settled.
-    always_ff @(posedge clk) begin
-        if (!rst_n) audio_out <= 16'sd0;
-        else begin
-            // DC mute is attenuation = INFINITY (datasheet), so this is a hard
-            // zero, not an attenuator. The filter states keep running
-            // underneath, which is what the real board does too: muting pin 6
-            // kills the output stage, it does not discharge C69/C83/CNF. So
-            // unmuting resumes mid-signal rather than thumping.
-            audio_out <= dc_mute ? 16'sd0 : out_sat;
+    task automatic issue_multiply(
+        input logic signed [63:0] a,
+        input logic signed [63:0] b,
+        input logic [6:0] aw,
+        input logic [6:0] bw,
+        input logic [7:0] tag
+    );
+        begin
+            mul_req_a       <= a;
+            mul_req_b       <= b;
+            mul_req_a_width <= aw;
+            mul_req_b_width <= bw;
+            mul_req_tag     <= tag;
+            mul_req_valid   <= 1'b1;
         end
-    end
+    endtask
 
-    // x1_d/x2_d/x3_d/y1/y2/y3/y4 remain sample_ce-gated: they are the
-    // recursive filter states themselves and must only advance once per
-    // audio sample.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            // Coupling caps uncharged == zero AC state; see the header note.
             x1_d <= '0;
             x2_d <= '0;
             x3_d <= '0;
@@ -307,15 +249,111 @@ module la4460 (
             y2   <= '0;
             y3   <= '0;
             y4   <= '0;
-        end else if (sample_ce) begin
-            x1_d <= x1;
-            x2_d <= y1_next;
-            x3_d <= y2_next;
-            y1   <= y1_next;
-            y2   <= y2_next;
-            y3   <= y3_next;
-            y4   <= y4_next;
+            x1_sample <= '0;
+            y1_work <= '0;
+            y2_work <= '0;
+            y3_work <= '0;
+            y4_work <= '0;
+            amp_sample <= '0;
+            audio_out <= '0;
+            op_index <= 3'd0;
+            waiting_response <= 1'b0;
+            settle_count <= 7'd0;
+            next_valid <= 1'b0;
+            mul_req_valid <= 1'b0;
+            mul_req_a <= '0;
+            mul_req_b <= '0;
+            mul_req_a_width <= 7'd1;
+            mul_req_b_width <= 7'd1;
+            mul_req_tag <= '0;
+        end else begin
+            audio_out <= dc_mute ? 16'sd0 : amp_sample;
+
+            if (mul_req_valid && mul_req_ready) begin
+                mul_req_valid <= 1'b0;
+                waiting_response <= 1'b1;
+            end
+
+            // Upstream channel pipelines settle shortly after sample_ce. The
+            // former free-running LA4460 pipeline continuously recomputed from
+            // that settled value, so its next state was already waiting when
+            // the following sample_ce arrived. Preserve that phase: wait 64
+            // clocks, compute during the sample window, and commit at the next
+            // sample_ce. Starting work on sample_ce instead would add exactly
+            // one audio sample of latency to the entire cabinet mix.
+            if (sample_ce) begin
+                settle_count <= 7'd64;
+                if (next_valid) begin
+                    x1_d <= x1_sample;
+                    x2_d <= y1_work;
+                    x3_d <= y2_work;
+                    y1 <= y1_work;
+                    y2 <= y2_work;
+                    y3 <= y3_work;
+                    y4 <= y4_work;
+                    next_valid <= 1'b0;
+                end
+            end else if (settle_count != 0) begin
+                settle_count <= settle_count - 1'b1;
+            end
+
+            if (!mul_req_valid && !waiting_response && settle_count == 7'd1) begin
+                x1_sample <= x1;
+                op_index <= 3'd0;
+                issue_multiply(64'(A_C69_Q24),
+                    64'(hp1_sum_start),
+                    7'd27, 7'd40, TAG_HP1);
+            end
+
+            if (mul_rsp_valid && waiting_response) begin
+                waiting_response <= 1'b0;
+                case (op_index)
+                    3'd0: begin
+                        y1_work <= rsp_q24;
+                        op_index <= 3'd1;
+                        issue_multiply(64'(A_C83_Q24),
+                            64'(hp2_sum_rsp),
+                            7'd27, 7'd40, TAG_HP2);
+                    end
+                    3'd1: begin
+                        y2_work <= rsp_q24;
+                        op_index <= 3'd2;
+                        issue_multiply(64'(A_CNF_Q24),
+                            64'(hp3_sum_rsp),
+                            7'd27, 7'd40, TAG_HP3);
+                    end
+                    3'd2: begin
+                        y3_work <= rsp_q24;
+                        op_index <= 3'd3;
+                        issue_multiply(64'(B_CX_Q24),
+                            64'(lp_diff_rsp),
+                            7'd27, 7'd40, TAG_LP);
+                    end
+                    3'd3: begin
+                        y4_work <= y4 + rsp_q24;
+                        op_index <= 3'd4;
+                        issue_multiply(64'(OUT_GAIN_Q16),
+                            64'(y4 + rsp_q24), 7'd27, 7'd48, TAG_OUT);
+                    end
+                    default: begin
+                        amp_sample <= rsp_out_sat;
+                        next_valid <= 1'b1;
+                    end
+                endcase
+            end
         end
     end
+
+`ifdef VERILATOR_SIM
+    always_ff @(posedge clk) begin
+        if (rst_n && mul_rsp_valid && waiting_response &&
+            (mul_rsp_tag != (TAG_HP1 + op_index))) begin
+            $error("LA4460 shared-multiply tag mismatch");
+        end
+        if (rst_n && sample_ce && (mul_req_valid || waiting_response)) begin
+            $error("LA4460 shared multiply missed sample deadline");
+        end
+    end
+`endif
 
 endmodule

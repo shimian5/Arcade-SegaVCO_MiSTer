@@ -97,3 +97,18 @@ audio-run: $(AUDIO_OBJ_DIR)/V$(AUDIO_TOP)
 
 audio-clean:
 	rm -rf $(AUDIO_OBJ_DIR) $(AUDIO_OUT_DIR)
+
+# Exact wide-on-27x27 shared multiplier unit bench.
+SHARED_MUL_OBJ_DIR = obj_dir_shared_mul
+
+.PHONY: shared-mul-test shared-mul-clean
+
+shared-mul-test: $(SHARED_MUL_OBJ_DIR)/Vshared_mul_lane
+	./$(SHARED_MUL_OBJ_DIR)/Vshared_mul_lane
+
+$(SHARED_MUL_OBJ_DIR)/Vshared_mul_lane: ../rtl/audio/shared_mul_lane.sv shared_mul_tb.cpp
+	$(VERILATOR) --cc --exe --build -Wno-fatal -Mdir $(SHARED_MUL_OBJ_DIR) \
+		--top-module shared_mul_lane -O2 $^
+
+shared-mul-clean:
+	rm -rf $(SHARED_MUL_OBJ_DIR)
