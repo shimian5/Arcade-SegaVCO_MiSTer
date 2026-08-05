@@ -112,3 +112,22 @@ $(SHARED_MUL_OBJ_DIR)/Vshared_mul_lane: ../rtl/audio/shared_mul_lane.sv shared_m
 
 shared-mul-clean:
 	rm -rf $(SHARED_MUL_OBJ_DIR)
+
+# SHIP's local shared-MAC integration, including its 832-cycle deadline and
+# response-tag assertions.  This intentionally bypasses audio_top because the
+# channel-arbiter wiring is a separate migration step.
+SHIP_SHARED_OBJ_DIR = obj_dir_ship_shared
+
+.PHONY: ship-shared-test ship-shared-clean
+
+ship-shared-test: $(SHIP_SHARED_OBJ_DIR)/Vship_shared_top
+	./$(SHIP_SHARED_OBJ_DIR)/Vship_shared_top
+
+$(SHIP_SHARED_OBJ_DIR)/Vship_shared_top: ship_shared_top.sv ship_shared_tb.cpp \
+	../rtl/audio/ship_chan.sv ../rtl/audio/relax_vco.sv ../rtl/audio/dc_block.sv \
+	../rtl/audio/shared_mul_lane.sv
+	$(VERILATOR) --cc --exe --build -Wno-fatal +define+VERILATOR_SIM \
+		-Mdir $(SHIP_SHARED_OBJ_DIR) --top-module ship_shared_top -O2 $^
+
+ship-shared-clean:
+	rm -rf $(SHIP_SHARED_OBJ_DIR)

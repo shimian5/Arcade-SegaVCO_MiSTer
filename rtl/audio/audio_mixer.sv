@@ -21,9 +21,6 @@ module audio_mixer (
     output logic signed [15:0] mix_out
 );
 
-    localparam signed [31:0] GAIN_10K = -32'sd4674;
-    localparam signed [31:0] GAIN_5K1 = -32'sd9166;
-
     wire signed [31:0] sum_10k = $signed({{16{ship_mix[15]}}, ship_mix})
                                 + $signed({{16{fire_mix[15]}}, fire_mix})
                                 + $signed({{16{exp_mix[15]}}, exp_mix})
@@ -32,13 +29,33 @@ module audio_mixer (
 
     wire signed [31:0] hit_ext = $signed({{16{hit_mix[15]}}, hit_mix});
 
-    wire signed [63:0] prod = sum_10k * GAIN_10K + hit_ext * GAIN_5K1;
+    // Keep the original 64-bit product boundary, but spell both fixed gains
+    // as shift/add networks so Quartus cannot spend DSPs on this passive
+    // resistor mixer.  These are exact integer decompositions:
+    //   4674 = 4096 + 512 + 64 + 2
+    //   9166 = 8192 + 512 + 256 + 128 + 64 + 8 + 4 + 2
+    // Both gains are inverting, hence the two leading negates.
+    wire signed [63:0] sum_10k_ext = $signed({{32{sum_10k[31]}}, sum_10k});
+    wire signed [63:0] hit_ext_64  = $signed({{32{hit_ext[31]}}, hit_ext});
+    wire signed [63:0] prod_10k = -((sum_10k_ext <<< 12) +
+                                    (sum_10k_ext <<< 9)  +
+                                    (sum_10k_ext <<< 6)  +
+                                    (sum_10k_ext <<< 1));
+    wire signed [63:0] prod_5k1 = -((hit_ext_64 <<< 13) +
+                                    (hit_ext_64 <<< 9)  +
+                                    (hit_ext_64 <<< 8)  +
+                                    (hit_ext_64 <<< 7)  +
+                                    (hit_ext_64 <<< 6)  +
+                                    (hit_ext_64 <<< 3)  +
+                                    (hit_ext_64 <<< 2)  +
+                                    (hit_ext_64 <<< 1));
+    wire signed [63:0] prod = prod_10k + prod_5k1;
 
     wire signed [31:0] acc_shifted = prod[47:16];
 
     wire signed [15:0] mix_sat =
         (acc_shifted > 32'sd32767)  ? 16'sd32767  :
-        (acc_shifted < -32'sd32768) ? -16'sd32768 :
+        (acc_shifted < -32'sd32768) ? 16'sh8000 :
         acc_shifted[15:0];
 
     always_ff @(posedge clk) begin

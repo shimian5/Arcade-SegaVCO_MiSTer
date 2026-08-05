@@ -155,7 +155,6 @@ module alarm_chan (
     // ---------------------------------------------------------------
     localparam signed [31:0] X_LOW  = 32'sd506;
     localparam signed [31:0] X_SPAN = 32'sd9226 - 32'sd506; // 8720
-    localparam signed [31:0] A_COEF = 32'sd65510; // Q0.16
 
     // Idle level: with no alarm gated, every 74LS38 output is off and R153
     // holds the node HIGH, so x settles at X_LOW + X_SPAN. x_scaled_d resets
@@ -177,7 +176,16 @@ module alarm_chan (
     // instead of the expected 0.90 V thump.
     localparam signed [31:0] X_SCALED_RESET = X_IDLE <<< 16;
     localparam signed [31:0] Y_STATE_RESET  = (X_IDLE - X_SIXV) <<< 16;
-    localparam signed [63:0] HP_PROD_RESET  = A_COEF * Y_STATE_RESET + 64'sd32768;
+    // A_COEF is 65510 = 65536 - 26.  Keep the original 64-bit product and
+    // rounding point, but express the constant multiply as shifts/adds so
+    // this always-on one-pole does not consume DSPs.  The reset expression
+    // uses the identical decomposition as the live datapath below.
+    localparam signed [63:0] Y_STATE_RESET_64 = $signed({{32{Y_STATE_RESET[31]}}, Y_STATE_RESET});
+    localparam signed [63:0] HP_TIMES_26_RESET = (Y_STATE_RESET_64 <<< 4) +
+                                                  (Y_STATE_RESET_64 <<< 3) +
+                                                  (Y_STATE_RESET_64 <<< 1);
+    localparam signed [63:0] HP_PROD_RESET  = (Y_STATE_RESET_64 <<< 16) -
+                                               HP_TIMES_26_RESET + 64'sd32768;
     localparam signed [31:0] Y_NEXT_RESET   = 32'(HP_PROD_RESET >>> 16);
 
     logic signed [31:0] x_scaled_d;   // previous x<<16, s32 4096*65536 LSB/V
@@ -341,13 +349,19 @@ module alarm_chan (
     //    under one output LSB, so the channel actually reaches silence.
     //
     // Note (2) is NOT coefficient precision: the stall point is 0.5/(1-a)
-    // in units of the STATE LSB, so carrying A_COEF in Q0.24 would not move
+    // in units of the STATE LSB, so carrying the pole in Q0.24 would not move
     // it. Only widening the state does.
     logic signed [63:0] hp_prod_pC;
+    wire signed [63:0] hp_sum_pB_64 = $signed({{32{hp_sum_pB[31]}}, hp_sum_pB});
+    wire signed [63:0] hp_times_26 = (hp_sum_pB_64 <<< 4) +
+                                      (hp_sum_pB_64 <<< 3) +
+                                      (hp_sum_pB_64 <<< 1);
+    wire signed [63:0] hp_prod_next = (hp_sum_pB_64 <<< 16) -
+                                       hp_times_26 + 64'sd32768;
 
     always_ff @(posedge clk) begin
         if (!rst_n) hp_prod_pC <= HP_PROD_RESET;
-        else        hp_prod_pC <= A_COEF * hp_sum_pB + 64'sd32768;
+        else        hp_prod_pC <= hp_prod_next;
     end
 
     // Pipe stage D: narrow the product back down to the filter's s32 scale.
@@ -368,7 +382,7 @@ module alarm_chan (
     // saturate mix_full to signed 16-bit
     wire signed [15:0] mix_sat =
         (mix_full > 32'sd32767)  ? 16'sd32767  :
-        (mix_full < -32'sd32768) ? -16'sd32768 :
+        (mix_full < -32'sd32768) ? 16'sh8000 :
         mix_full[15:0];
 
     // POWER-ON THUMP -- modelled deliberately; the real board does this.

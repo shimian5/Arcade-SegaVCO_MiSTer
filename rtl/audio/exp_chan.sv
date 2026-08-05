@@ -343,7 +343,6 @@ module exp_chan (
     wire [58:0] vca_params_rumble = vca_lut_params(v2_rumble_scaled);
     wire signed [53:0] rsp_q54 = 54'(mul_rsp_product);
     wire signed [26:0] rsp_q16 = 27'(mul_rsp_product >>> 16);
-    wire signed [26:0] rsp_q24 = 27'(mul_rsp_product >>> 24);
     wire signed [20:0] rsp_gain_q16 = 21'(mul_rsp_product >>> 16);
     wire signed [26:0] rsp_mix_full = (crack_out_work + rsp_q16) >>> 8;
     wire signed [15:0] rsp_mix_sat =

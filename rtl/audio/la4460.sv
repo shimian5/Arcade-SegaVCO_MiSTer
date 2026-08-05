@@ -216,7 +216,7 @@ module la4460 (
     wire signed [127:0] rsp_out_full = rounded_out >>> 36;
     wire signed [15:0] rsp_out_sat =
         (rsp_out_full > 128'sd32767)  ?  16'sd32767 :
-        (rsp_out_full < -128'sd32768) ? -16'sd32768 :
+        (rsp_out_full < -128'sd32768) ? 16'sh8000 :
         rsp_out_full[15:0];
     wire signed [39:0] hp1_sum_start = 40'(y1) + 40'(x1) - 40'(x1_d);
     wire signed [39:0] hp2_sum_rsp   = 40'(y2) + 40'(rsp_q24) - 40'(x2_d);

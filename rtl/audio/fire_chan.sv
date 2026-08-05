@@ -34,7 +34,21 @@ module fire_chan (
     input  logic               sample_ce,
     input  logic                fire_n,          // /FIRE, active low, falling edge triggers
     input  logic signed [15:0] noise_a,
-    output logic signed [15:0] fire_mix         // 4096 LSB = 1V
+    output logic signed [15:0] fire_mix,        // 4096 LSB = 1V
+
+    // Shared-multiplier client.  FIRE submits one operation at a time; the
+    // deterministic sequence below completes well inside one 832-clock audio
+    // sample interval and commits its recursive state on the next sample_ce.
+    output logic                mul_req_valid,
+    input  logic                mul_req_ready,
+    output logic signed [63:0]  mul_req_a,
+    output logic signed [63:0]  mul_req_b,
+    output logic          [6:0] mul_req_a_width,
+    output logic          [6:0] mul_req_b_width,
+    output logic          [7:0] mul_req_tag,
+    input  logic                mul_rsp_valid,
+    input  logic signed [127:0] mul_rsp_product,
+    input  logic          [7:0] mul_rsp_tag
 );
 
     // ---------------------------------------------------------------
@@ -107,11 +121,8 @@ module fire_chan (
     localparam signed [26:0] B_CHARGE = 27'sd1351;  // 65536 - A_CHARGE
     localparam signed [26:0] A_DECAY  = 27'sd16776873; // Q0.24; target 0, so (1-a)*target drops out
 
-    logic signed [26:0] env, env_next;
+    logic signed [26:0] env;
 
-    wire signed [63:0] env_charge_sum = A_CHARGE * env + B_CHARGE * VPEAK_SCALED;
-    wire signed [63:0] env_decay_sum  = A_DECAY * env;
-    assign env_next = q_oneshot ? env_charge_sum[47:16] : env_decay_sum[55:24];
 
     // ---------------------------------------------------------------
     // Stages 3-5: control leg (V2 -> VCA LUT) and filter leg (Tr1 conduction
@@ -174,51 +185,6 @@ module fire_chan (
     // audio scale, matching every other channel's noise-fed filter).
     wire signed [26:0] noise_scaled = 27'({{16{noise_a[15]}}, noise_a} <<< 8);
 
-    // Pipe stage 0 (every clk): the three multiplies that only depend on the
-    // env register / the live noise_a port are independent -- share a stage.
-    logic signed [63:0] p0_v2_prod, p0_vbe_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            p0_v2_prod      <= '0;
-            p0_vbe_prod     <= '0;
-        end else begin
-            p0_v2_prod      <= COEF_0839 * env;
-            p0_vbe_prod     <= VBE_COEF * env;
-        end
-    end
-
-    // Pipe stage 1: shift/subtract down to working scale (cheap).
-    logic signed [26:0] p1_v2_scaled, p1_vbe_scaled;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            p1_v2_scaled   <= '0;
-            p1_vbe_scaled  <= '0;
-        end else begin
-            p1_v2_scaled   <= 27'(V2_CONST_SCALED - p0_v2_prod[47:16]);
-            p1_vbe_scaled  <= 27'(p0_vbe_prod[47:16]);
-        end
-    end
-
-    // Pipe stage 2: clamp V2 (cheap); the reciprocal multiply that replaces
-    // the original runtime division.
-    logic signed [26:0] p2_v2_clamped, p2_vbe_scaled;
-    logic signed [63:0] p2_frac_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            p2_v2_clamped  <= '0;
-            p2_vbe_scaled  <= '0;
-            p2_frac_prod   <= '0;
-        end else begin
-            p2_v2_clamped  <= (p1_v2_scaled < V2_MIN_SCALED) ? V2_MIN_SCALED :
-                              (p1_v2_scaled > V2_MAX_SCALED) ? V2_MAX_SCALED :
-                              p1_v2_scaled;
-            p2_vbe_scaled  <= p1_vbe_scaled;
-            p2_frac_prod   <= (p1_vbe_scaled - VBE_LOW_SCALED) * RECIP_FRAC_Q32;
-        end
-    end
 
     // ---------------------------------------------------------------
     // MC3340 VCA gain LUT: 65 points across V2 = 2.0 .. 6.0V, step 0.0625V.
@@ -249,39 +215,28 @@ module fire_chan (
         32'd9
     };
 
-    function automatic logic signed [31:0] vca_lut_lookup(input logic signed [31:0] v2_in);
-        logic [31:0] v2_off;
+    // Return {gain_lo, gain_hi-gain_lo, frac}; interpolation itself is a
+    // scheduled shared-lane operation, never a hidden inferred multiplier.
+    function automatic logic [58:0] vca_lut_params(input logic signed [26:0] v2_in);
+        logic signed [26:0] v2_clamped;
+        logic [22:0] v2_off;
         logic [6:0]  lut_idx;
         logic [15:0] lut_frac;
         logic [31:0] gain_lo, gain_hi;
-        logic signed [63:0] gain_interp_prod;
+        logic signed [20:0] gain_base, gain_delta;
         begin
-            v2_off   = v2_in - V2_MIN_SCALED;   // 0 .. LUT_SIZE-1 in units of 65536
+            v2_clamped = (v2_in < V2_MIN_SCALED) ? V2_MIN_SCALED :
+                         (v2_in > V2_MAX_SCALED) ? V2_MAX_SCALED : v2_in;
+            v2_off   = 23'(v2_clamped - V2_MIN_SCALED);   // 0 .. LUT_SIZE-1 in units of 65536
             lut_idx  = v2_off[22:16];           // 0 .. 63 (indices for interpolation)
             lut_frac = v2_off[15:0];            // Q0.16 fraction between idx and idx+1
             gain_lo  = VCA_GAIN_LUT[lut_idx];
             gain_hi  = VCA_GAIN_LUT[lut_idx + 7'd1];
-            gain_interp_prod = ($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo})) * $signed({1'b0, lut_frac});
-            vca_lut_lookup = 32'($signed({1'b0, gain_lo}) + gain_interp_prod[47:16]);
+            gain_base  = 21'($signed({1'b0, gain_lo}));
+            gain_delta = 21'($signed({1'b0, gain_hi}) - $signed({1'b0, gain_lo}));
+            vca_lut_params = {gain_base, gain_delta, 1'b0, lut_frac};
         end
     endfunction
-
-    // Pipe stage 3: the VCA LUT lookup (1 mult, inside the function) and the
-    // gc fraction's clamp (cheap mux, resolving the divide-replacement
-    // multiply from stage 2) run in parallel.
-    logic signed [31:0] p3_vca_gain, p3_frac_gc;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            p3_vca_gain <= '0;
-            p3_frac_gc  <= '0;
-        end else begin
-            p3_vca_gain <= vca_lut_lookup(32'(p2_v2_clamped));
-            p3_frac_gc  <= (p2_vbe_scaled <= VBE_LOW_SCALED) ? 32'sd0 :
-                          (p2_vbe_scaled >= (VBE_LOW_SCALED + VBE_RANGE_SCALED)) ? 32'sd65536 :
-                          32'(p2_frac_prod >>> 32);
-        end
-    end
 
     // ---------------------------------------------------------------
     // IC12 filter leg: a genuine time-varying 2-pole biquad, not a one-pole
@@ -363,34 +318,6 @@ module fire_chan (
         27'sd15537651
     };
 
-    // frac_gc ranges 0..65536 (17-bit range); >>11 gives 0..32, a clean
-    // index into the 33-entry tables above.
-    wire [5:0] filt_idx = 6'(p3_frac_gc[16:11]);
-
-    logic signed [26:0] ic12_x1, ic12_x2;
-    logic signed [39:0] ic12_y1, ic12_y2;
-
-    // Cheap adds exploiting the B1=B0+B2 identity above -- see the note.
-    wire signed [26:0] ic12_u1 = 27'(noise_scaled + ic12_x1);
-    wire signed [26:0] ic12_u2 = 27'(ic12_x1 + ic12_x2);
-
-    // Pipe stage f0 (every clk): the filter's four independent products.
-    logic signed [63:0] f0_b0u1_prod, f0_b2u2_prod, f0_a1y1_prod, f0_a2y2_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            f0_b0u1_prod <= '0;
-            f0_b2u2_prod <= '0;
-            f0_a1y1_prod <= '0;
-            f0_a2y2_prod <= '0;
-        end else begin
-            f0_b0u1_prod <= IC12_B0_LUT[filt_idx] * ic12_u1;
-            f0_b2u2_prod <= IC12_B2_LUT[filt_idx] * ic12_u2;
-            f0_a1y1_prod <= IC12_A1_LUT[filt_idx] * ic12_y1;
-            f0_a2y2_prod <= IC12_A2_LUT[filt_idx] * ic12_y2;
-        end
-    end
-
     // IC12 OUTPUT RAILS -- a real clipping mechanism, not a format guard,
     // same reasoning as every other op-amp stage in this design (SHIP/HIT/
     // EXP/LA4460's own RAIL_HI/RAIL_LO). IC12 is an LM324 like the rest of
@@ -413,127 +340,132 @@ module fire_chan (
     localparam signed [39:0] IC12_RAIL_HI = 40'sd4718592;   // +4.50V * 2^20
     localparam signed [39:0] IC12_RAIL_LO = -40'sd6291456;  // -6.00V * 2^20
 
-    // Pipe stage f1: sum -> rail-clip -> ic12_y_next (cheap add + clamp).
-    wire signed [39:0] ic12_y_raw = 40'((f0_b0u1_prod + f0_b2u2_prod - f0_a1y1_prod - f0_a2y2_prod) >>> 24);
-
-    logic signed [39:0] ic12_y_next;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) ic12_y_next <= '0;
-        else        ic12_y_next <= (ic12_y_raw > IC12_RAIL_HI) ? IC12_RAIL_HI :
-                                    (ic12_y_raw < IC12_RAIL_LO) ? IC12_RAIL_LO :
-                                    ic12_y_raw;
-    end
-
-    // Pipe stages 4-6: carry vca_gain forward to stage 7, where it meets the
-    // atten multiply -- unrelated to the filter's own pipeline above, which
-    // settles independently and is only read (via the stable ic12_y1
-    // register) at sample_ce.
-    logic signed [31:0] p4_vca_gain, p5_vca_gain, p6_vca_gain;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) p4_vca_gain <= '0;
-        else        p4_vca_gain <= p3_vca_gain;
-    end
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) p5_vca_gain <= '0;
-        else        p5_vca_gain <= p4_vca_gain;
-    end
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) p6_vca_gain <= '0;
-        else        p6_vca_gain <= p5_vca_gain;
-    end
-
-    // Pipe stage 7: the output stage's input-attenuator multiply on the
-    // CURRENT ic12_y1 register (independent of the filter pipeline above --
-    // ic12_y1 only advances once per sample_ce, so both are reading the
-    // same stable value for this whole 832-cycle window).
     localparam signed [26:0] ATTEN_Q16    = 27'sd6495;   // 0.0991 * 65536
     localparam signed [26:0] OUT_GAIN_Q16 = -27'sd144179; // -2.2 * 65536
+    // FIRE has fourteen sample-rate products.  At three clocks per native
+    // 27-bit multiply (four for the 40-bit feedback terms), the sequence is
+    // comfortably below the 832 clocks between sample_ce pulses.  Start
+    // after a short settle window and commit work atomically on the next CE.
+    localparam logic [7:0] TAG_FIRE_BASE = 8'hC0;
+    logic [3:0] op_index;
+    logic waiting_response, next_valid;
+    logic [6:0] settle_count;
+    logic signed [26:0] ic12_x1, ic12_x2;
+    logic signed [39:0] ic12_y1, ic12_y2;
+    logic signed [26:0] vbe_work;
+    logic signed [20:0] gain_base, gain_delta, gain_work;
+    logic signed [16:0] gain_frac;
+    logic [5:0] filt_idx_work;
+    logic signed [127:0] b0_work, b2_work, a1_work;
+    logic signed [39:0] ic12_y_work;
+    logic signed [53:0] env_charge_a;
+    logic signed [26:0] env_charge_work, env_decay_work;
+    logic signed [15:0] fire_sample;
 
-    logic signed [63:0] p7_atten_prod;
-    logic signed [31:0] p7_vca_gain;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            p7_atten_prod <= '0;
-            p7_vca_gain   <= '0;
-        end else begin
-            p7_atten_prod <= ATTEN_Q16 * ic12_y1;
-            p7_vca_gain   <= p6_vca_gain;
-        end
-    end
-
-    // Pipe stage 8: input atten x VCA gain.
-    //
-    // NOTE: a Verilog bit-select like `signal[47:16]` is ALWAYS UNSIGNED,
-    // even when `signal` itself is declared signed -- so it must be routed
-    // through its own signed-declared wire before it can be widened (via a
-    // width cast) or arithmetically shifted (`>>>`) correctly. Chaining
-    // `64'(wide_signal[47:16])` or `wide_signal[47:16] >>> N` directly, as a
-    // first draft of this rework did, zero-extends/logically-shifts what
-    // should be a sign-extended/arithmetic operation -- turning small
-    // negative filter values into huge positive ones and pinning FIRE at
-    // the positive rail even at idle. Caught by instrumenting this module
-    // and comparing against a hand trace; not visible from the RTL alone.
-
-    wire signed [31:0] p7_atten = p7_atten_prod[47:16];
-
-    logic signed [63:0] p8_vca_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) p8_vca_prod <= '0;
-        else        p8_vca_prod <= p7_atten * p7_vca_gain;
-    end
-
-    // Pipe stage 9: output gain.
-    wire signed [31:0] p8_vca = p8_vca_prod[47:16];
-
-    logic signed [63:0] p9_out_prod;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) p9_out_prod <= '0;
-        else        p9_out_prod <= OUT_GAIN_Q16 * p8_vca;
-    end
-
-    wire signed [31:0] p9_out    = p9_out_prod[47:16];
-    wire signed [31:0] mix_full  = p9_out >>> 8; // filter scale -> audio scale
-
+    wire signed [26:0] ic12_u1 = 27'(noise_scaled + ic12_x1);
+    wire signed [26:0] ic12_u2 = 27'(ic12_x1 + ic12_x2);
+    wire signed [127:0] filter_sum = b0_work + b2_work - a1_work - mul_rsp_product;
+    wire signed [127:0] filter_scaled = filter_sum >>> 24;
+    wire signed [31:0] rsp_q16_32 = 32'(mul_rsp_product >>> 16);
+    wire signed [20:0] rsp_gain_q16 = 21'(mul_rsp_product >>> 16);
+    wire signed [26:0] rsp_env_q16 = 27'(mul_rsp_product >>> 16);
+    wire signed [26:0] rsp_env_q24 = 27'(mul_rsp_product >>> 24);
+    // Quartus 17 cannot elaborate a part-select directly on a function-call
+    // result. Keep the full typed result on a named wire, exactly as EXP does.
+    wire signed [26:0] v2_from_env = 27'(V2_CONST_SCALED - rsp_env_q16);
+    wire        [58:0] vca_params_from_env = vca_lut_params(v2_from_env);
+    wire signed [31:0] mix_full = rsp_q16_32 >>> 8;
     wire signed [15:0] mix_sat =
-        (mix_full > 32'sd32767)  ? 16'sd32767  :
-        (mix_full < -32'sd32768) ? -16'sd32768 :
-        mix_full[15:0];
+        (mix_full > 32'sd32767) ? 16'sd32767 :
+        (mix_full < -32'sd32768) ? 16'sh8000 : mix_full[15:0];
 
-    // fire_mix free-runs on `clk` like the rest of this pipeline, same
-    // reasoning as ship_mix/rebound_mix: by the time it is next read (the
-    // following sample_ce, at least ~820 clk_sys cycles after this one given
-    // the ~10-stage pipeline above) it has long since settled.
-    always_ff @(posedge clk) begin
-        if (!rst_n) fire_mix <= 16'sd0;
-        else        fire_mix <= mix_sat;
-    end
+    task automatic issue_multiply(
+        input logic signed [63:0] a, input logic signed [63:0] b,
+        input logic [6:0] aw, input logic [6:0] bw, input logic [7:0] tag
+    );
+        begin
+            mul_req_a <= a; mul_req_b <= b;
+            mul_req_a_width <= aw; mul_req_b_width <= bw;
+            mul_req_tag <= tag; mul_req_valid <= 1'b1;
+        end
+    endtask
 
-    // env / ic12_x1,x2,y1,y2 remain sample_ce-gated: they are the recursive
-    // filter states themselves and must only advance once per audio sample.
-    // The IC12 states all reset to 0 -- noise has no DC bias, so (like
-    // HIT/EXP's identical noise-fed biquads) zero genuinely is the idle
-    // state, no special reset-derivation needed the way ALARM's was.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            env     <= 27'sd0;
-            ic12_x1 <= 27'sd0;
-            ic12_x2 <= 27'sd0;
-            ic12_y1 <= 40'sd0;
-            ic12_y2 <= 40'sd0;
-        end else if (sample_ce) begin
-            env     <= env_next;
-            ic12_x2 <= ic12_x1;
-            ic12_x1 <= noise_scaled;
-            ic12_y2 <= ic12_y1;
-            ic12_y1 <= ic12_y_next;
+            env <= '0; ic12_x1 <= '0; ic12_x2 <= '0; ic12_y1 <= '0; ic12_y2 <= '0;
+            // Prime the first snapshot after reset too.  The legacy
+            // free-running pipeline had already derived its first next-state
+            // before the first sample_ce; starting at zero here would defer
+            // that update by one complete audio sample forever.
+            op_index <= '0; waiting_response <= 1'b0; next_valid <= 1'b0; settle_count <= 7'd64;
+            vbe_work <= '0; gain_base <= '0; gain_delta <= '0; gain_frac <= '0; gain_work <= '0;
+            filt_idx_work <= '0; b0_work <= '0; b2_work <= '0; a1_work <= '0; ic12_y_work <= '0;
+            env_charge_a <= '0; env_charge_work <= '0; env_decay_work <= '0;
+            fire_sample <= '0; fire_mix <= '0;
+            mul_req_valid <= 1'b0; mul_req_a <= '0; mul_req_b <= '0;
+            mul_req_a_width <= 7'd1; mul_req_b_width <= 7'd1; mul_req_tag <= '0;
+        end else begin
+            fire_mix <= fire_sample;
+            if (mul_req_valid && mul_req_ready) begin
+                mul_req_valid <= 1'b0;
+                waiting_response <= 1'b1;
+            end
+            if (sample_ce) begin
+                settle_count <= 7'd64;
+                if (next_valid) begin
+                    env <= q_oneshot ? env_charge_work : env_decay_work;
+                    ic12_x2 <= ic12_x1; ic12_x1 <= noise_scaled;
+                    ic12_y2 <= ic12_y1; ic12_y1 <= ic12_y_work;
+                    next_valid <= 1'b0;
+                end
+            end else if (settle_count != 0) begin
+                settle_count <= settle_count - 1'b1;
+            end
+            if (!mul_req_valid && !waiting_response && settle_count == 7'd1) begin
+                op_index <= 4'd0;
+                issue_multiply(64'(COEF_0839), 64'(env), 7'd27, 7'd27, TAG_FIRE_BASE);
+            end
+            if (mul_rsp_valid && waiting_response) begin
+                waiting_response <= 1'b0;
+                case (op_index)
+                    4'd0: begin
+                        gain_base <= vca_params_from_env[58:38];
+                        gain_delta <= vca_params_from_env[37:17];
+                        gain_frac <= vca_params_from_env[16:0];
+                        op_index <= 4'd1; issue_multiply(64'(VBE_COEF),64'(env),7'd27,7'd27,TAG_FIRE_BASE+8'd1);
+                    end
+                    4'd1: begin vbe_work <= rsp_env_q16; op_index <= 4'd2; issue_multiply(64'(rsp_env_q16-VBE_LOW_SCALED),64'(RECIP_FRAC_Q32),7'd27,7'd32,TAG_FIRE_BASE+8'd2); end
+                    4'd2: begin
+                        filt_idx_work <= (vbe_work <= VBE_LOW_SCALED) ? 6'd0 :
+                                         (vbe_work >= VBE_LOW_SCALED+VBE_RANGE_SCALED) ? 6'd32 : 6'(mul_rsp_product >>> 43);
+                        op_index <= 4'd3; issue_multiply(64'(gain_delta),64'(gain_frac),7'd21,7'd17,TAG_FIRE_BASE+8'd3);
+                    end
+                    4'd3: begin gain_work <= gain_base + rsp_gain_q16; op_index <= 4'd4; issue_multiply(64'(IC12_B0_LUT[filt_idx_work]),64'(ic12_u1),7'd27,7'd27,TAG_FIRE_BASE+8'd4); end
+                    4'd4: begin b0_work <= mul_rsp_product; op_index <= 4'd5; issue_multiply(64'(IC12_B2_LUT[filt_idx_work]),64'(ic12_u2),7'd27,7'd27,TAG_FIRE_BASE+8'd5); end
+                    4'd5: begin b2_work <= mul_rsp_product; op_index <= 4'd6; issue_multiply(64'(IC12_A1_LUT[filt_idx_work]),64'(ic12_y1),7'd27,7'd40,TAG_FIRE_BASE+8'd6); end
+                    4'd6: begin a1_work <= mul_rsp_product; op_index <= 4'd7; issue_multiply(64'(IC12_A2_LUT[filt_idx_work]),64'(ic12_y2),7'd27,7'd40,TAG_FIRE_BASE+8'd7); end
+                    4'd7: begin
+                        ic12_y_work <= (filter_scaled > 128'(IC12_RAIL_HI)) ? IC12_RAIL_HI : (filter_scaled < 128'(IC12_RAIL_LO)) ? IC12_RAIL_LO : 40'(filter_scaled);
+                        op_index <= 4'd8; issue_multiply(64'(ATTEN_Q16),64'(ic12_y1),7'd27,7'd40,TAG_FIRE_BASE+8'd8);
+                    end
+                    4'd8: begin op_index <= 4'd9; issue_multiply(64'(rsp_q16_32),64'(gain_work),7'd32,7'd21,TAG_FIRE_BASE+8'd9); end
+                    4'd9: begin op_index <= 4'd10; issue_multiply(64'(OUT_GAIN_Q16),64'(rsp_q16_32),7'd27,7'd32,TAG_FIRE_BASE+8'd10); end
+                    4'd10: begin fire_sample <= mix_sat; op_index <= 4'd11; issue_multiply(64'(A_CHARGE),64'(env),7'd27,7'd27,TAG_FIRE_BASE+8'd11); end
+                    4'd11: begin env_charge_a <= 54'(mul_rsp_product); op_index <= 4'd12; issue_multiply(64'(B_CHARGE),64'(VPEAK_SCALED),7'd27,7'd27,TAG_FIRE_BASE+8'd12); end
+                    4'd12: begin env_charge_work <= 27'((env_charge_a + 54'(mul_rsp_product)) >>> 16); op_index <= 4'd13; issue_multiply(64'(A_DECAY),64'(env),7'd27,7'd27,TAG_FIRE_BASE+8'd13); end
+                    default: begin env_decay_work <= rsp_env_q24; next_valid <= 1'b1; end
+                endcase
+            end
         end
     end
+
+`ifdef VERILATOR_SIM
+    always_ff @(posedge clk) begin
+        if (rst_n && mul_rsp_valid && waiting_response && (mul_rsp_tag != TAG_FIRE_BASE + 8'(op_index)))
+            $error("FIRE shared-multiply tag mismatch");
+        if (rst_n && sample_ce && (mul_req_valid || waiting_response))
+            $error("FIRE shared multiply missed sample deadline");
+    end
+`endif
 
 endmodule

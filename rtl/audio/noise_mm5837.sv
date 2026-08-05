@@ -40,10 +40,6 @@ module noise_mm5837 #(
     output logic signed [15:0] noise_b    // 4096 LSB = 1V, gain -0.303 tap
 );
 
-    // Q0.16 gain constants (see docs/audio-rtl-design.md)
-    localparam signed [31:0] GAIN_A = -32'sd6554;    // -0.10  * 65536
-    localparam signed [31:0] GAIN_B = -32'sd19857;   // -0.303 * 65536
-
     // 17-bit Fibonacci LFSR, bits 1..17 (1-indexed to match "taps 17,14").
     // Seeded non-zero out of reset so it can never lock up at all-zero.
     logic [17:1] lfsr;
@@ -61,9 +57,26 @@ module noise_mm5837 #(
     localparam signed [15:0] NOISE_HALF = 16'(NOISE_VPP_LSB / 2);
     wire signed [15:0] noise_raw = lfsr[17] ? NOISE_HALF : -NOISE_HALF;
 
-    // widen to 64 bits so the >>>16 is a real Q0.16 fixed-point multiply
-    wire signed [63:0] prod_a = noise_raw * GAIN_A;
-    wire signed [63:0] prod_b = noise_raw * GAIN_B;
+    // Preserve the former signed 64-bit Q0.16 products without inferring
+    // DSPs.  The fixed gains decompose exactly as:
+    //   6554  = 4096 + 2048 + 256 + 128 + 16 + 8 + 2
+    //   19857 = 16384 + 2048 + 1024 + 256 + 128 + 16 + 1
+    // Both analogue buffers invert, so the complete products are negated.
+    wire signed [63:0] noise_raw_ext = $signed({{48{noise_raw[15]}}, noise_raw});
+    wire signed [63:0] prod_a = -((noise_raw_ext <<< 12) +
+                                  (noise_raw_ext <<< 11) +
+                                  (noise_raw_ext <<< 8)  +
+                                  (noise_raw_ext <<< 7)  +
+                                  (noise_raw_ext <<< 4)  +
+                                  (noise_raw_ext <<< 3)  +
+                                  (noise_raw_ext <<< 1));
+    wire signed [63:0] prod_b = -((noise_raw_ext <<< 14) +
+                                  (noise_raw_ext <<< 11) +
+                                  (noise_raw_ext <<< 10) +
+                                  (noise_raw_ext <<< 8)  +
+                                  (noise_raw_ext <<< 7)  +
+                                  (noise_raw_ext <<< 4)  +
+                                  noise_raw_ext);
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
