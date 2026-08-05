@@ -456,26 +456,23 @@ module segavco
     // gated on mod_turbo so a Buck Rogers session doesn't burn BRAM loading
     // bytes that will never be read (and vice versa).
     //
-    // road_gen.v (Step 3) and mixer_turbo.v (Step 5) are the actual
-    // consumers of most of these; only PR-1119 (forwarded into sprite_engine
-    // as Turbo's Y-scale, above) is wired to a consumer this session --
-    // everything else here is loaded and named, ready for those steps.
-    // PR-1279 (sound, 0x1000-0x1020) is not loaded at all: Phase 4 scope.
+    // mixer_turbo.v (Step 5) and the collision detector (Step 6) are the
+    // actual consumers of most of these; only PR-1119 (forwarded into
+    // sprite_engine as Turbo's Y-scale, above) is wired to a consumer this
+    // session -- everything else here is loaded and named, ready for those
+    // steps. PR-1114/1115/1117 moved out to road_gen.v in Step 3, which owns
+    // and consumes them directly (same pattern as yscale_rom living inside
+    // sprite_engine rather than here). PR-1279 (sound, 0x1000-0x1020) is not
+    // loaded at all: Phase 4 scope.
     // ------------------------------------------------------------------
-    reg [7:0] turbo_pr1114[0:31];   // bacol low byte (road colour)
-    reg [7:0] turbo_pr1115[0:31];   // babit (AREA->road bits, incl. SLIPAR/ACCIAR)
     reg [7:0] turbo_pr1116[0:31];   // collision detect
-    reg [7:0] turbo_pr1117[0:31];   // bacol high byte
     reg [7:0] turbo_pr1118[0:255];  // forebits (foreground colour table)
     reg [7:0] turbo_pr1120[0:511];  // no consumer in MAME -- loaded, not wired
     reg [7:0] turbo_pr1121[0:511];  // final pen output
     reg [7:0] turbo_pr1122[0:1023]; // sprite priority
     reg [7:0] turbo_pr1123[0:1023]; // overall priority -> mx
 
-    wire        turbo_pr1114_we = mod_turbo && proms_we && (proms_wraddr < 13'h020);
-    wire        turbo_pr1115_we = mod_turbo && proms_we && (proms_wraddr >= 13'h020) && (proms_wraddr < 13'h040);
     wire        turbo_pr1116_we = mod_turbo && proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
-    wire        turbo_pr1117_we = mod_turbo && proms_we && (proms_wraddr >= 13'h060) && (proms_wraddr < 13'h100);
     wire        turbo_pr1118_we = mod_turbo && proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h200);
     wire        turbo_pr1120_we = mod_turbo && proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
     wire        turbo_pr1121_we = mod_turbo && proms_we && (proms_wraddr >= 13'h600) && (proms_wraddr < 13'h800);
@@ -489,16 +486,55 @@ module segavco
     wire [12:0] turbo_pr1123_off = proms_wraddr - 13'hC00;
 
     always @(posedge clk) begin
-        if (turbo_pr1114_we) turbo_pr1114[proms_wraddr[4:0]]   <= rom_dout;
-        if (turbo_pr1115_we) turbo_pr1115[proms_wraddr[4:0]]   <= rom_dout;
         if (turbo_pr1116_we) turbo_pr1116[proms_wraddr[4:0]]   <= rom_dout;
-        if (turbo_pr1117_we) turbo_pr1117[proms_wraddr[4:0]]   <= rom_dout;
         if (turbo_pr1118_we) turbo_pr1118[turbo_pr1118_off[7:0]]  <= rom_dout;
         if (turbo_pr1120_we) turbo_pr1120[turbo_pr1120_off[8:0]]  <= rom_dout;
         if (turbo_pr1121_we) turbo_pr1121[turbo_pr1121_off[8:0]]  <= rom_dout;
         if (turbo_pr1122_we) turbo_pr1122[turbo_pr1122_off[9:0]]  <= rom_dout;
         if (turbo_pr1123_we) turbo_pr1123[turbo_pr1123_off[9:0]]  <= rom_dout;
     end
+
+    // road_gen.v (Step 3): five ROM-driven edge comparisons per pixel that
+    // replace Buck Rogers' starfield/bgcolor background. Owns PR-1114/1115/
+    // 1117 directly (forwarded from the same proms_we/proms_wraddr window as
+    // above) plus its own 5 road ROM banks (shared "road" download slot with
+    // Buck's bgcolorrom, gated by mod_turbo the same way bgcolorrom_we is).
+    // PPI0/PPI1 are shared hardware between both games -- Turbo's opa/opb/
+    // opc/ipa/ipb/ipc are literally the same ppi0_pa/pb/pc, ppi1_pa/pb/pc
+    // wires Buck Rogers reads for its own purposes, just interpreted
+    // differently by Turbo's software (see docs/WORKPLAN_TURBO_GRAPHICS.md
+    // Step 7's register table). PPI3 (fbcol, fbpla) does not exist yet --
+    // Step 7 scope -- so fbcol0 is tied to 0 here as a placeholder; road_gen
+    // is otherwise functionally complete.
+    wire [7:0]  turbo_babit;
+    wire [15:0] turbo_bacol;
+    wire        turbo_road;
+    road_gen u_road
+    (
+        .clk        (clk),
+
+        .road_we    (road_we),
+        .road_addr  (road_wraddr),
+        .road_wdata (rom_dout),
+
+        .proms_we   (proms_we),
+        .proms_addr (proms_wraddr),
+        .proms_wdata(rom_dout),
+
+        .y          (y_native),
+        .xx         (xx_native),
+        .opa        (ppi0_pa),
+        .opb        (ppi0_pb),
+        .opc        (ppi0_pc),
+        .ipa        (ppi1_pa),
+        .ipb        (ppi1_pb),
+        .ipc        (ppi1_pc),
+        .fbcol0     (1'b0), // TODO Step 7: PPI3 port C bit4 (fbcol & 1)
+
+        .babit      (turbo_babit),
+        .bacol      (turbo_bacol),
+        .road       (turbo_road)
+    );
 
     wire [7:0]  sprram_rdata, sprpos_rdata;
     wire [31:0] sprbits;

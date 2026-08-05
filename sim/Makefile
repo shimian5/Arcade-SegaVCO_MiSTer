@@ -19,6 +19,7 @@ SOURCES = \
 	$(RTL_DIR)/video/video_timing.v \
 	$(RTL_DIR)/video/fg_tilemap.v \
 	$(RTL_DIR)/video/sprite_engine.v \
+	$(RTL_DIR)/video/road_gen.v \
 	$(wildcard $(RTL_DIR)/audio/*.sv) \
 	$(RTL_DIR)/io/i8255.v \
 	$(RTL_DIR)/io/i8279.v \
