@@ -10,15 +10,19 @@
 // single "if" (not a "while") per level per pixel is enough, no arbitration
 // needed).
 //
-// Game-specific constants are parameters, not hardcoded, per docs/PLAN.md's
-// sequencing note: "the sprite engine's game-specific bits (plb_end table,
-// X-scale constants, offset pre-shift, sprite-position RAM addressing) are
-// parameterized so it can be slotted in later [for Turbo/Subroc-3D] without
-// reopening the engine." This instance is wired up for Buck Rogers only;
-// Turbo's sprite-position addressing (sprpos[xx] | sprpos[xx+0x100]<<8,
-// vs. Buck Rogers' sprpos[xx*2] | sprpos[xx*2+1]<<8) and its different
-// self-termination test (bitmask compare, not a plb_end table) are NOT
-// implemented here -- that's phase 3 work.
+// Turbo mode (docs/WORKPLAN_TURBO_GRAPHICS.md Step 4): the runtime mod_turbo
+// strap selects between Buck Rogers and Turbo's sprite-engine differences --
+// XSCALE_THRESHOLD, the offset register's effective width/wraparound, ROM
+// bank size, Y-byte inversion, sprite-position RAM addressing, and the
+// self-termination test -- all switched at runtime rather than at
+// elaboration, since both games are resident in the same bitstream (Step 1).
+// Physical register/array widths stay fixed at Buck Rogers' (larger) sizes;
+// Turbo's narrower logical values are computed in their own native width
+// then zero-extended, which correctly reproduces MAME's masked/uint16_t
+// arithmetic (e.g. Turbo's ROM address is `(offs>>1)&0x3fff`, a real 14-bit
+// mask, not merely "the low 14 bits of whatever the 15-bit calculation gave"
+// -- those differ whenever the 15-bit calculation's bit 14 would have
+// carried into/out of a wider add).
 //
 // PR-5195 ("sprite state machine" per its ROM comment in turbo.cpp) has no
 // consumer anywhere in MAME's buckrog_state emulation: on real hardware it
@@ -60,12 +64,10 @@
 // mux (critical here: the 8 sprite-ROM banks alone are 256KB).
 module sprite_engine
 #(
-    parameter [31:0] XSCALE_THRESHOLD = 32'h00800000,   // Buck Rogers: 0x800000; Turbo: 0x1000000
-    parameter        OFFSET_PRESHIFT  = 1,               // Buck Rogers pre-shifts offset<<1; Turbo does not
-    parameter        ROM_ADDR_BITS    = 15,               // 32KB/level (Buck Rogers); Turbo uses 14 (16KB/level)
-    parameter        Y_INVERT         = 0,               // Turbo inverts sprite Y bytes (^0xff); Buck Rogers does not
     // plb_end[16], 2 bits/entry {END,PLB}, packed entry15..entry0 MSB..LSB.
-    // Default = Buck Rogers' table {0,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,2}.
+    // Buck Rogers only -- Turbo's self-termination test is a direct bitmask
+    // compare on pixdata, computed structurally below (see mod_turbo use
+    // in the per-level generate block).
     parameter [31:0] PLB_END          = {2'd2,2'd1,2'd1,2'd1, 2'd1,2'd1,2'd1,2'd1,
                                           2'd1,2'd1,2'd1,2'd1, 2'd1,2'd1,2'd1,2'd0},
     parameter        VTOTAL           = 264,
@@ -140,17 +142,25 @@ module sprite_engine
     end
 
     // ------------------------------------------------------------------
-    // Sprite-position RAM: split into lo/hi byte banks (CPU addr bit0
-    // selects bank) so the engine can read both bytes of a 16-bit
-    // horizontal-enable word in the same cycle from two independent
-    // 2-port BRAMs, instead of needing a 3rd port on one array.
+    // Sprite-position RAM: split into lo/hi byte banks so the engine can
+    // read both bytes of a 16-bit horizontal-enable word in the same cycle
+    // from two independent 2-port BRAMs, instead of needing a 3rd port on
+    // one array. The engine-side read (below, pos_prefetch_addr) is
+    // identical for both games -- xx directly indexes each bank regardless
+    // of how the CPU laid the two bytes out -- so only the CPU-side
+    // bank-select bit and index change with mod_turbo:
+    //   Buck Rogers: sprpos[xx*2] | sprpos[xx*2+1]<<8 (interleaved pairs,
+    //     bank select = addr[0], index = addr[9:1])
+    //   Turbo:       sprpos[xx] | sprpos[xx+0x100]<<8 (two flat 256B
+    //     blocks, bank select = addr[8], index = addr[7:0])
     // ------------------------------------------------------------------
     reg [7:0] sprpos_lo[0:511];
     reg [7:0] sprpos_hi[0:511];
 
-    wire        cpu_sprpos_we_lo = cpu_sprpos_we && !cpu_sprpos_addr[0];
-    wire        cpu_sprpos_we_hi = cpu_sprpos_we &&  cpu_sprpos_addr[0];
-    wire [8:0]  cpu_sprpos_idx   = cpu_sprpos_addr[9:1];
+    wire        cpu_sprpos_bank  = mod_turbo ? cpu_sprpos_addr[8] : cpu_sprpos_addr[0];
+    wire        cpu_sprpos_we_lo = cpu_sprpos_we && !cpu_sprpos_bank;
+    wire        cpu_sprpos_we_hi = cpu_sprpos_we &&  cpu_sprpos_bank;
+    wire [8:0]  cpu_sprpos_idx   = mod_turbo ? {1'b0, cpu_sprpos_addr[7:0]} : cpu_sprpos_addr[9:1];
     reg  [7:0]  cpu_sprpos_rdata_lo, cpu_sprpos_rdata_hi;
     always @(posedge clk) begin
         if (cpu_sprpos_we_lo) sprpos_lo[cpu_sprpos_idx] <= cpu_sprpos_wdata;
@@ -158,7 +168,7 @@ module sprite_engine
         cpu_sprpos_rdata_lo <= sprpos_lo[cpu_sprpos_idx];
         cpu_sprpos_rdata_hi <= sprpos_hi[cpu_sprpos_idx];
     end
-    always @(posedge clk) cpu_sprpos_rdata <= cpu_sprpos_addr[0] ? cpu_sprpos_rdata_hi : cpu_sprpos_rdata_lo;
+    always @(posedge clk) cpu_sprpos_rdata <= cpu_sprpos_bank ? cpu_sprpos_rdata_hi : cpu_sprpos_rdata_lo;
 
     // Engine read port, prefetched one native pixel ahead: address issued
     // while displaying column xx-1 targets column xx, so the registered
@@ -174,13 +184,26 @@ module sprite_engine
     end
 
     // ------------------------------------------------------------------
-    // 8 sprite-ROM banks, 32KB each (level = sproms_addr[17:15])
+    // 8 sprite-ROM banks, sized for Buck Rogers' larger 32KB/level (arrays
+    // are fixed at elaboration; Turbo's 16KB/level data simply occupies the
+    // low half of each array, addressed with the top bit forced 0).
+    // level = sproms_addr[17:15] (Buck, 32KB/level) or sproms_addr[16:14]
+    // (Turbo, 16KB/level). Turbo's actual ROM data only spans the low 128KB
+    // of the shared 256KB download slot (docs/WORKPLAN_TURBO_GRAPHICS.md
+    // Step 1's REGIONS table pads the rest with 0xFF filler to match Buck's
+    // fixed region size) -- since Turbo's level/offset decode only looks at
+    // addr[16:0], addresses at 0x20000+ (addr[17]=1) would alias directly
+    // onto 0x00000-0x1FFFF and silently overwrite real chip data with that
+    // trailing filler if not excluded, so sproms_we_eff gates them out.
     // ------------------------------------------------------------------
     reg [7:0] sprom0[0:32767], sprom1[0:32767], sprom2[0:32767], sprom3[0:32767];
     reg [7:0] sprom4[0:32767], sprom5[0:32767], sprom6[0:32767], sprom7[0:32767];
-    wire [14:0] sproms_off = sproms_addr[14:0];
+    wire [2:0]  sproms_level    = mod_turbo ? sproms_addr[16:14] : sproms_addr[17:15];
+    wire [14:0] sproms_off      = mod_turbo ? {1'b0, sproms_addr[13:0]} : sproms_addr[14:0];
+    wire        sproms_in_range = mod_turbo ? !sproms_addr[17] : 1'b1;
+    wire        sproms_we_eff   = sproms_we && sproms_in_range;
     always @(posedge clk) begin
-        if (sproms_we) case (sproms_addr[17:15])
+        if (sproms_we_eff) case (sproms_level)
             3'd0: sprom0[sproms_off] <= sproms_wdata;
             3'd1: sprom1[sproms_off] <= sproms_wdata;
             3'd2: sprom2[sproms_off] <= sproms_wdata;
@@ -194,9 +217,11 @@ module sprite_engine
 
     // Per-level registered read ports (one per bank, unrolled -- a `case`
     // can't select between separate `always` blocks, only between
-    // statements inside one).
-    wire [ROM_ADDR_BITS-1:0] rom_raddr [0:7];
-    reg  [7:0]                rom_dout [0:7];
+    // statements inside one). Sized for Buck's 15-bit address; Turbo's
+    // fetch_addr_reg (below) zero-extends its 14-bit address into this same
+    // width.
+    wire [14:0] rom_raddr [0:7];
+    reg  [7:0]  rom_dout [0:7];
     always @(posedge clk) rom_dout[0] <= sprom0[rom_raddr[0]];
     always @(posedge clk) rom_dout[1] <= sprom1[rom_raddr[1]];
     always @(posedge clk) rom_dout[2] <= sprom2[rom_raddr[2]];
@@ -232,7 +257,12 @@ module sprite_engine
     // ------------------------------------------------------------------
     // Per-level runtime state (8 levels)
     // ------------------------------------------------------------------
-    localparam OFFSET_WIDTH = 16 + OFFSET_PRESHIFT;
+    // Physical width fixed at Buck Rogers' 17 bits (16-bit offset + its
+    // preshift-by-1 extra precision bit); Turbo's logical 16-bit offset
+    // zero-extends into the same register (bit 16 always 0 for Turbo), see
+    // commit_offset/offset_next below for the width-aware wraparound this
+    // requires.
+    localparam OFFSET_WIDTH = 17;
 
     reg [OFFSET_WIDTH-1:0] offset_reg [0:7];
     reg [31:0]             step_reg   [0:7];
@@ -312,8 +342,8 @@ module sprite_engine
 
     // Two-stage carry ALU (docs/PLAN.md "Per-scanline prepare_sprites state
     // machine", step 1). Combinational from the just-captured Y bytes.
-    wire [7:0] y_lo_eff = Y_INVERT ? ~y_lo_reg : y_lo_reg;
-    wire [7:0] y_hi_eff = Y_INVERT ? ~y_hi_reg : y_hi_reg;
+    wire [7:0] y_lo_eff = mod_turbo ? ~y_lo_reg : y_lo_reg;
+    wire [7:0] y_hi_eff = mod_turbo ? ~y_hi_reg : y_hi_reg;
     wire [8:0] alu_sum1 = {1'b0, y_target} + {1'b0, y_lo_eff};
     wire       alu_clo  = alu_sum1[8];
     wire [16:0] alu_sum2 = {8'b0, alu_sum1} + {1'b0, y_target, 8'b0} + {1'b0, y_hi_eff, 8'b0};
@@ -394,7 +424,10 @@ module sprite_engine
                 if (ve_bit_reg) begin
                     commit_pulse  <= 1'b1;
                     commit_level  <= idx[2:0];
-                    commit_offset <= OFFSET_PRESHIFT ? {new_offset, 1'b0} : new_offset;
+                    // Buck Rogers pre-shifts (offset<<1, 17-bit value);
+                    // Turbo does not (16-bit value, zero-extended into the
+                    // same 17-bit register -- bit 16 stays 0).
+                    commit_offset <= mod_turbo ? {1'b0, new_offset} : {new_offset, 1'b0};
                     commit_step   <= xscale_dout;
                     ve_reg[idx]   <= 1'b1;
 
@@ -448,6 +481,25 @@ module sprite_engine
     wire [31:0] latched_masked [0:7];
     wire [7:0]  clear_lvl_vec;
 
+    // X-scale fire threshold: Buck Rogers 0x800000, Turbo 0x1000000
+    // (docs/reference/turbo_v.cpp's per-game sprite_xscale scaling target).
+    wire [31:0] xscale_threshold = mod_turbo ? 32'h01000000 : 32'h00800000;
+
+    // ROM address from a 17-bit offset register: Buck Rogers uses the full
+    // offs[15:1] (15 bits, natural wraparound); Turbo masks to offs[14:1]
+    // (14 bits, matching MAME's explicit "(offs>>1)&0x3fff") -- computed in
+    // Turbo's own 16-bit-wide slice first so its wraparound is confined to
+    // 16 bits before zero-extending into this module's unified 17-bit
+    // offset register width, then zero-extended again into the unified
+    // 15-bit ROM address bus.
+    function [14:0] rom_addr_from_offs;
+        input        turbo;
+        input [16:0] offs;
+        begin
+            rom_addr_from_offs = turbo ? {1'b0, offs[14:1]} : offs[15:1];
+        end
+    endfunction
+
     genvar lvl;
     generate
         for (lvl = 0; lvl < 8; lvl = lvl + 1) begin : levels
@@ -474,16 +526,26 @@ module sprite_engine
             // pos_prefetch_addr latch) keeps rom_raddr -- and hence
             // rom_dout -- stable for the entire period until the NEXT fire,
             // so consumption always sees the byte this fire actually meant.
-            reg [ROM_ADDR_BITS-1:0] fetch_addr_reg;
+            reg [14:0] fetch_addr_reg;
             assign rom_raddr[lvl] = fetch_addr_reg;
 
             wire        live     = lst_eff[lvl];
             wire [32:0] frac_sum = {1'b0, frac_reg[lvl]} + {1'b0, step_reg[lvl]};
-            wire        fire     = live && (frac_sum >= {1'b0, XSCALE_THRESHOLD});
+            wire        fire     = live && (frac_sum >= {1'b0, xscale_threshold});
 
             wire [3:0] pixdata   = nibble_sel_pending[lvl] ? rom_dout[lvl][7:4] : rom_dout[lvl][3:0];
             wire [1:0] plb_end_v = PLB_END[pixdata*2 +: 2];
-            assign clear_lvl_vec[lvl] = fire_pending[lvl] && plb_end_v[1];
+            // Buck Rogers: plb_end table lookup. Turbo: direct bitmask test,
+            // no table (turbo_v.cpp:327 -- "if bit 3 is 0 and bit 2 is 1,
+            // the enable flip/flop is reset", i.e. (pixdata & 0x0c) == 0x04).
+            // Turbo's PLB bit needs no separate handling here: sprite_expand
+            // already puts pixdata bit 3 at bit 24 of the 32-bit word (D24 =
+            // PLB0 before the <<lvl below), so it rides along inside sprbits
+            // automatically -- Turbo's mixer (a later step) reads PLB from
+            // sprbits directly instead of this module's plb output.
+            wire        turbo_end = (pixdata[3:2] == 2'b01);
+            wire        lvl_end   = mod_turbo ? turbo_end : plb_end_v[1];
+            assign clear_lvl_vec[lvl] = fire_pending[lvl] && lvl_end;
 
             // Sole driver of offset_reg[lvl]/step_reg[lvl]/frac_reg[lvl]/
             // latched_reg[lvl]/plb_bit_reg[lvl] -- both the prepare_sprites
@@ -499,15 +561,25 @@ module sprite_engine
             // nibble_sel_pending below -- matching sim/golden_buckrog.py's
             // `get_sprite_bits` (turbo_v.cpp), which fetches with `offs =
             // st["offset"]` and only increments afterward.
+            // Buck Rogers decrements when offset bit 16 (0x10000) is set,
+            // wrapping the full 17-bit register (turbo_v.cpp-equivalent
+            // buckrog logic uses a wider offset than Turbo's real uint16_t).
+            // Turbo decrements when offset bit 15 (0x8000) is set
+            // (turbo_v.cpp:334, "if bit 15 is set, we decrement instead"),
+            // wrapping only its native 16 bits -- computed in a 16-bit slice
+            // first so a decrement from 0 wraps to 0xFFFF, not into bit 16
+            // of the unified register, then zero-extended to match.
+            wire [16:0] offset_next_buck =
+                offset_reg[lvl] + (offset_reg[lvl][16] ? 17'h1FFFF : 17'h00001);
+            wire [15:0] offset_next_turbo16 =
+                offset_reg[lvl][15:0] + (offset_reg[lvl][15] ? 16'hFFFF : 16'h0001);
             wire [OFFSET_WIDTH-1:0] offset_next =
-                offset_reg[lvl] + (offset_reg[lvl][OFFSET_WIDTH-1] ?
-                                    {OFFSET_WIDTH{1'b1}} :
-                                    {{(OFFSET_WIDTH-1){1'b0}}, 1'b1});
+                mod_turbo ? {1'b0, offset_next_turbo16} : offset_next_buck;
 
             always @(posedge clk) begin
                 if (commit_now) begin
                     offset_reg[lvl]  <= commit_offset;
-                    fetch_addr_reg   <= commit_offset[ROM_ADDR_BITS:1];
+                    fetch_addr_reg   <= rom_addr_from_offs(mod_turbo, commit_offset);
                     step_reg[lvl]    <= commit_step;
                     frac_reg[lvl]    <= 32'd0;
                     latched_reg[lvl] <= 32'd0;
@@ -515,10 +587,10 @@ module sprite_engine
                     fire_pending[lvl] <= 1'b0;
                 end else if (active_pix) begin
                     if (live) begin
-                        frac_reg[lvl] <= fire ? (frac_sum[31:0] - XSCALE_THRESHOLD) : frac_sum[31:0];
+                        frac_reg[lvl] <= fire ? (frac_sum[31:0] - xscale_threshold) : frac_sum[31:0];
                         if (fire) begin
                             offset_reg[lvl]         <= offset_next;
-                            fetch_addr_reg          <= offset_reg[lvl][ROM_ADDR_BITS:1];
+                            fetch_addr_reg          <= rom_addr_from_offs(mod_turbo, offset_reg[lvl]);
                             nibble_sel_pending[lvl] <= ~offset_reg[lvl][0];
                             fire_pending[lvl]       <= 1'b1;
                         end else begin
