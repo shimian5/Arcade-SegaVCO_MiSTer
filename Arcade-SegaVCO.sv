@@ -114,6 +114,7 @@ wire        ioctl_download;
 wire        ioctl_wr;
 wire [24:0] ioctl_addr;
 wire [7:0]  ioctl_dout;
+wire [15:0] ioctl_index;
 
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
@@ -131,13 +132,25 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
+	.ioctl_index(ioctl_index),
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({status[5]}),
+	// bit1 = mod_turbo, reserved for Turbo's own DIP page(s) (Step 7 of
+	// docs/WORKPLAN_TURBO_GRAPHICS.md) to hide Buck Rogers' P1 DIP page
+	// and vice versa; no CONF_STR entry references it yet since Turbo has
+	// no menu items of its own in this step. bit0 unchanged.
+	.status_menumask({mod_turbo, status[5]}),
 
 	.ps2_key(ps2_key)
 );
+
+// Game strap: ioctl_index 1 is the mod byte MRA part gen_mra.py emits
+// after every game's ROM regions (00 = Buck Rogers, 01 = Turbo). One RBF,
+// selected at ROM-load time -- see docs/WORKPLAN_TURBO_GRAPHICS.md Step 1.
+reg [7:0] mod_game;
+always @(posedge clk_sys) if (ioctl_wr && ioctl_index == 16'd1) mod_game <= ioctl_dout;
+wire mod_turbo = mod_game[0];
 
 // IN0/IN1/DSW1/DSW2 -- docs/PLAN.md phase 1 CPU/memory table, buckrog
 // INPUT_PORTS_START in docs/reference/turbo.cpp. Joystick bit convention:
@@ -243,6 +256,8 @@ segavco segavco
 (
 	.clk(clk_sys),
 	.reset(reset),
+
+	.mod_turbo(mod_turbo),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_wr(ioctl_wr),

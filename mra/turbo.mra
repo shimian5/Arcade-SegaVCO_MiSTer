@@ -58,5 +58,6 @@
     <part name="epr-1258.prom-ic49" crc="aee6e05e"/>
     <part repeat="131072">FF</part>
   </rom>
+  <rom index="1"><part>01</part></rom>
 
 </misterromdescription>

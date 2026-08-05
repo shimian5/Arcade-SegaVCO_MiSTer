@@ -21,6 +21,13 @@ module segavco
     input  wire        clk,             // core clock, ~39.936 MHz nominal
     input  wire        reset,
 
+    // One-RBF game strap (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1): 0 = Buck
+    // Rogers, 1 = Turbo. Selects between the two games' data in every LUT
+    // that $readmemh loaded at elaboration time (palette_rom here; xscale_lut
+    // in sprite_engine.v) and, from Step 2 onward, the PROM sub-window
+    // layout and CPU memory map.
+    input  wire         mod_turbo,
+
     input  wire         ioctl_download,
     input  wire         ioctl_wr,
     input  wire [24:0]  ioctl_addr,
@@ -422,19 +429,76 @@ module segavco
 `endif
     );
 
-    // pr-5196 (Y-scale, 512B @ proms offset 0x100) and pr-5199 (sprite
-    // color table, 1024B @ proms offset 0x700) forwarded from the shared
-    // PROMS blob, same pattern as xshift_we/color_table above. Full-width
-    // subtraction before slicing (not truncation) -- see rom_download.v's
-    // header comment on why that matters for non-zero-based windows.
-    wire        yscale_we_fwd = proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h300);
-    wire [12:0] yscale_off    = proms_wraddr - 13'h100;
+    // pr-5196 (Buck Rogers Y-scale, 512B @ proms offset 0x100) / pr-1119
+    // (Turbo Y-scale equivalent, 512B @ proms offset 0x200 -- see the PROM
+    // table in docs/WORKPLAN_TURBO_GRAPHICS.md Step 2) and pr-5199 (Buck
+    // Rogers sprite color table, 1024B @ proms offset 0x700) forwarded from
+    // the shared PROMS blob, same pattern as xshift_we/color_table above.
+    // Full-width subtraction before slicing (not truncation) -- see
+    // rom_download.v's header comment on why that matters for non-zero-based
+    // windows. Only one game's proms blob is ever loaded at boot, so the
+    // window simply moves with mod_turbo rather than needing two forwards.
+    wire [12:0] yscale_base   = mod_turbo ? 13'h200 : 13'h100;
+    wire        yscale_we_fwd = proms_we && (proms_wraddr >= yscale_base) && (proms_wraddr < yscale_base + 13'h200);
+    wire [12:0] yscale_off    = proms_wraddr - yscale_base;
 
     wire        sprcolor_we_fwd = proms_we && (proms_wraddr >= 13'h700) && (proms_wraddr < 13'hB00);
     wire [12:0] sprcolor_off    = proms_wraddr - 13'h700;
 
     reg [7:0] sprcolor_table[0:1023]; // pr-5199
     always @(posedge clk) if (sprcolor_we_fwd) sprcolor_table[sprcolor_off[9:0]] <= rom_dout;
+
+    // ------------------------------------------------------------------
+    // Turbo PROM sub-window routing (docs/WORKPLAN_TURBO_GRAPHICS.md Step 2).
+    // Turbo's proms blob has a completely different layout from Buck's,
+    // verified against docs/reference/turbo_v.cpp:354-361 and mra/turbo.mra.
+    // Same shared proms_we/proms_wraddr download slot as Buck's PROMs above;
+    // gated on mod_turbo so a Buck Rogers session doesn't burn BRAM loading
+    // bytes that will never be read (and vice versa).
+    //
+    // road_gen.v (Step 3) and mixer_turbo.v (Step 5) are the actual
+    // consumers of most of these; only PR-1119 (forwarded into sprite_engine
+    // as Turbo's Y-scale, above) is wired to a consumer this session --
+    // everything else here is loaded and named, ready for those steps.
+    // PR-1279 (sound, 0x1000-0x1020) is not loaded at all: Phase 4 scope.
+    // ------------------------------------------------------------------
+    reg [7:0] turbo_pr1114[0:31];   // bacol low byte (road colour)
+    reg [7:0] turbo_pr1115[0:31];   // babit (AREA->road bits, incl. SLIPAR/ACCIAR)
+    reg [7:0] turbo_pr1116[0:31];   // collision detect
+    reg [7:0] turbo_pr1117[0:31];   // bacol high byte
+    reg [7:0] turbo_pr1118[0:255];  // forebits (foreground colour table)
+    reg [7:0] turbo_pr1120[0:511];  // no consumer in MAME -- loaded, not wired
+    reg [7:0] turbo_pr1121[0:511];  // final pen output
+    reg [7:0] turbo_pr1122[0:1023]; // sprite priority
+    reg [7:0] turbo_pr1123[0:1023]; // overall priority -> mx
+
+    wire        turbo_pr1114_we = mod_turbo && proms_we && (proms_wraddr < 13'h020);
+    wire        turbo_pr1115_we = mod_turbo && proms_we && (proms_wraddr >= 13'h020) && (proms_wraddr < 13'h040);
+    wire        turbo_pr1116_we = mod_turbo && proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
+    wire        turbo_pr1117_we = mod_turbo && proms_we && (proms_wraddr >= 13'h060) && (proms_wraddr < 13'h100);
+    wire        turbo_pr1118_we = mod_turbo && proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h200);
+    wire        turbo_pr1120_we = mod_turbo && proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
+    wire        turbo_pr1121_we = mod_turbo && proms_we && (proms_wraddr >= 13'h600) && (proms_wraddr < 13'h800);
+    wire        turbo_pr1122_we = mod_turbo && proms_we && (proms_wraddr >= 13'h800) && (proms_wraddr < 13'hC00);
+    wire        turbo_pr1123_we = mod_turbo && proms_we && (proms_wraddr >= 13'hC00) && (proms_wraddr < 13'h1000);
+
+    wire [12:0] turbo_pr1118_off = proms_wraddr - 13'h100;
+    wire [12:0] turbo_pr1120_off = proms_wraddr - 13'h400;
+    wire [12:0] turbo_pr1121_off = proms_wraddr - 13'h600;
+    wire [12:0] turbo_pr1122_off = proms_wraddr - 13'h800;
+    wire [12:0] turbo_pr1123_off = proms_wraddr - 13'hC00;
+
+    always @(posedge clk) begin
+        if (turbo_pr1114_we) turbo_pr1114[proms_wraddr[4:0]]   <= rom_dout;
+        if (turbo_pr1115_we) turbo_pr1115[proms_wraddr[4:0]]   <= rom_dout;
+        if (turbo_pr1116_we) turbo_pr1116[proms_wraddr[4:0]]   <= rom_dout;
+        if (turbo_pr1117_we) turbo_pr1117[proms_wraddr[4:0]]   <= rom_dout;
+        if (turbo_pr1118_we) turbo_pr1118[turbo_pr1118_off[7:0]]  <= rom_dout;
+        if (turbo_pr1120_we) turbo_pr1120[turbo_pr1120_off[8:0]]  <= rom_dout;
+        if (turbo_pr1121_we) turbo_pr1121[turbo_pr1121_off[8:0]]  <= rom_dout;
+        if (turbo_pr1122_we) turbo_pr1122[turbo_pr1122_off[9:0]]  <= rom_dout;
+        if (turbo_pr1123_we) turbo_pr1123[turbo_pr1123_off[9:0]]  <= rom_dout;
+    end
 
     wire [7:0]  sprram_rdata, sprpos_rdata;
     wire [31:0] sprbits;
@@ -612,6 +676,8 @@ module segavco
     (
         .clk              (clk),
         .reset            (reset),
+
+        .mod_turbo        (mod_turbo),
 
         .cpu_sprram_we    (sel_sprram && cpu_write),
         .cpu_sprram_addr  (cpu_a[9:0]),
@@ -895,11 +961,16 @@ module segavco
                           star_bit             ? 10'h0ff :                // bitmap/star
                                                   repack_bg(bgcolor_reg);  // bgcolor
 
-    reg [23:0] palette_rom[0:1023];
-    initial $readmemh("roms/palette_buckrog.hex", palette_rom);
+    // Combined buckrog/turbo palette (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1):
+    // $readmemh can't be conditional on mod_turbo, so both games' tables are
+    // loaded into one 2048-entry BRAM and selected by indexing on mod_turbo
+    // as the MSB -- buckrog at 0-1023 (10-bit palbits), turbo at 1024-1279
+    // (8-bit pen, zero-extended to 10 bits by the two 0 bits below).
+    reg [23:0] palette_rom[0:2047];
+    initial $readmemh("roms/palette_combined.hex", palette_rom);
 
     reg [23:0] rgb_reg;
-    always @(posedge clk) rgb_reg <= palette_rom[palbits];
+    always @(posedge clk) rgb_reg <= palette_rom[{mod_turbo, palbits}];
 
     assign video_r = (hblank | vblank) ? 8'h0 : rgb_reg[23:16];
     assign video_g = (hblank | vblank) ? 8'h0 : rgb_reg[15:8];

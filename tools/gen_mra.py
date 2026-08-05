@@ -93,8 +93,15 @@ def build_rom_xml(game):
 def build_dip_xml(game):
     return game.get("dips", "")
 
+def build_mod_xml(game):
+    # One-RBF game strap (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1): a single
+    # byte at ioctl_index 1, latched into mod_game in Arcade-SegaVCO.sv.
+    # 00 = Buck Rogers, 01 = Turbo.
+    return f'  <rom index="1"><part>{game["mod"]:02X}</part></rom>'
+
 def build_mra(game):
     rom_xml = build_rom_xml(game)
+    mod_xml = build_mod_xml(game)
     dip_xml = build_dip_xml(game)
     xml = f'''<misterromdescription>
   <name>{game["name"]}</name>
@@ -103,6 +110,7 @@ def build_mra(game):
   <manufacturer>{game["manufacturer"]}</manufacturer>
   <rbf>Arcade-SegaVCO</rbf>
 {rom_xml}
+{mod_xml}
 {dip_xml}
 </misterromdescription>
 '''
@@ -115,6 +123,7 @@ GAMES = {
         "zip": "buckrogn.zip|buckrog.zip",
         "year": 1982,
         "manufacturer": "Sega",
+        "mod": 0,
         "regions": {
             "maincpu": [
                 ("epr-5257.cpu-ic3", 0x0000, 0x4000, "7f1910af"),
@@ -159,6 +168,7 @@ GAMES = {
         "zip": "buckrog.zip",
         "year": 1982,
         "manufacturer": "Sega",
+        "mod": 0,
         "regions": {
             "maincpu": [
                 ("epr-5265.cpu-ic3", 0x0000, 0x4000, "f0055e97"),
@@ -203,6 +213,7 @@ GAMES = {
         "zip": "turbo.zip",
         "year": 1981,
         "manufacturer": "Sega",
+        "mod": 1,
         "regions": {
             "maincpu": [
                 ("epr-1513.cpu-ic76",  0x0000, 0x2000, "0326adfc"),
