@@ -116,6 +116,17 @@ module sprite_engine
 
     input  wire [2:0]   obch,        // PPI1 port C bits 0-2 (tied 0 until PPI1 is wired up)
 
+    // Turbo only (docs/WORKPLAN_TURBO_GRAPHICS.md Step 3/5): road_gen's
+    // "road" latch (turbo_v.cpp:302-303 -- "if we haven't left the road yet,
+    // sprites 3-7 are disabled"). Fed straight from road_gen's registered
+    // output with no further delay-matching: it only ever transitions once
+    // per scanline (0->1), and road_gen's own ~3clk settle time is small
+    // relative to a native pixel's 8clk dwell, so the only imprecision this
+    // can introduce is a few-native-pixel window right at that one
+    // transition point each scanline -- not validated against a golden
+    // model, see the work log. Ignored when !mod_turbo.
+    input  wire         road_in,
+
     // Real-time per-pixel output, zero added latency vs. hpos/vpos -- caller
     // delay-matches against the fg-tilemap path itself.
     output wire [31:0]  sprbits,     // CDA0-7=D0-7, CDB0-7=D8-15, CDC0-7=D16-23, CDD0-7=D24-31
@@ -529,7 +540,16 @@ module sprite_engine
             reg [14:0] fetch_addr_reg;
             assign rom_raddr[lvl] = fetch_addr_reg;
 
-            wire        live     = lst_eff[lvl];
+            // Turbo: levels 3-7 read as dead until road_in goes high this
+            // scanline (turbo_v.cpp:302-303); levels 0-2 and Buck Rogers
+            // (any level) are never masked. Gates both the fetch/advance
+            // path (live, here) and the output path (latched_masked, below)
+            // -- matching MAME's local `sprlive` copy, which masks both the
+            // per-pixel sprdata accumulation and the fetch/advance loop, but
+            // never the persistent lst register's own accumulation
+            // (lst_active's update below is intentionally NOT road-gated).
+            wire        road_gate = !mod_turbo || (lvl < 3) || road_in;
+            wire        live      = lst_eff[lvl] && road_gate;
             wire [32:0] frac_sum = {1'b0, frac_reg[lvl]} + {1'b0, step_reg[lvl]};
             wire        fire     = live && (frac_sum >= {1'b0, xscale_threshold});
 
@@ -623,7 +643,7 @@ module sprite_engine
             // using lst_eff -- fire cadence was independently confirmed
             // bit-exact against golden with that in place, so only the
             // display path needed correcting.
-            assign latched_masked[lvl] = lst_active[lvl] ? latched_reg[lvl] : 32'd0;
+            assign latched_masked[lvl] = (lst_active[lvl] && road_gate) ? latched_reg[lvl] : 32'd0;
         end
     endgenerate
 

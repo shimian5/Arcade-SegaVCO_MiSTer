@@ -410,6 +410,7 @@ module segavco
     fg_tilemap u_fg
     (
         .clk          (clk),
+        .mod_turbo    (mod_turbo),
         .cpu_we       (sel_vram && cpu_write),
         .cpu_addr     (cpu_a[10:0]),
         .cpu_wdata    (cpu_do),
@@ -456,42 +457,24 @@ module segavco
     // gated on mod_turbo so a Buck Rogers session doesn't burn BRAM loading
     // bytes that will never be read (and vice versa).
     //
-    // mixer_turbo.v (Step 5) and the collision detector (Step 6) are the
-    // actual consumers of most of these; only PR-1119 (forwarded into
-    // sprite_engine as Turbo's Y-scale, above) is wired to a consumer this
-    // session -- everything else here is loaded and named, ready for those
-    // steps. PR-1114/1115/1117 moved out to road_gen.v in Step 3, which owns
-    // and consumes them directly (same pattern as yscale_rom living inside
-    // sprite_engine rather than here). PR-1279 (sound, 0x1000-0x1020) is not
-    // loaded at all: Phase 4 scope.
+    // mixer_turbo.v (Step 5) owns and consumes PR-1118/1121/1122/1123
+    // directly (moved out below, same reasoning as PR-1114/1115/1117 moving
+    // into road_gen.v in Step 3). The collision detector (Step 6) is the
+    // only remaining unbuilt consumer, so PR-1116 stays here as a holding
+    // pattern. PR-1279 (sound, 0x1000-0x1020) is not loaded at all: Phase 4
+    // scope.
     // ------------------------------------------------------------------
     reg [7:0] turbo_pr1116[0:31];   // collision detect
-    reg [7:0] turbo_pr1118[0:255];  // forebits (foreground colour table)
     reg [7:0] turbo_pr1120[0:511];  // no consumer in MAME -- loaded, not wired
-    reg [7:0] turbo_pr1121[0:511];  // final pen output
-    reg [7:0] turbo_pr1122[0:1023]; // sprite priority
-    reg [7:0] turbo_pr1123[0:1023]; // overall priority -> mx
 
     wire        turbo_pr1116_we = mod_turbo && proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
-    wire        turbo_pr1118_we = mod_turbo && proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h200);
     wire        turbo_pr1120_we = mod_turbo && proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
-    wire        turbo_pr1121_we = mod_turbo && proms_we && (proms_wraddr >= 13'h600) && (proms_wraddr < 13'h800);
-    wire        turbo_pr1122_we = mod_turbo && proms_we && (proms_wraddr >= 13'h800) && (proms_wraddr < 13'hC00);
-    wire        turbo_pr1123_we = mod_turbo && proms_we && (proms_wraddr >= 13'hC00) && (proms_wraddr < 13'h1000);
 
-    wire [12:0] turbo_pr1118_off = proms_wraddr - 13'h100;
     wire [12:0] turbo_pr1120_off = proms_wraddr - 13'h400;
-    wire [12:0] turbo_pr1121_off = proms_wraddr - 13'h600;
-    wire [12:0] turbo_pr1122_off = proms_wraddr - 13'h800;
-    wire [12:0] turbo_pr1123_off = proms_wraddr - 13'hC00;
 
     always @(posedge clk) begin
         if (turbo_pr1116_we) turbo_pr1116[proms_wraddr[4:0]]   <= rom_dout;
-        if (turbo_pr1118_we) turbo_pr1118[turbo_pr1118_off[7:0]]  <= rom_dout;
         if (turbo_pr1120_we) turbo_pr1120[turbo_pr1120_off[8:0]]  <= rom_dout;
-        if (turbo_pr1121_we) turbo_pr1121[turbo_pr1121_off[8:0]]  <= rom_dout;
-        if (turbo_pr1122_we) turbo_pr1122[turbo_pr1122_off[9:0]]  <= rom_dout;
-        if (turbo_pr1123_we) turbo_pr1123[turbo_pr1123_off[9:0]]  <= rom_dout;
     end
 
     // road_gen.v (Step 3): five ROM-driven edge comparisons per pixel that
@@ -714,6 +697,7 @@ module segavco
         .reset            (reset),
 
         .mod_turbo        (mod_turbo),
+        .road_in          (turbo_road),
 
         .cpu_sprram_we    (sel_sprram && cpu_write),
         .cpu_sprram_addr  (cpu_a[9:0]),
@@ -990,12 +974,36 @@ module segavco
         repack_bg = ({2'b00, p} & 10'h0c0) | (({2'b00, p} & 10'h030) << 4) | (({2'b00, p} & 10'h00f) << 2);
     endfunction
 
-    wire [9:0] palbits_fg = {2'b00, repack(forebits_reg4)};
-    wire [9:0] palbits = (!forebits_reg4[7]) ? palbits_fg :             // fg tier 1
+    wire [9:0] palbits_buck = (!forebits_reg4[7]) ? palbits_fg :             // fg tier 1
                           (!mux_reg[3])       ? {2'b00, sprcolor_dout} : // sprite
                           (!forebits_reg4[6]) ? palbits_fg :             // fg tier 2
                           star_bit             ? 10'h0ff :                // bitmap/star
                                                   repack_bg(bgcolor_reg);  // bgcolor
+    wire [9:0] palbits_fg = {2'b00, repack(forebits_reg4)};
+
+    // mixer_turbo.v (Step 5): bit-serial 16:1 mux, entirely separate from
+    // Buck Rogers' ordinal priority chain above. sprbits is the same
+    // real-time wire Buck's SPR_TO_MIX_DELAY path taps; foreraw/babit/bacol
+    // are fg_tilemap's/road_gen's own outputs. fbpla/fbcol (PPI3 port C,
+    // Step 7) don't exist yet -- tied to 0, same placeholder pattern as
+    // road_gen's fbcol0.
+    wire [7:0] turbo_pen;
+    mixer_turbo u_mixer_turbo
+    (
+        .clk         (clk),
+        .proms_we    (proms_we),
+        .proms_addr  (proms_wraddr),
+        .proms_wdata (rom_dout),
+        .sprbits     (sprbits),
+        .foreraw     (foreraw),
+        .babit       (turbo_babit),
+        .bacol       (turbo_bacol),
+        .fbpla       (4'h0), // TODO Step 7: PPI3 port C low nibble
+        .fbcol       (3'h0), // TODO Step 7: PPI3 port C bits 4-6
+        .pen         (turbo_pen)
+    );
+
+    wire [9:0] palbits = mod_turbo ? {2'b00, turbo_pen} : palbits_buck;
 
     // Combined buckrog/turbo palette (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1):
     // $readmemh can't be conditional on mod_turbo, so both games' tables are
@@ -1014,28 +1022,39 @@ module segavco
 
     // ------------------------------------------------------------------
     // Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with
-    // the pipeline latency above (fg_tilemap's 4 + color_table's 1 +
-    // forebits_reg2/3/4's 3 = 8 clk = 2 whole output pixels, matching
+    // the pipeline latency above. Buck Rogers: fg_tilemap's 4 + color_table's
+    // 1 + forebits_reg2/3/4's 3 = 8 clk = 2 whole output pixels, matching
     // sprcolor_dout/mux_reg's and the star/bgcolor branches' 8 hops, see
-    // SPR_TO_MIX_DELAY/COORD_DELAY comments above; + palette_rom's 1 = 9),
-    // so the sync signals output alongside rgb_reg describe the same
-    // original hpos/vpos that produced it.
+    // SPR_TO_MIX_DELAY/COORD_DELAY comments above; + palette_rom's 1 = 9.
+    // Turbo: mixer_turbo.v's own documented 11-clk latency (live pixel ->
+    // pen) + palette_rom's 1 = 12 -- deeper than Buck's because of the real
+    // (not padding) 3-deep sequential PR-1122->PR-1123->PR-1121 ROM-read
+    // chain mixer_turbo.v's header explains. Since the two games need
+    // different total latencies but this is one shared delay line (no
+    // per-game duplicate exists), the shift registers are sized to the
+    // larger of the two (12) and mod_turbo selects which tap is "the end"
+    // -- the extra 3 stages of shift register the Buck Rogers path doesn't
+    // need cost a handful of FFs, not worth a second parallel delay line.
     // ------------------------------------------------------------------
-    localparam VIDEO_PIPE_LATENCY = 9;
+    localparam VIDEO_PIPE_LATENCY_BUCK  = 9;
+    localparam VIDEO_PIPE_LATENCY_TURBO = 12;
+    localparam VIDEO_PIPE_LATENCY_MAX   = 12;
 
-    reg [VIDEO_PIPE_LATENCY-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
+    wire [3:0] video_pipe_tap = (mod_turbo ? VIDEO_PIPE_LATENCY_TURBO : VIDEO_PIPE_LATENCY_BUCK) - 4'd1;
+
+    reg [VIDEO_PIPE_LATENCY_MAX-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
     always @(posedge clk) begin
-        hblank_pipe <= {hblank_pipe[VIDEO_PIPE_LATENCY-2:0], hblank_raw};
-        vblank_pipe <= {vblank_pipe[VIDEO_PIPE_LATENCY-2:0], vblank_raw};
-        hsync_pipe  <= {hsync_pipe [VIDEO_PIPE_LATENCY-2:0], hsync_raw};
-        vsync_pipe  <= {vsync_pipe [VIDEO_PIPE_LATENCY-2:0], vsync_raw};
-        ce_pix_pipe <= {ce_pix_pipe[VIDEO_PIPE_LATENCY-2:0], ce_pix_int};
+        hblank_pipe <= {hblank_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], hblank_raw};
+        vblank_pipe <= {vblank_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], vblank_raw};
+        hsync_pipe  <= {hsync_pipe [VIDEO_PIPE_LATENCY_MAX-2:0], hsync_raw};
+        vsync_pipe  <= {vsync_pipe [VIDEO_PIPE_LATENCY_MAX-2:0], vsync_raw};
+        ce_pix_pipe <= {ce_pix_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], ce_pix_int};
     end
-    assign hblank = hblank_pipe[VIDEO_PIPE_LATENCY-1];
-    assign vblank = vblank_pipe[VIDEO_PIPE_LATENCY-1];
-    assign hsync  = hsync_pipe [VIDEO_PIPE_LATENCY-1];
-    assign vsync  = vsync_pipe [VIDEO_PIPE_LATENCY-1];
-    assign ce_pix = ce_pix_pipe[VIDEO_PIPE_LATENCY-1];
+    assign hblank = hblank_pipe[video_pipe_tap];
+    assign vblank = vblank_pipe[video_pipe_tap];
+    assign hsync  = hsync_pipe [video_pipe_tap];
+    assign vsync  = vsync_pipe [video_pipe_tap];
+    assign ce_pix = ce_pix_pipe[video_pipe_tap];
 
 `ifdef SIM_DEBUG_TRACE
     // Session-6-continued (CPU/game-state divergence investigation): latch
@@ -1269,7 +1288,10 @@ module segavco
         end
     end
     always @(posedge clk) begin
-        if (ce_pix_pipe[VIDEO_PIPE_LATENCY-1] && !vblank_pipe[VIDEO_PIPE_LATENCY-1] && !hblank_pipe[VIDEO_PIPE_LATENCY-1]) begin
+        // Buck Rogers-only diagnostic (forebits_reg4/mux_reg/star_bit below
+        // are Buck's own mixer signals) -- always keys off the Buck tap
+        // regardless of mod_turbo, since it's meaningless for Turbo.
+        if (ce_pix_pipe[VIDEO_PIPE_LATENCY_BUCK-1] && !vblank_pipe[VIDEO_PIPE_LATENCY_BUCK-1] && !hblank_pipe[VIDEO_PIPE_LATENCY_BUCK-1]) begin
             if (!forebits_reg4[7])      dbg_tier1  = dbg_tier1 + 1;
             else if (!mux_reg[3])       dbg_sprite = dbg_sprite + 1;
             else if (!forebits_reg4[6]) dbg_tier2  = dbg_tier2 + 1;

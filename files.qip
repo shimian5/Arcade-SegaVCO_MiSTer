@@ -9,6 +9,7 @@ set_global_assignment -name VERILOG_FILE rtl/video/video_timing.v
 set_global_assignment -name VERILOG_FILE rtl/video/fg_tilemap.v
 set_global_assignment -name VERILOG_FILE rtl/video/sprite_engine.v
 set_global_assignment -name VERILOG_FILE rtl/video/road_gen.v
+set_global_assignment -name VERILOG_FILE rtl/video/mixer_turbo.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8255.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8279.v
 set_global_assignment -name VERILOG_FILE rtl/segavco.v

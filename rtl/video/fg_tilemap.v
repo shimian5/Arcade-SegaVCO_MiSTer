@@ -27,6 +27,14 @@ module fg_tilemap
 (
     input  wire        clk,
 
+    // One-RBF game strap (docs/WORKPLAN_TURBO_GRAPHICS.md Step 5): Turbo's
+    // column fetch has no PR-5194 X-shift remap -- it's a plain 8-native-
+    // pixel shift with the whole tilemap forced blank outside
+    // [8, 0x108) -- turbo_v.cpp:459 (`foreraw = (xx<8||xx>=0x108) ? 0 :
+    // fore[xx-8]`). Everything downstream of "col" (VRAM/tile-ROM lookup,
+    // bit-select+pack) is unchanged between games.
+    input  wire        mod_turbo,
+
     // CPU port -- video RAM, c000-c7ff (2KB span; only the low 1KB, the
     // 32x32 grid, is ever addressed by the tilemap fetch below)
     input  wire         cpu_we,
@@ -86,13 +94,23 @@ module fg_tilemap
         y_d1  <= y;     y_d2  <= y_d1;
     end
 
-    // Stage 1: X-shift PROM lookup -> tile column
-    wire [4:0] col_raw = xx[7:3] - 5'd1;          // (xx>>3)-1, wraps mod 32
+    // Stage 1: X-shift PROM lookup -> tile column (Buck Rogers), or a plain
+    // shift-by-8 with no remap (Turbo). Both are registered here so col is
+    // available at the same absolute pipeline stage regardless of mod_turbo
+    // -- this module's total latency (FG_TILEMAP_LATENCY) must stay fixed
+    // and game-independent, since segavco.v's delay-matching constants are
+    // not (yet) runtime-switched.
+    wire [4:0] col_raw       = xx[7:3] - 5'd1;          // (xx>>3)-1, wraps mod 32
+    wire [4:0] turbo_col_raw = (xx - 8'd8) >> 3;         // (xx-8)>>3, wraps mod 32 via 8-bit truncation
     reg  [7:0] xshift_dout;
-    always @(posedge clk) xshift_dout <= xshift_rom[col_raw];
+    reg  [4:0] turbo_col_reg;
+    always @(posedge clk) begin
+        xshift_dout   <= xshift_rom[col_raw];
+        turbo_col_reg <= turbo_col_raw;
+    end
 
     // Stage 2: VRAM lookup -> tile code (y delayed 1 to match stage 1's xx sample)
-    wire [4:0] col   = xshift_dout[4:0];
+    wire [4:0] col   = mod_turbo ? turbo_col_reg : xshift_dout[4:0];
     wire [9:0] vaddr = {y_d1[7:3], col};          // row*32 + col
     reg  [7:0] vram_dout;
     always @(posedge clk) vram_dout <= vram[vaddr];
@@ -112,8 +130,17 @@ module fg_tilemap
     wire       bit0  = plane0_dout[3'd7 - xx_d3[2:0]];
     wire       bit1  = plane1_dout[3'd7 - xx_d3[2:0]];
     wire [5:0] color = code_dout[7:2];
+
+    // Turbo's blanking window, evaluated on the same xx_d3 sample as the
+    // pixel above (turbo_v.cpp:459). The ">=264" arm is structurally dead
+    // for this core -- xx never exceeds 255 (8-bit, 256 native columns) --
+    // but is kept for fidelity to the MAME source rather than silently
+    // dropped.
+    wire turbo_blank = (xx_d3 < 8'd8) || ({1'b0, xx_d3} >= 9'd264);
+
     reg  [7:0] foreraw_reg;
-    always @(posedge clk) foreraw_reg <= {color, bit1, bit0};
+    always @(posedge clk)
+        foreraw_reg <= (mod_turbo && turbo_blank) ? 8'h00 : {color, bit1, bit0};
     assign foreraw = foreraw_reg;
 
 endmodule
