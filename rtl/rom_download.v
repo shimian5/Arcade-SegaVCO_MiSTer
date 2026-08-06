@@ -12,6 +12,23 @@ module rom_download
     input  wire        ioctl_wr,
     input  wire [24:0] ioctl_addr,
     input  wire [7:0]  ioctl_dout,
+    // MRA transfers other than the main ROM blob (index 0) share this same
+    // ioctl_wr/ioctl_addr/ioctl_download bus -- notably index 1, the
+    // one-RBF game-strap mod byte (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1,
+    // <rom index="1"><part>NN</part></rom> in mra/*.mra). Without this
+    // qualifier every one of those transfers was ALSO decoded as ROM blob
+    // data at whatever ioctl_addr it carried -- the mod-byte transfer sends
+    // addr=0, so it silently overwrote maincpu_rom[0] with the mod byte
+    // value right after the real ROM had already loaded. Confirmed on
+    // hardware: harmless for Buck Rogers (byte 0 is 0xF3 DI, overwritten
+    // with mod byte 0x00 = NOP -- interrupts are already disabled at reset,
+    // so the missing DI never mattered) but fatal for Turbo (byte 0 is
+    // 0xC3 JP nnnn, overwritten with mod byte 0x01 turns the reset vector
+    // into LD BC,nnnn, falling through into 0xFF-filled dead ROM space --
+    // an infinite RST 38 loop that eventually jumps cold into the
+    // interrupt handler with SP never initialized). This one line is the
+    // actual fix for that hang.
+    input  wire [15:0] ioctl_index,
 
     output wire         maincpu_we,
     output wire [14:0]  maincpu_addr,   // 0x8000 (32KB)
@@ -36,7 +53,7 @@ module rom_download
     localparam ROAD_BASE     = 25'h00D000, ROAD_SIZE     = 25'h008000;
     localparam SPRITES_BASE  = 25'h015000, SPRITES_SIZE  = 25'h040000;
 
-    wire wr = ioctl_download && ioctl_wr;
+    wire wr = ioctl_download && ioctl_wr && (ioctl_index == 16'd0);
 
     wire in_maincpu = (ioctl_addr >= MAINCPU_BASE) && (ioctl_addr < MAINCPU_BASE + MAINCPU_SIZE);
     wire in_subcpu  = (ioctl_addr >= SUBCPU_BASE)  && (ioctl_addr < SUBCPU_BASE  + SUBCPU_SIZE);

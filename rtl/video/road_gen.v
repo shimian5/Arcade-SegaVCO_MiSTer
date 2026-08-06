@@ -86,9 +86,19 @@ module road_gen
     reg [7:0] bank0[0:4095], bank1[0:4095], bank2[0:4095], bank3[0:4095];
     reg [7:0] bank4[0:2047];
 
-    wire        bank_sel4  = (road_addr[14:12] == 3'd4);
-    wire [11:0] bank_off   = road_addr[11:0];
-    wire [10:0] bank4_off  = road_addr[10:0];
+    wire [11:0] bank_off  = road_addr[11:0];
+    wire [10:0] bank4_off = road_addr[10:0];
+
+    // bank4 (AREA5, epr-1243) is only 2KB of real chip data, but its
+    // road_addr[14:12]==4 case selects the full 4KB window 0x4000-0x4FFF.
+    // gen_mra.py pads the shared 32KB road/bgcolor download slot with 0xFF
+    // filler past the last real chip (epr-1243 ends at 0x4800) to match
+    // Buck Rogers' fixed region size -- that filler falls at 0x4800-0x4FFF,
+    // still inside the same case branch, and aliases straight back onto
+    // bank4_off 0x000-0x7FF, silently overwriting the real ROM data with
+    // 0xFF right after it's written. Range-gate to the real 2KB so this
+    // can't happen -- same reasoning as sproms_in_range in sprite_engine.v.
+    wire bank4_in_range = (road_addr < 15'h4800);
 
     always @(posedge clk) begin
         if (road_we) case (road_addr[14:12])
@@ -96,7 +106,7 @@ module road_gen
             3'd1: bank1[bank_off] <= road_wdata;
             3'd2: bank2[bank_off] <= road_wdata;
             3'd3: bank3[bank_off] <= road_wdata;
-            3'd4: bank4[bank4_off] <= road_wdata;
+            3'd4: if (bank4_in_range) bank4[bank4_off] <= road_wdata;
             default: ;
         endcase
     end
@@ -109,9 +119,21 @@ module road_gen
     reg [7:0] pr1115[0:31];
     reg [7:0] pr1117[0:31];
 
+    // pr1117_we's upper bound MUST be its own chip end (0x060+0x020=0x080),
+    // not PR-1118's start (0x100): the 0x080-0x0FF gap between PR-1117's
+    // real 32B and PR-1118 is gen_mra.py 0xFF filler (region_blob(), same
+    // reasoning as bank4_in_range above), and with the old < 13'h100 bound
+    // pr1117_we stayed asserted across that whole gap -- proms_addr[4:0]
+    // wraps every 32 bytes, so each filler byte re-wrote pr1117[] on top of
+    // the real chip data, and the LAST write (nearest 0x0FF, still filler)
+    // won: pr1117 read back as a constant 0xFF at every address instead of
+    // real per-address bacol-high-byte data. That degenerate bacol is why
+    // the road/edge lost its white/red alternation (and likely fed the
+    // earlier black-road symptom too, since bacol drives every red/grn/blu
+    // channel).
     wire pr1114_we = proms_we && (proms_addr < 13'h020);
     wire pr1115_we = proms_we && (proms_addr >= 13'h020) && (proms_addr < 13'h040);
-    wire pr1117_we = proms_we && (proms_addr >= 13'h060) && (proms_addr < 13'h100);
+    wire pr1117_we = proms_we && (proms_addr >= 13'h060) && (proms_addr < 13'h080);
 
     always @(posedge clk) begin
         if (pr1114_we) pr1114[proms_addr[4:0]] <= proms_wdata;

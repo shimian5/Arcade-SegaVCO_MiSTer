@@ -4,6 +4,20 @@
   <year>1981</year>
   <manufacturer>Sega</manufacturer>
   <rbf>Arcade-SegaVCO</rbf>
+  <buttons names="-,-,-,Start,Coin,Gear Shift,Pedal" default="-,-,-,Start,Select,Y,A"></buttons>
+  <switches default="EF,FF,30">
+    <dip bits="0,1" name="Lives" ids="2,3,4,5"/>
+    <dip bits="2" name="Game Time" ids="Fixed (55 sec),Adjustable"/>
+    <dip bits="3" name="Difficulty" ids="Hard,Easy"/>
+    <dip bits="4" name="Collisions" ids="On,Off (Cheat)"/>
+    <dip bits="5" name="Initial Entry" ids="Off,On"/>
+    <dip bits="8,9" name="Game Time" ids="60s,70s,80s,90s"/>
+    <dip bits="10,11,12" name="Coin B" ids="1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,1C_1C"/>
+    <dip bits="13,14,15" name="Coin A" ids="1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,1C_1C"/>
+    <dip bits="22" name="Tachometer" ids="Digital (LED),Analog (Meter)"/>
+    <dip bits="23" name="Sound System" ids="Cockpit,Upright"/>
+  </switches>
+  <rom index="1"><part>01</part></rom>
   <rom index="0" zip="turbo.zip" md5="none">
     <!-- maincpu @ 0x000000, 0x8000 bytes -->
     <part name="epr-1513.cpu-ic76" crc="0326adfc"/>
@@ -41,23 +55,28 @@
     <part repeat="14336">FF</part>
     <!-- sprites @ 0x015000, 0x40000 bytes -->
     <part name="epr-1246.prom-ic84" crc="555bfe9a"/>
-    <part repeat="8192">FF</part>
+    <part name="epr-1246.prom-ic84" crc="555bfe9a"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1247.prom-ic86" crc="c8c5e4d5"/>
-    <part repeat="8192">FF</part>
+    <part name="epr-1247.prom-ic86" crc="c8c5e4d5"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1248.prom-ic88" crc="82fe5b94"/>
-    <part repeat="8192">FF</part>
+    <part name="epr-1248.prom-ic88" crc="82fe5b94"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1249.prom-ic90" crc="e258e009"/>
     <part name="epr-1250.prom-ic108" crc="aee6e05e"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1251.prom-ic92" crc="292573de"/>
     <part name="epr-1252.prom-ic110" crc="aee6e05e"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1253.prom-ic94" crc="92783626"/>
     <part name="epr-1254.prom-ic112" crc="aee6e05e"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1255.prom-ic32" crc="485dcef9"/>
     <part name="epr-1256.prom-ic47" crc="aee6e05e"/>
+    <part repeat="16384">FF</part>
     <part name="epr-1257.prom-ic34" crc="4ca984ce"/>
     <part name="epr-1258.prom-ic49" crc="aee6e05e"/>
-    <part repeat="131072">FF</part>
+    <part repeat="16384">FF</part>
   </rom>
-  <rom index="1"><part>01</part></rom>
-
 </misterromdescription>

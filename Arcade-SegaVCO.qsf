@@ -36,7 +36,14 @@ set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
 # detail -- so enable it unconditionally.
 set_global_assignment -name VERILOG_MACRO "TV80_REFRESH=1"
 
-#set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
+# Required for screen_rotate (Turbo's native raster is portrait, MAME
+# ROT270) -- without this, FB_EN/FB_WIDTH/FB_HEIGHT/etc. don't exist as
+# real top-level ports at all (emu_ports.vh gates them on this macro), so
+# screen_rotate's connections to them silently become dangling implicit
+# nets and the HDMI framebuffer/rotate path is a no-op even though it
+# compiles clean. Confirmed by diffing against Arcade-DonkeyKong_MiSTer,
+# a working rotated-cabinet core, which has this enabled.
+set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
 #enable it only if 8bit indexed mode is used in core
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB_PALETTE=1"
@@ -295,6 +302,7 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
 set_global_assignment -name TOP_LEVEL_ENTITY sys_top
 set_global_assignment -name VERILOG_FILE rtl/io/i8255.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8279.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/steering_input.sv
 set_global_assignment -name VERILOG_FILE rtl/video/road_gen.v
 set_global_assignment -name VERILOG_FILE rtl/video/mixer_turbo.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/audio/mute_ctl.sv

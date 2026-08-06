@@ -32,6 +32,11 @@ module segavco
     input  wire         ioctl_wr,
     input  wire [24:0]  ioctl_addr,
     input  wire [7:0]   ioctl_dout,
+    // Qualifies ROM-blob writes in rom_download.v against non-blob MRA
+    // transfers (index 1, the mod byte) sharing the same ioctl_wr/addr bus
+    // -- see rom_download.v's port comment for why this is load-bearing,
+    // not just tidy decode hygiene.
+    input  wire [15:0]  ioctl_index,
 
     // IN0/IN1/DSW1/DSW2, real player controls + coin/start/service + DIP
     // switches. See docs/PLAN.md phase 1 CPU/memory table and the buckrog
@@ -41,6 +46,17 @@ module segavco
     input  wire [7:0]   in1,
     input  wire [7:0]   dsw1,
     input  wire [7:0]   dsw2,
+
+    // Turbo-only I/O (docs/WORKPLAN_TURBO_GRAPHICS.md Step 7): its own IN0
+    // layout, three DIP banks (DSW3's lower nibble is collision, forced 0 by
+    // Arcade-SegaVCO.sv since it's not player-adjustable), and the
+    // free-running dial position (steering_input.sv) analog_r's delta
+    // computation is built from below. Ignored when !mod_turbo.
+    input  wire [7:0]   turbo_in0,
+    input  wire [7:0]   turbo_dsw1,
+    input  wire [7:0]   turbo_dsw2,
+    input  wire [7:0]   turbo_dsw3,
+    input  wire [7:0]   turbo_dial,
 
     output wire         hblank,
     output wire         vblank,
@@ -65,6 +81,34 @@ module segavco
     , output wire [7:0]  dbg_plb
     , output wire [9:0]  dbg_hpos
     , output wire [8:0]  dbg_vpos
+    // Turbo road/mixer debug taps (black-road / background-disappears
+    // investigation): raw road_gen/mixer_turbo outputs and the PPI0/1/3
+    // inputs that drive them, all real-time (not delay-matched).
+    , output wire [7:0]  dbg_babit
+    , output wire [15:0] dbg_bacol
+    , output wire        dbg_road
+    , output wire [7:0]  dbg_pen
+    , output wire [3:0]  dbg_fbpla
+    , output wire [2:0]  dbg_fbcol
+    , output wire [7:0]  dbg_opa
+    , output wire [7:0]  dbg_opb
+    , output wire [7:0]  dbg_opc
+    , output wire [7:0]  dbg_ipa
+    , output wire [7:0]  dbg_ipb
+    , output wire [7:0]  dbg_ipc
+    , output wire [3:0]  dbg_collision
+    , output wire [15:0] dbg_i8279_rd_count
+    , output wire [7:0]  dbg_i8279_last_rl
+    , output wire [15:0] dbg_i8279_wr_count
+    , output wire [15:0] dbg_i8279_sel_count
+    , output wire [15:0] dbg_ppi3_rd_count
+    , output wire [7:0]  dbg_ppi3_last_inb
+    , output wire [31:0] dbg_coll_sprbits_nz_count
+    , output wire [31:0] dbg_coll_addr_nz_count
+    , output wire [4:0]  dbg_coll_addr_max
+    , output wire [3:0]  dbg_coll_max
+    , output wire [15:0] dbg_coll_clear_count
+    , output wire [15:0] dbg_coll_first_hit_frame
     // Star-motion investigation: direct combinational read of bitmap_ram
     // (the sub-CPU-written star layer), addressed the same way as the
     // mixer's read (y*256+x). Lets the testbench dump the raw star bitmap
@@ -158,6 +202,7 @@ module segavco
         .ioctl_wr       (ioctl_wr),
         .ioctl_addr     (ioctl_addr),
         .ioctl_dout     (ioctl_dout),
+        .ioctl_index    (ioctl_index),
         .maincpu_we     (maincpu_we),
         .maincpu_addr   (maincpu_wraddr),
         .subcpu_we      (subcpu_we),
@@ -276,11 +321,21 @@ module segavco
     wire [7:0]  sub_di, sub_do;
     wire        sub_wr_n, sub_rd_n, sub_mreq_n, sub_m1_n, sub_iorq_n;
 
+    // Turbo has no sub CPU (docs/WORKPLAN_TURBO_GRAPHICS.md Step 7): held
+    // permanently in reset under mod_turbo rather than left to free-run on
+    // its ROM (all-0xFF, since Turbo's MRA has no subcpu region -- an
+    // infinite RST 38 loop) while its /INT line (sub_int_n, driven from
+    // ppi0_pc[7]) tracks Turbo's own opc[7] road-invert bit. Found via a
+    // hardware-vs-sim discrepancy report (game hung on the init screen,
+    // never reaching attract mode) alongside the audio_top mute fix below
+    // -- both are real, independently-justified bugs, but which one (or
+    // both) actually caused the hang/audio symptoms was not isolated
+    // before fixing both; re-test on hardware to confirm.
     cpu_z80 u_subcpu
     (
         .clk     (clk),
         .cen     (ce_z80),
-        .reset_n (~reset),
+        .reset_n (~(reset || mod_turbo)),
         .wait_n  (1'b1),
         .int_n   (sub_int_n),
         .nmi_n   (1'b1),
@@ -396,15 +451,72 @@ module segavco
     always @(posedge clk) cpu_write_d <= cpu_write_lvl;
     wire cpu_write = cpu_write_d && !cpu_write_lvl;
 
-    wire sel_rom     = (cpu_a < 16'h8000);
-    wire sel_vram    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
-    wire sel_ppi0    = (cpu_a >= 16'hC800) && (cpu_a < 16'hD000);
-    wire sel_ppi1    = (cpu_a >= 16'hD000) && (cpu_a < 16'hD800);
-    wire sel_i8279   = (cpu_a >= 16'hD800) && (cpu_a < 16'hE000);
-    wire sel_sprpos  = (cpu_a >= 16'hE000) && (cpu_a < 16'hE400);
-    wire sel_sprram  = (cpu_a >= 16'hE400) && (cpu_a < 16'hE800);
-    wire sel_io2     = (cpu_a >= 16'hE800) && (cpu_a < 16'hF000); // IN0/IN1/DSW
-    wire sel_workram = (cpu_a >= 16'hF800);
+    // Buck Rogers decode (unchanged from before Step 7 -- every wire below
+    // is byte-for-byte the same expression it always was).
+    wire sel_rom_buck     = (cpu_a < 16'h8000);
+    wire sel_vram_buck    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
+    wire sel_ppi0_buck    = (cpu_a >= 16'hC800) && (cpu_a < 16'hD000);
+    wire sel_ppi1_buck    = (cpu_a >= 16'hD000) && (cpu_a < 16'hD800);
+    wire sel_i8279_buck   = (cpu_a >= 16'hD800) && (cpu_a < 16'hE000);
+    wire sel_sprpos_buck  = (cpu_a >= 16'hE000) && (cpu_a < 16'hE400);
+    wire sel_sprram_buck  = (cpu_a >= 16'hE400) && (cpu_a < 16'hE800);
+    wire sel_io2_buck     = (cpu_a >= 16'hE800) && (cpu_a < 16'hF000); // IN0/IN1/DSW
+    wire sel_workram_buck = (cpu_a >= 16'hF800);
+
+    // Turbo decode (docs/WORKPLAN_TURBO_GRAPHICS.md Step 7, turbo_state::
+    // prg_map, docs/reference/turbo.cpp:557-573). Mirror ranges are decoded
+    // by comparing only the address bits the real hardware's chip-select
+    // actually looks at (top N bits), leaving the mirrored bits as
+    // don't-cares -- e.g. "a000-a0ff mirror 0700" decodes cpu_a[15:11]
+    // only, matching a000-a7ff as one contiguous 2KB window with bits[10:8]
+    // don't-care and bits[7:0] the real sprite-RAM sub-address.
+    wire sel_rom_turbo            = (cpu_a < 16'h6000);
+    wire sel_sprram_turbo         = (cpu_a[15:11] == 5'b10100); // a000-a7ff
+    wire sel_outlatch_turbo       = (cpu_a[15:11] == 5'b10101); // a800-afff
+    wire sel_sprpos_turbo         = (cpu_a[15:11] == 5'b10110); // b000-b7ff
+    wire sel_analog_reset_turbo   = (cpu_a[15:11] == 5'b10111); // b800-bfff
+    wire sel_vram_turbo           = (cpu_a[15:11] == 5'b11100); // e000-e7ff
+    wire sel_collision_clear_turbo= (cpu_a[15:11] == 5'b11101); // e800-efff
+    wire sel_workram_turbo        = (cpu_a[15:11] == 5'b11110); // f000-f7ff
+    wire sel_ppi0_turbo            = (cpu_a[15:8] == 8'hf8);
+    wire sel_ppi1_turbo            = (cpu_a[15:8] == 8'hf9);
+    wire sel_ppi2_turbo            = (cpu_a[15:8] == 8'hfa);
+    wire sel_ppi3_turbo            = (cpu_a[15:8] == 8'hfb);
+    wire sel_i8279_turbo           = (cpu_a[15:8] == 8'hfc);
+    wire sel_in0_turbo             = (cpu_a[15:8] == 8'hfd);
+    wire sel_collision_dsw3_turbo  = (cpu_a[15:8] == 8'hfe);
+
+    // Combined selects: same physical resources (vram, ppi0/1, i8279,
+    // sprram, sprpos, work_ram) are shared between games -- see Step 1-4's
+    // "combined LUT"/mod_turbo-parameterized-module precedent -- so each
+    // just switches which decode drives it. Turbo-only resources
+    // (outlatch/analog_reset/collision_clear/ppi2/ppi3/in0/collision_dsw3)
+    // have no Buck equivalent and are simply gated on mod_turbo directly.
+    wire sel_rom     = mod_turbo ? sel_rom_turbo     : sel_rom_buck;
+    wire sel_vram    = mod_turbo ? sel_vram_turbo    : sel_vram_buck;
+    wire sel_ppi0    = mod_turbo ? sel_ppi0_turbo    : sel_ppi0_buck;
+    wire sel_ppi1    = mod_turbo ? sel_ppi1_turbo    : sel_ppi1_buck;
+    wire sel_i8279   = mod_turbo ? sel_i8279_turbo   : sel_i8279_buck;
+    wire sel_sprpos  = mod_turbo ? sel_sprpos_turbo  : sel_sprpos_buck;
+    wire sel_sprram  = mod_turbo ? sel_sprram_turbo  : sel_sprram_buck;
+    wire sel_io2     = !mod_turbo && sel_io2_buck; // IN0/IN1/DSW, Buck only
+    wire sel_workram = mod_turbo ? sel_workram_turbo : sel_workram_buck;
+
+    wire sel_ppi2           = mod_turbo && sel_ppi2_turbo;
+    wire sel_ppi3           = mod_turbo && sel_ppi3_turbo;
+    wire sel_outlatch       = mod_turbo && sel_outlatch_turbo;
+    wire sel_analog_reset   = mod_turbo && sel_analog_reset_turbo;
+    wire sel_collision_clear= mod_turbo && sel_collision_clear_turbo;
+    wire sel_in0_t          = mod_turbo && sel_in0_turbo;
+    wire sel_collision_dsw3 = mod_turbo && sel_collision_dsw3_turbo;
+
+    // Turbo sprite RAM address fold (turbo_state::spriteram_r/w,
+    // docs/reference/turbo.cpp:538-548): the CPU's 8-bit sub-address within
+    // the a000-a0ff/mirror window folds onto 128 physical bytes. Applied
+    // here in the decode, not inside sprite_engine.v (which just takes
+    // whatever 10-bit address it's given), per the plan's Step 4 note.
+    wire [6:0] sprram_fold_turbo = (cpu_a[7:0] & 8'h07) | ((cpu_a[7:0] & 8'hf0) >> 1);
+    wire [9:0] sprram_addr_final = mod_turbo ? {3'b0, sprram_fold_turbo} : cpu_a[9:0];
 
     wire [7:0] vram_rdata;
     fg_tilemap u_fg
@@ -437,11 +549,23 @@ module segavco
     // the shared PROMS blob, same pattern as xshift_we/color_table above.
     // Full-width subtraction before slicing (not truncation) -- see
     // rom_download.v's header comment on why that matters for non-zero-based
-    // windows. Only one game's proms blob is ever loaded at boot, so the
-    // window simply moves with mod_turbo rather than needing two forwards.
-    wire [12:0] yscale_base   = mod_turbo ? 13'h200 : 13'h100;
-    wire        yscale_we_fwd = proms_we && (proms_wraddr >= yscale_base) && (proms_wraddr < yscale_base + 13'h200);
-    wire [12:0] yscale_off    = proms_wraddr - yscale_base;
+    // windows.
+    //
+    // Y-scale is forwarded through TWO always-active windows now, not one
+    // mod_turbo-selected window: mod_turbo is latched from a separate
+    // ioctl_index=1 transfer sent only after this whole proms blob
+    // (ioctl_index=0) has streamed in, so it is not valid yet during
+    // download -- selecting the forward window by mod_turbo silently
+    // forwarded Turbo's real pr-1119 bytes through Buck's window (0x100-
+    // 0x300) at the wrong relative offset, and dropped the back half
+    // entirely (0x300-0x400 falls outside that window). sprite_engine.v
+    // owns two separate Y-scale arrays and mux)es its OUTPUT by mod_turbo
+    // instead, which is safe: that mux only matters during actual gameplay
+    // (well after boot), by which point mod_turbo is genuinely valid.
+    wire        buck_yscale_we_fwd  = proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h300);
+    wire [12:0] buck_yscale_off     = proms_wraddr - 13'h100;
+    wire        turbo_yscale_we_fwd = proms_we && (proms_wraddr >= 13'h200) && (proms_wraddr < 13'h400);
+    wire [12:0] turbo_yscale_off    = proms_wraddr - 13'h200;
 
     wire        sprcolor_we_fwd = proms_we && (proms_wraddr >= 13'h700) && (proms_wraddr < 13'hB00);
     wire [12:0] sprcolor_off    = proms_wraddr - 13'h700;
@@ -467,8 +591,23 @@ module segavco
     reg [7:0] turbo_pr1116[0:31];   // collision detect
     reg [7:0] turbo_pr1120[0:511];  // no consumer in MAME -- loaded, not wired
 
-    wire        turbo_pr1116_we = mod_turbo && proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
-    wire        turbo_pr1120_we = mod_turbo && proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
+    // NOT mod_turbo-gated: mod_turbo (the ioctl_index=1 strap byte) is sent
+    // by the MRA AFTER the ioctl_index=0 ROM blob finishes loading (see
+    // rom_download.v's header -- this exact ordering is what caused the
+    // real-hardware Turbo boot hang fixed earlier this session), so
+    // mod_turbo reads 0 for the entire PROM download regardless of which
+    // game is actually loaded. Gating this write on mod_turbo meant
+    // turbo_pr1116[] never received the real PROM-1116 collision-detect
+    // data on real hardware -- it stayed all-zero, so
+    // turbo_collision_acc |= turbo_pr1116[addr] always OR'd in 0 and the
+    // car could never register a crash. Sim never caught this because
+    // sim/tb_z80_3d.cpp sets mod_turbo=1 BEFORE loading the ROM blob,
+    // which real hardware never does. No aliasing risk from removing the
+    // gate: Buck's own PROM writes only touch 0x000-0x020, 0x100-0x300,
+    // 0x500-0x700, 0x700-0xB00 -- turbo_yscale_we_fwd below (0x200-0x400)
+    // already isn't mod_turbo-gated for the identical reason.
+    wire        turbo_pr1116_we = proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
+    wire        turbo_pr1120_we = proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
 
     wire [12:0] turbo_pr1120_off = proms_wraddr - 13'h400;
 
@@ -486,9 +625,8 @@ module segavco
     // opc/ipa/ipb/ipc are literally the same ppi0_pa/pb/pc, ppi1_pa/pb/pc
     // wires Buck Rogers reads for its own purposes, just interpreted
     // differently by Turbo's software (see docs/WORKPLAN_TURBO_GRAPHICS.md
-    // Step 7's register table). PPI3 (fbcol, fbpla) does not exist yet --
-    // Step 7 scope -- so fbcol0 is tied to 0 here as a placeholder; road_gen
-    // is otherwise functionally complete.
+    // Step 7's register table). fbcol0 = PPI3 port C bit4 (turbo_fbcol[0],
+    // declared further down alongside the rest of Turbo's I/O).
     wire [7:0]  turbo_babit;
     wire [15:0] turbo_bacol;
     wire        turbo_road;
@@ -512,7 +650,7 @@ module segavco
         .ipa        (ppi1_pa),
         .ipb        (ppi1_pb),
         .ipc        (ppi1_pc),
-        .fbcol0     (1'b0), // TODO Step 7: PPI3 port C bit4 (fbcol & 1)
+        .fbcol0     (turbo_fbcol[0]),
 
         .babit      (turbo_babit),
         .bacol      (turbo_bacol),
@@ -527,6 +665,19 @@ module segavco
     assign dbg_plb      = spr_plb;
     assign dbg_hpos      = hpos;
     assign dbg_vpos      = vpos;
+    assign dbg_babit = turbo_babit;
+    assign dbg_bacol = turbo_bacol;
+    assign dbg_road  = turbo_road;
+    assign dbg_pen   = turbo_pen;
+    assign dbg_fbpla = turbo_fbpla;
+    assign dbg_fbcol = turbo_fbcol;
+    assign dbg_opa = ppi0_pa;
+    assign dbg_opb = ppi0_pb;
+    assign dbg_opc = ppi0_pc;
+    assign dbg_ipa = ppi1_pa;
+    assign dbg_ipb = ppi1_pb;
+    assign dbg_ipc = ppi1_pc;
+    assign dbg_collision = turbo_collision_acc;
     assign dbg_bitmap_bit = bitmap_ram[dbg_bitmap_addr];
     assign dbg_workram_data  = sub_workram[dbg_workram_addr];
     assign dbg_mainram_data  = work_ram[dbg_mainram_addr];
@@ -700,7 +851,7 @@ module segavco
         .road_in          (turbo_road),
 
         .cpu_sprram_we    (sel_sprram && cpu_write),
-        .cpu_sprram_addr  (cpu_a[9:0]),
+        .cpu_sprram_addr  (sprram_addr_final),
         .cpu_sprram_wdata (cpu_do),
         .cpu_sprram_rdata (sprram_rdata),
 
@@ -713,9 +864,12 @@ module segavco
         .sproms_addr      (sprites_wraddr),
         .sproms_wdata     (rom_dout),
 
-        .yscale_we        (yscale_we_fwd),
-        .yscale_addr      (yscale_off[8:0]),
-        .yscale_wdata     (rom_dout),
+        .buck_yscale_we   (buck_yscale_we_fwd),
+        .buck_yscale_addr (buck_yscale_off[8:0]),
+        .buck_yscale_wdata(rom_dout),
+        .turbo_yscale_we   (turbo_yscale_we_fwd),
+        .turbo_yscale_addr (turbo_yscale_off[8:0]),
+        .turbo_yscale_wdata(rom_dout),
 
         .ce_pix           (ce_pix_int),
         .hblank           (hblank_raw),
@@ -771,12 +925,23 @@ module segavco
     // The sound board hangs off PPI1 ports A and B over a 20-pin flat cable.
     // Only the four /ALARM lines are consumed so far (phase 1); the rest of
     // the channels land later. Full pinout in docs/hardware-audio.md.
+    // PPI1 is shared hardware (Step 3's note): for Turbo it carries ipa/ipb
+    // (road_gen's AREA-select inputs), not Buck's alarm/fire/exp/hit/
+    // rebound trigger lines audio_top decodes those same bits as. Without
+    // this mute, Turbo's own unrelated PPI1 writes get misread as spurious
+    // audio triggers -- confirmed on hardware as the Buck Rogers "spaceship"
+    // sound playing while Turbo is running. Idle values hold every
+    // active-low trigger high and every active-high level (ship_on/game_on)
+    // low; audio_top's own alarm/hit/accel clock-edge inputs never toggle
+    // once held constant, so no spurious edge fires either.
+    wire [7:0] audio_ppi1_pa = mod_turbo ? 8'hFF : ppi1_pa;
+    wire [7:0] audio_ppi1_pb = mod_turbo ? 8'h3F : ppi1_pb;
     audio_top u_audio
     (
         .clk     (clk),
         .rst_n   (~reset),
-        .ppi1_pa (ppi1_pa),
-        .ppi1_pb (ppi1_pb),
+        .ppi1_pa (audio_ppi1_pa),
+        .ppi1_pb (audio_ppi1_pb),
         .audio_l (audio_l),
         .audio_r (audio_r),
         .sample_ce ()
@@ -805,8 +970,209 @@ module segavco
         .clk  (clk), .reset (reset),
         .cs   (sel_i8279), .we (cpu_write), .addr (cpu_a[0]),
         .din  (cpu_do), .dout (i8279_dout),
-        .rl   (dsw1)
+        .rl   (mod_turbo ? turbo_dsw1 : dsw1)
     );
+
+    // DIP-effect debug probe (temporary): count actual CPU reads of the
+    // i8279 data register (addr==0, the DSW1/RL path) and latch the last rl
+    // value seen at that moment, to distinguish "CPU never reads DSW1" from
+    // "reads it but the value never affects RAM."
+    reg [15:0] dbg_i8279_rd_count_r;
+    reg [7:0]  dbg_i8279_last_rl_r;
+    wire       i8279_rd_now = sel_i8279 && ~cpu_a[0] && ~cpu_rd_n && ~cpu_mreq_n;
+    reg        i8279_rd_now_d;
+    always @(posedge clk) begin
+        i8279_rd_now_d <= i8279_rd_now;
+        if (reset) begin
+            dbg_i8279_rd_count_r <= 16'h0;
+            dbg_i8279_last_rl_r  <= 8'h0;
+        end else if (i8279_rd_now && !i8279_rd_now_d) begin
+            dbg_i8279_rd_count_r <= dbg_i8279_rd_count_r + 16'h1;
+            dbg_i8279_last_rl_r  <= mod_turbo ? turbo_dsw1 : dsw1;
+        end
+    end
+    assign dbg_i8279_rd_count = dbg_i8279_rd_count_r;
+    assign dbg_i8279_last_rl  = dbg_i8279_last_rl_r;
+
+    reg [15:0] dbg_i8279_wr_count_r;
+    reg [15:0] dbg_i8279_sel_count_r;
+    reg        sel_i8279_d;
+    always @(posedge clk) begin
+        sel_i8279_d <= sel_i8279;
+        if (reset) begin
+            dbg_i8279_wr_count_r  <= 16'h0;
+            dbg_i8279_sel_count_r <= 16'h0;
+        end else begin
+            if (sel_i8279 && cpu_write) dbg_i8279_wr_count_r <= dbg_i8279_wr_count_r + 16'h1;
+            if (sel_i8279 && !sel_i8279_d) dbg_i8279_sel_count_r <= dbg_i8279_sel_count_r + 16'h1;
+        end
+    end
+    assign dbg_i8279_wr_count  = dbg_i8279_wr_count_r;
+    assign dbg_i8279_sel_count = dbg_i8279_sel_count_r;
+
+    // ------------------------------------------------------------------
+    // Turbo-only I/O (docs/WORKPLAN_TURBO_GRAPHICS.md Step 7).
+    // ------------------------------------------------------------------
+
+    // PPI2 (fa00-fa03, mirror 00fc): sound generator interface
+    // (out_pa/pb/pc_callback = sound_a_w/sound_b_w/sound_c_w in
+    // docs/reference/turbo.cpp). Latched so the writes are visible for a
+    // future Turbo audio phase, but not consumed by anything yet -- Phase 4
+    // scope, per the plan's "explicitly out of scope" note.
+    wire [7:0] ppi2_dout, ppi2_pa, ppi2_pb, ppi2_pc;
+    i8255 u_ppi2
+    (
+        .clk   (clk), .reset (reset),
+        .cs    (sel_ppi2), .we (cpu_write), .addr (cpu_a[1:0]),
+        .din   (cpu_do), .dout (ppi2_dout),
+        .in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+        .ack_n (1'b1),
+        .pa    (ppi2_pa), .pb (ppi2_pb), .pc (ppi2_pc),
+        .pa_wr (), .pb_wr (), .pc_wr ()
+    );
+
+    // PPI3 (fb00-fb03, mirror 00fc): port A = steering dial delta
+    // (analog_r), port B = DSW2, port C write = fbpla/fbcol (turbo_v.cpp's
+    // mixer/road inputs -- road_gen.v's fbcol0 and mixer_turbo.v's fbpla/
+    // fbcol, both previously tied to constant placeholders, are wired to
+    // the real registers below).
+    reg [7:0] turbo_last_analog;
+    always @(posedge clk) begin
+        if (reset) turbo_last_analog <= 8'h0;
+        else if (sel_analog_reset && cpu_write) turbo_last_analog <= turbo_dial;
+    end
+    wire [7:0] turbo_analog_delta = turbo_dial - turbo_last_analog;
+
+    wire [7:0] ppi3_dout, ppi3_pa, ppi3_pb;
+    wire       ppi3_pc_wr;
+    wire [7:0] ppi3_pc;
+    i8255 u_ppi3
+    (
+        .clk   (clk), .reset (reset),
+        .cs    (sel_ppi3), .we (cpu_write), .addr (cpu_a[1:0]),
+        .din   (cpu_do), .dout (ppi3_dout),
+        .in_a  (turbo_analog_delta), .in_b (turbo_dsw2), .in_c (8'hFF),
+        .ack_n (1'b1),
+        .pa    (ppi3_pa), .pb (ppi3_pb), .pc (ppi3_pc),
+        .pa_wr (), .pb_wr (), .pc_wr (ppi3_pc_wr)
+    );
+    // DIP-effect debug probe (temporary): count actual CPU reads of PPI3
+    // port B (the DSW2/Game-Time path, addr==2'd1) and latch the last
+    // turbo_dsw2 value seen at that moment -- same pattern as the i8279 RL
+    // probe above, to distinguish "CPU never reads DSW2" from "reads it but
+    // the value never affects the displayed/counted game time."
+    reg [15:0] dbg_ppi3_rd_count_r;
+    reg [7:0]  dbg_ppi3_last_inb_r;
+    wire       ppi3_rd_now = sel_ppi3 && (cpu_a[1:0] == 2'd1) && ~cpu_rd_n && ~cpu_mreq_n;
+    reg        ppi3_rd_now_d;
+    always @(posedge clk) begin
+        ppi3_rd_now_d <= ppi3_rd_now;
+        if (reset) begin
+            dbg_ppi3_rd_count_r <= 16'h0;
+            dbg_ppi3_last_inb_r <= 8'h0;
+        end else if (ppi3_rd_now && !ppi3_rd_now_d) begin
+            dbg_ppi3_rd_count_r <= dbg_ppi3_rd_count_r + 16'h1;
+            dbg_ppi3_last_inb_r <= turbo_dsw2;
+        end
+    end
+    assign dbg_ppi3_rd_count = dbg_ppi3_rd_count_r;
+    assign dbg_ppi3_last_inb = dbg_ppi3_last_inb_r;
+
+    reg [3:0] turbo_fbpla;
+    reg [2:0] turbo_fbcol;
+    always @(posedge clk) begin
+        if (reset) begin
+            turbo_fbpla <= 4'h0;
+            turbo_fbcol <= 3'h0;
+        end else if (ppi3_pc_wr) begin
+            turbo_fbpla <= ppi3_pc[3:0];
+            turbo_fbcol <= ppi3_pc[6:4];
+        end
+    end
+
+    // LS259 outlatch (a800-a807, mirror 07f8): bit0/1 coin meters, bit3
+    // start lamp (turbo_state::coin_meter_1_w/coin_meter_2_w/start_lamp_w).
+    // No top-level MiSTer port for coin meters/lamp exists yet, same
+    // TODO as Buck Rogers' own coin_meter1/2/start_lamp above.
+    reg [7:0] turbo_outlatch;
+    always @(posedge clk) begin
+        if (reset) turbo_outlatch <= 8'h0;
+        else if (sel_outlatch && cpu_write) turbo_outlatch[cpu_a[2:0]] <= cpu_do[0];
+    end
+    wire turbo_coin_meter1 = turbo_outlatch[0];
+    wire turbo_coin_meter2 = turbo_outlatch[1];
+    wire turbo_start_lamp  = turbo_outlatch[3];
+
+    // Collision detection (Step 6): turbo_collision_acc is the real
+    // PR-1116-driven per-pixel accumulator, declared further down alongside
+    // the mixer_turbo instantiation it depends on (mirrors turbo_fbpla/
+    // turbo_fbcol's own forward-reference pattern from PPI3 above).
+    wire [3:0] turbo_collision = turbo_collision_acc;
+
+    // Both of these are read back by the CPU ($fd00/IN0 and $fe00/DSW3+
+    // collision) and previously had no reset guard at all -- after the very
+    // first FPGA power-up (where synthesis-default register content happens
+    // to be a clean 0) they worked fine, but a mid-session Reset left
+    // whatever stale byte was sitting here from the previous play session,
+    // which the CPU's boot code had never seen before and could branch on
+    // incorrectly. Reset to known-idle values (IN0 idle-high per its
+    // active-low convention; DSW3+collision to a fresh, uncollided read).
+    reg [7:0] turbo_in0_reg;
+    always @(posedge clk) begin
+        if (reset) turbo_in0_reg <= 8'hFF;
+        else if (sel_in0_t) turbo_in0_reg <= turbo_in0;
+    end
+
+    reg [7:0] turbo_collision_dsw3_reg;
+    always @(posedge clk) begin
+        if (reset) turbo_collision_dsw3_reg <= 8'h00;
+        else if (sel_collision_dsw3) turbo_collision_dsw3_reg <= {turbo_dsw3[7:4], turbo_collision};
+    end
+
+    // Collision-diagnosis debug probe (temporary): track the highest value
+    // turbo_collision (the live accumulator, sampled every cycle regardless
+    // of whether the CPU is polling it right now) ever reaches, and count
+    // clear pulses, to distinguish "never sets" from "sets then gets
+    // cleared before the CPU's next poll can see it."
+    reg [3:0]  dbg_coll_max_r;
+    reg [15:0] dbg_coll_clear_count_r;
+    reg        coll_clear_now_d;
+    wire       coll_clear_now = sel_collision_clear && cpu_write;
+    always @(posedge clk) begin
+        coll_clear_now_d <= coll_clear_now;
+        if (reset) begin
+            dbg_coll_max_r         <= 4'h0;
+            dbg_coll_clear_count_r <= 16'h0;
+        end else begin
+            if (turbo_collision_acc > dbg_coll_max_r) dbg_coll_max_r <= turbo_collision_acc;
+            if (coll_clear_now && !coll_clear_now_d) dbg_coll_clear_count_r <= dbg_coll_clear_count_r + 16'h1;
+        end
+    end
+    assign dbg_coll_max         = dbg_coll_max_r;
+    assign dbg_coll_clear_count = dbg_coll_clear_count_r;
+
+    // First-hit frame capture: latch which vblank-numbered frame the PROM
+    // lookup first reports a nonzero collision bit in, so the testbench can
+    // re-run and dump exactly that frame as a screenshot for visual
+    // confirmation of a real sprite/road overlap vs. a spurious address hit.
+    reg [15:0] dbg_coll_first_hit_frame_r;
+    reg        dbg_coll_first_hit_seen_r;
+    reg [15:0] dbg_vblank_count_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            dbg_coll_first_hit_frame_r <= 16'hFFFF;
+            dbg_coll_first_hit_seen_r  <= 1'b0;
+            dbg_vblank_count_r         <= 16'h0;
+        end else begin
+            if (vblank_rise) dbg_vblank_count_r <= dbg_vblank_count_r + 16'h1;
+            if (!dbg_coll_first_hit_seen_r && !hblank_pipe[7] && !vblank_pipe[7] &&
+                turbo_pr1116[turbo_coll_addr][3:0] != 4'h0) begin
+                dbg_coll_first_hit_seen_r  <= 1'b1;
+                dbg_coll_first_hit_frame_r <= dbg_vblank_count_r;
+            end
+        end
+    end
+    assign dbg_coll_first_hit_frame = dbg_coll_first_hit_frame_r;
 
     // ------------------------------------------------------------------
     // IN0/IN1/DSW real reads (e800-e803, mirror 07fc). e802/e803 are DSW
@@ -841,6 +1207,10 @@ module segavco
                      sel_sprpos ? sprpos_rdata   :
                      sel_io2    ? io2_reg        :
                      sel_workram? work_ram_dout  :
+                     sel_ppi2   ? ppi2_dout      :
+                     sel_ppi3   ? ppi3_dout      :
+                     sel_in0_t  ? turbo_in0_reg  :
+                     sel_collision_dsw3 ? turbo_collision_dsw3_reg :
                                   8'hFF;
 
     // ------------------------------------------------------------------
@@ -984,10 +1354,11 @@ module segavco
     // mixer_turbo.v (Step 5): bit-serial 16:1 mux, entirely separate from
     // Buck Rogers' ordinal priority chain above. sprbits is the same
     // real-time wire Buck's SPR_TO_MIX_DELAY path taps; foreraw/babit/bacol
-    // are fg_tilemap's/road_gen's own outputs. fbpla/fbcol (PPI3 port C,
-    // Step 7) don't exist yet -- tied to 0, same placeholder pattern as
-    // road_gen's fbcol0.
+    // are fg_tilemap's/road_gen's own outputs; fbpla/fbcol come from PPI3
+    // port C (turbo_fbpla/turbo_fbcol, declared further down).
     wire [7:0] turbo_pen;
+    wire [31:0] turbo_coll_sprbits_d8;
+    wire [7:0]  turbo_coll_babit_d8;
     mixer_turbo u_mixer_turbo
     (
         .clk         (clk),
@@ -998,10 +1369,73 @@ module segavco
         .foreraw     (foreraw),
         .babit       (turbo_babit),
         .bacol       (turbo_bacol),
-        .fbpla       (4'h0), // TODO Step 7: PPI3 port C low nibble
-        .fbcol       (3'h0), // TODO Step 7: PPI3 port C bits 4-6
-        .pen         (turbo_pen)
+        .fbpla       (turbo_fbpla),
+        .fbcol       (turbo_fbcol),
+        .pen         (turbo_pen),
+        .coll_sprbits_d8 (turbo_coll_sprbits_d8),
+        .coll_babit_d8   (turbo_coll_babit_d8)
     );
+
+    // Collision detect (docs/WORKPLAN_TURBO_GRAPHICS.md Step 6). Address
+    // bits confirmed against the schematic, not just turbo_v.cpp: P-ROM
+    // Board sheet 2/10, PDF p.26/printed p.144 (docs/hardware-turbo.md),
+    // IC20 (PR-1116, a TBP18S030 32x8 PROM) has 5 address inputs labeled
+    // directly on the sheet -- PLB0/PLB1/PLB2 (pins 10-12, A0-A2) and
+    // SLIPAR/ACCIAR (pins 13-14, A3-A4) -- which independently corroborates
+    // turbo_v.cpp:475-476's `((sprbits>>24)&7) | ((babit&0x30)>>1)` (PLB0-2
+    // = sprbits[26:24]; SLIPAR/ACCIAR = babit[4]/babit[5], matching bits3/4
+    // of that shifted mask exactly). IC20's output feeds a 74LS376 latch
+    // (IC19) whose exact set/clear sequencing was not traced pin-by-pin at
+    // this schematic resolution; the OR-accumulate-until-e800-efff-write
+    // behavior below matches the plan's documented behavior for a
+    // CPU-polled hit flag, not something independently re-derived from the
+    // latch's TTL internals -- flag this if a future schematic pass finds
+    // otherwise. OR-accumulated every visible pixel, read at fe00 low
+    // nibble, cleared by any write to e800-efff. Was previously stubbed to
+    // a hardcoded 0 (turbo_collision below) -- with no collision ever
+    // detected, the game never crashes the car into anything and runs
+    // forever, exactly the reported symptom. Uses mixer_turbo's own
+    // cycle-8 sprbits_d8/babit_d8 taps (see that module's port comment)
+    // rather than re-deriving a second latency-matched copy. Gates on
+    // hblank_pipe[7]/vblank_pipe[7] (the same shift registers the
+    // sync-bundle delay line below already maintains, tapped 8 stages in
+    // to match sprbits_d8/babit_d8's cycle-8 landing point) so
+    // blanking-period pipeline garbage never contributes a spurious
+    // collision -- schematic shows "TV BLANK" gating the AREA5/ROAD latch
+    // on the same sheet (IC30), the same active-video-only restriction.
+    wire [4:0] turbo_coll_addr = {turbo_coll_babit_d8[5:4], turbo_coll_sprbits_d8[26:24]};
+    reg  [3:0] turbo_collision_acc;
+    always @(posedge clk) begin
+        if (reset)
+            turbo_collision_acc <= 4'h0;
+        else if (sel_collision_clear && cpu_write)
+            turbo_collision_acc <= 4'h0;
+        else if (!hblank_pipe[7] && !vblank_pipe[7])
+            turbo_collision_acc <= turbo_collision_acc | turbo_pr1116[turbo_coll_addr][3:0];
+    end
+
+    // Collision-diagnosis debug probe (temporary): count active-video
+    // cycles where sprbits[26:24] is ever nonzero (a sprite is present at
+    // all in the collision-relevant bit range) vs where the PROM lookup
+    // itself would report a hit, to localize why turbo_collision_acc never
+    // sets during real gameplay.
+    reg [31:0] dbg_coll_sprbits_nz_count_r;
+    reg [31:0] dbg_coll_addr_nz_count_r;
+    reg [4:0]  dbg_coll_addr_max_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            dbg_coll_sprbits_nz_count_r <= 32'h0;
+            dbg_coll_addr_nz_count_r    <= 32'h0;
+            dbg_coll_addr_max_r         <= 5'h0;
+        end else if (!hblank_pipe[7] && !vblank_pipe[7]) begin
+            if (turbo_coll_sprbits_d8[26:24] != 3'h0) dbg_coll_sprbits_nz_count_r <= dbg_coll_sprbits_nz_count_r + 32'h1;
+            if (turbo_pr1116[turbo_coll_addr][3:0] != 4'h0) dbg_coll_addr_nz_count_r <= dbg_coll_addr_nz_count_r + 32'h1;
+            if (turbo_coll_addr > dbg_coll_addr_max_r) dbg_coll_addr_max_r <= turbo_coll_addr;
+        end
+    end
+    assign dbg_coll_sprbits_nz_count = dbg_coll_sprbits_nz_count_r;
+    assign dbg_coll_addr_nz_count    = dbg_coll_addr_nz_count_r;
+    assign dbg_coll_addr_max         = dbg_coll_addr_max_r;
 
     wire [9:0] palbits = mod_turbo ? {2'b00, turbo_pen} : palbits_buck;
 

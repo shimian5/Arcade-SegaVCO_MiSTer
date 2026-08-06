@@ -103,10 +103,17 @@ module sprite_engine
     input  wire [17:0]  sproms_addr,
     input  wire [7:0]   sproms_wdata,
 
-    // ROM download: PR-5196, Y-scale PROM, 512B
-    input  wire         yscale_we,
-    input  wire [8:0]   yscale_addr,
-    input  wire [7:0]   yscale_wdata,
+    // ROM download: PR-5196 (Buck Y-scale) / PR-1119 (Turbo Y-scale
+    // equivalent), 512B each, in separate always-active arrays -- see
+    // segavco.v's forwarding comment for why mod_turbo can't gate which one
+    // gets written (it isn't valid yet during this download), only which
+    // one's OUTPUT is read (safe, since that only happens post-boot).
+    input  wire         buck_yscale_we,
+    input  wire [8:0]   buck_yscale_addr,
+    input  wire [7:0]   buck_yscale_wdata,
+    input  wire         turbo_yscale_we,
+    input  wire [8:0]   turbo_yscale_addr,
+    input  wire [7:0]   turbo_yscale_wdata,
 
     // Video timing (undelayed / real-time)
     input  wire         ce_pix,
@@ -195,26 +202,30 @@ module sprite_engine
     end
 
     // ------------------------------------------------------------------
-    // 8 sprite-ROM banks, sized for Buck Rogers' larger 32KB/level (arrays
-    // are fixed at elaboration; Turbo's 16KB/level data simply occupies the
-    // low half of each array, addressed with the top bit forced 0).
-    // level = sproms_addr[17:15] (Buck, 32KB/level) or sproms_addr[16:14]
-    // (Turbo, 16KB/level). Turbo's actual ROM data only spans the low 128KB
-    // of the shared 256KB download slot (docs/WORKPLAN_TURBO_GRAPHICS.md
-    // Step 1's REGIONS table pads the rest with 0xFF filler to match Buck's
-    // fixed region size) -- since Turbo's level/offset decode only looks at
-    // addr[16:0], addresses at 0x20000+ (addr[17]=1) would alias directly
-    // onto 0x00000-0x1FFFF and silently overwrite real chip data with that
-    // trailing filler if not excluded, so sproms_we_eff gates them out.
+    // 8 sprite-ROM banks, sized for Buck Rogers' native 32KB/level.
+    //
+    // WRITE-TIME decode is a SINGLE fixed scheme (level=addr[17:15],
+    // offset=addr[14:0]) for BOTH games -- deliberately NOT selected by
+    // mod_turbo. mod_turbo is latched from a separate ioctl_index=1
+    // transfer that MiSTer's loader sends only after this whole ROM blob
+    // (ioctl_index=0) has already streamed in, so it is not valid yet
+    // during sprite-ROM download; gating the write address on it here
+    // silently corrupted Turbo's sprite data on real hardware (invisible in
+    // simulation, where the testbench sets mod_turbo=1 before asserting
+    // ioctl_download -- a divergence a sim-only regression can't catch).
+    // gen_mra.py pads each of Turbo's 8 levels out to a full 32KB slot
+    // (16KB real chip data + 16KB explicit 0xFF filler) specifically so
+    // this fixed write scheme places Turbo's real data in the low 16KB
+    // half of each bank -- exactly where the READ side below (which IS
+    // correctly mod_turbo-gated, safely, since it only ever runs
+    // post-boot once the strap is genuinely valid) already expects it.
     // ------------------------------------------------------------------
     reg [7:0] sprom0[0:32767], sprom1[0:32767], sprom2[0:32767], sprom3[0:32767];
     reg [7:0] sprom4[0:32767], sprom5[0:32767], sprom6[0:32767], sprom7[0:32767];
-    wire [2:0]  sproms_level    = mod_turbo ? sproms_addr[16:14] : sproms_addr[17:15];
-    wire [14:0] sproms_off      = mod_turbo ? {1'b0, sproms_addr[13:0]} : sproms_addr[14:0];
-    wire        sproms_in_range = mod_turbo ? !sproms_addr[17] : 1'b1;
-    wire        sproms_we_eff   = sproms_we && sproms_in_range;
+    wire [2:0]  sproms_level = sproms_addr[17:15];
+    wire [14:0] sproms_off   = sproms_addr[14:0];
     always @(posedge clk) begin
-        if (sproms_we_eff) case (sproms_level)
+        if (sproms_we) case (sproms_level)
             3'd0: sprom0[sproms_off] <= sproms_wdata;
             3'd1: sprom1[sproms_off] <= sproms_wdata;
             3'd2: sprom2[sproms_off] <= sproms_wdata;
@@ -243,13 +254,19 @@ module sprite_engine
     always @(posedge clk) rom_dout[7] <= sprom7[rom_raddr[7]];
 
     // ------------------------------------------------------------------
-    // Y-scale PROM (PR-5196), 512B
+    // Y-scale PROM: PR-5196 (Buck) / PR-1119 (Turbo), 512B each, separate
+    // arrays -- output muxed by mod_turbo (safe: only read post-boot).
     // ------------------------------------------------------------------
-    reg [7:0] yscale_rom[0:511];
-    always @(posedge clk) if (yscale_we) yscale_rom[yscale_addr] <= yscale_wdata;
+    reg [7:0] buck_yscale_rom[0:511];
+    reg [7:0] turbo_yscale_rom[0:511];
+    always @(posedge clk) begin
+        if (buck_yscale_we)  buck_yscale_rom[buck_yscale_addr]   <= buck_yscale_wdata;
+        if (turbo_yscale_we) turbo_yscale_rom[turbo_yscale_addr] <= turbo_yscale_wdata;
+    end
     reg [8:0] yscale_raddr;
     reg [7:0] yscale_dout;
-    always @(posedge clk) yscale_dout <= yscale_rom[yscale_raddr];
+    always @(posedge clk)
+        yscale_dout <= mod_turbo ? turbo_yscale_rom[yscale_raddr] : buck_yscale_rom[yscale_raddr];
 
     // ------------------------------------------------------------------
     // X-scale LUT: combined buckrog/turbo, 512 x 32-bit Q8.24, generated by

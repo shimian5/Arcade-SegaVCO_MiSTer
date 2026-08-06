@@ -12,6 +12,7 @@ set_global_assignment -name VERILOG_FILE rtl/video/road_gen.v
 set_global_assignment -name VERILOG_FILE rtl/video/mixer_turbo.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8255.v
 set_global_assignment -name VERILOG_FILE rtl/io/i8279.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/steering_input.sv
 set_global_assignment -name VERILOG_FILE rtl/segavco.v
 
 set_global_assignment -name SDC_FILE Arcade-SegaVCO.sdc
