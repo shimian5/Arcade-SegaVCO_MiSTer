@@ -36,6 +36,14 @@ struct Harness {
     // global enable, and the game asserts it once at boot and leaves it there.
     // Idling it low would mute every scenario.
     uint8_t pb = 0xFF & ~(1 << 6);
+    // PPI2/CN1 (Turbo sound board, Phase 4 Step 4). Idle at the 8255's own
+    // reset value (all-ones, since an unwritten output latch on this model
+    // reads back 0xFF) -- matches segavco.v's PPI2 before any CPU write, so
+    // driving these in a Turbo-only scenario cannot perturb Buck's own
+    // scenarios 0-22 above, which never touch ppi2_pa/pb/pc at all.
+    uint8_t ppi2_pa = 0xFF;
+    uint8_t ppi2_pb = 0xFF;
+    uint8_t ppi2_pc = 0xFF;
     std::vector<int16_t> samples;
     // DC-mute tracking: how many captured samples were muted, and the sample
     // index at which the mute first released (-1 = never released).
@@ -45,12 +53,20 @@ struct Harness {
     // per-channel peaks, to separate an internally-saturating channel from
     // master-stage clipping
     int pk_alarm = 0, pk_fire = 0, pk_exp = 0, pk_hit = 0, pk_reb = 0, pk_ship = 0;
+    // Turbo ALARM channel (Phase 4 Step 5). Not summed into audio_l -- its
+    // own samples are tracked separately so its WAV and its
+    // non-constant/returns-to-rest assertions don't depend on Buck's chain.
+    int pk_turbo_alarm = 0;
+    std::vector<int16_t> turbo_alarm_samples;
 
     Harness() {
         dut = new Vaudio_top;
         dut->rst_n = 0;
         dut->ppi1_pa = pa;
         dut->ppi1_pb = pb;
+        dut->ppi2_pa = ppi2_pa;
+        dut->ppi2_pb = ppi2_pb;
+        dut->ppi2_pc = ppi2_pc;
         dut->clk = 0;
     }
 
@@ -62,6 +78,9 @@ struct Harness {
     void apply_ports() {
         dut->ppi1_pa = pa;
         dut->ppi1_pb = pb;
+        dut->ppi2_pa = ppi2_pa;
+        dut->ppi2_pb = ppi2_pb;
+        dut->ppi2_pc = ppi2_pc;
     }
 
     // advance one half clock period
@@ -93,6 +112,8 @@ struct Harness {
             absmax(pk_hit,   (int16_t)dut->dbg_hit_mix);
             absmax(pk_reb,   (int16_t)dut->dbg_rebound_mix);
             absmax(pk_ship,  (int16_t)dut->dbg_ship_mix);
+            absmax(pk_turbo_alarm, (int16_t)dut->dbg_turbo_alarm_mix);
+            turbo_alarm_samples.push_back((int16_t)dut->dbg_turbo_alarm_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -214,6 +235,21 @@ struct Harness {
         run_ms(0.05);
     }
 
+    // /TRIG1-4 (Turbo sound board CN1, Phase 4 Step 5). Bit position in
+    // ppi2_pa is exactly `which` for which=1..4 (bit0=/CRASH.S, unused
+    // here), matching audio_top.sv's cn1_trig_n = ppi2_pa[4:1] decode.
+    void pulse_turbo_trig(int which, double low_ms = 1.0) {
+        ppi2_pa &= (uint8_t)~(1 << which);
+        run_ms(low_ms);
+        ppi2_pa |= (uint8_t)(1 << which);
+    }
+
+    void pulse_turbo_trig_multi(std::vector<int> which, double low_ms = 1.0) {
+        for (int w : which) ppi2_pa &= (uint8_t)~(1 << w);
+        run_ms(low_ms);
+        for (int w : which) ppi2_pa |= (uint8_t)(1 << w);
+    }
+
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
             switch (w) {
@@ -268,7 +304,7 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-22>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-24>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -517,9 +553,129 @@ int main(int argc, char **argv) {
             h.game_on(true);
             h.run_ms(400);
             break;
+        // ---- CN1 plumbing check (Phase 4 Step 4) ----
+        case 23:
+            // Not an audio scenario -- no channel consumes CN1 yet. Drives
+            // every CN1 field to a distinct, non-idle value and lets the
+            // dbg_cn1_* taps settle for a report check below. Confirms the
+            // PPI2->audio_top wiring is live, not silently dead (three prior
+            // sessions in this project were lost to instrumentation that
+            // looked wired but wasn't).
+            //
+            // pa: bit0=/CRASH.S(assert 0), bits1-4=/TRIG1-4(assert 0),
+            //     bit5=OSEL0(drive 1), bit6=/SLIP(idle 1), bit7=/CRASH.L(idle 1)
+            //     -> 0b1110_0000 = 0xE0
+            h.ppi2_pa = 0xE0;
+            // pb: bits0-5=ACC5..ACC0=0x2B, bit6=/AMBU(idle 1), bit7=/SPIN(idle 1)
+            //     -> 0xC0 | 0x2B = 0xEB
+            h.ppi2_pb = 0xEB;
+            // pc: bit0=OSEL1(1), bit1=OSEL2(0), bits2-3=BSEL0-1(11),
+            //     bit4=SPEED0(1), bit5=SPEED1(1), bit6=SPEED2(0), bit7=SPEED3(0)
+            //     -> 0b0011_1101 = 0x3D
+            h.ppi2_pc = 0x3D;
+            h.run_ms(1);
+            break;
+        // ---- Turbo ALARM (Phase 4 Step 5) ----
+        case 24:
+            // Realistic driving pattern, per the same reasoning Buck's own
+            // ALARM scenarios use (docs/hardware-audio.md: the game drives
+            // these as a dense retrigger train, not lone pulses):
+            //   phase 1: TRIG1 (15.5 ms one-shot) retriggered every 8 ms --
+            //     faster than its own width, so it must sustain continuously
+            //     rather than chop, proving the 74123 model is genuinely
+            //     retriggerable (ttl_74123.sv's own documented requirement).
+            //   phase 2: silence, long enough for the ~24 ms filter tail to
+            //     visibly settle back toward rest.
+            //   phase 3: a single TRIG3 pulse (the longest one-shot, 512 ms)
+            //     to exercise the far end of the timing range.
+            //   phase 4: TRIG1+TRIG4 fired together, retriggered repeatedly --
+            //     both qualify against different counter taps (2QA/32 vs
+            //     1QB/4) so this exercises the open-collector wire-OR node
+            //     with two simultaneous tones, the same intermodulation
+            //     concern Buck's own scenario 5 exists to check.
+            h.run_ms(10);
+            for (int i = 0; i < 15; i++) {
+                h.pulse_turbo_trig(1, 2.0);
+                h.run_ms(8.0 - 2.0);
+            }
+            h.run_ms(150);
+            h.pulse_turbo_trig(3, 5.0);
+            h.run_ms(700);
+            for (int i = 0; i < 10; i++) {
+                h.pulse_turbo_trig_multi({1, 4}, 3.0);
+                h.run_ms(30.0 - 3.0);
+            }
+            // TRIG4's own one-shot is 155 ms wide, so it is still gating the
+            // node for up to 155 ms after the last retrigger above -- the
+            // trailing silence has to clear that AND the ~52 ms filter tau
+            // on top, not just the filter tau alone.
+            h.run_ms(800);
+            break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
             return 1;
+    }
+
+    if (scen == 23) {
+        printf("cn1: crash_s_n=%d trig_n=%X osel0=%d slip_n=%d crash_l_n=%d "
+               "acc=%02X ambu_n=%d spin_n=%d osel12=%X bsel=%X speed=%X\n",
+               h.dut->dbg_cn1_crash_s_n, h.dut->dbg_cn1_trig_n, h.dut->dbg_cn1_osel0,
+               h.dut->dbg_cn1_slip_n, h.dut->dbg_cn1_crash_l_n, h.dut->dbg_cn1_acc,
+               h.dut->dbg_cn1_ambu_n, h.dut->dbg_cn1_spin_n, h.dut->dbg_cn1_osel12,
+               h.dut->dbg_cn1_bsel, h.dut->dbg_cn1_speed);
+        return 0;
+    }
+
+    if (scen == 24) {
+        write_wav("out/audio/turbo_alarm_scen24.wav", h.turbo_alarm_samples);
+
+        // Non-trivial assertions -- a scenario that cannot fail has told us
+        // nothing (three prior sessions here were lost to instrumentation
+        // that was silently dead).
+        const auto &s = h.turbo_alarm_samples;
+        size_t n = s.size();
+        // Rest level: the first 200 samples, captured before any trigger
+        // fires (h.run_ms(10) above is ~0.5 samples at 48 kHz -- use the
+        // very first few instead).
+        int16_t rest_min = s.empty() ? 0 : s[0], rest_max = s.empty() ? 0 : s[0];
+        for (size_t i = 0; i < 20 && i < n; i++) {
+            if (s[i] < rest_min) rest_min = s[i];
+            if (s[i] > rest_max) rest_max = s[i];
+        }
+        // Trigger-window extremes: from the start of phase 1 (t=10ms) to
+        // the end of phase 4 (well before the final 300 ms of silence).
+        int16_t win_min = 0, win_max = 0;
+        bool win_init = false;
+        for (size_t i = 0; i < n; i++) {
+            double t_ms = (double)i * 1000.0 / 48000.0;
+            if (t_ms < 10.0 || t_ms > (n * 1000.0 / 48000.0 - 800.0)) continue;
+            if (!win_init) { win_min = win_max = s[i]; win_init = true; }
+            if (s[i] < win_min) win_min = s[i];
+            if (s[i] > win_max) win_max = s[i];
+        }
+        // Return-to-rest: the final 100 samples (last ~2ms of the 300ms
+        // trailing silence, well past the ~24ms filter tau).
+        int16_t tail_min = 0, tail_max = 0;
+        if (n >= 100) {
+            tail_min = tail_max = s[n - 100];
+            for (size_t i = n - 100; i < n; i++) {
+                if (s[i] < tail_min) tail_min = s[i];
+                if (s[i] > tail_max) tail_max = s[i];
+            }
+        }
+
+        bool non_constant   = (win_max - win_min) > 4;   // moved by >4 LSB during the trigger window
+        bool returned_rest  = std::abs((int)tail_max - (int)rest_min) < 8 &&
+                               std::abs((int)tail_min - (int)rest_max) < 8;
+
+        printf("turbo_alarm: scenario=24 samples=%zu peak=%d (%.4fV) "
+               "rest=[%d,%d] window=[%d,%d] tail=[%d,%d] "
+               "non_constant=%s returned_to_rest=%s\n",
+               n, h.pk_turbo_alarm, h.pk_turbo_alarm / 4096.0,
+               rest_min, rest_max, win_min, win_max, tail_min, tail_max,
+               non_constant ? "PASS" : "FAIL",
+               returned_rest ? "PASS" : "FAIL");
+        return 0;
     }
 
     char path[256];

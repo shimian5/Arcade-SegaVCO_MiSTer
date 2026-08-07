@@ -942,6 +942,14 @@ module segavco
         .rst_n   (~reset),
         .ppi1_pa (audio_ppi1_pa),
         .ppi1_pb (audio_ppi1_pb),
+        // Turbo sound-board CN1 bundle (PPI2, instantiated below as
+        // u_ppi2). Not consumed by any channel yet (Phase 4 Step 4:
+        // plumbing only) -- ppi2_pa/pb/pc idle at their PPI reset value
+        // (8'hFF, all-inputs) for Buck Rogers same as any other unused
+        // PPI2 read, so this wiring cannot affect Buck's audio path.
+        .ppi2_pa (ppi2_pa),
+        .ppi2_pb (ppi2_pb),
+        .ppi2_pc (ppi2_pc),
         .audio_l (audio_l),
         .audio_r (audio_r),
         .sample_ce ()

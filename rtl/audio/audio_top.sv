@@ -11,6 +11,14 @@ module audio_top (
     input  logic               rst_n,
     input  logic         [7:0] ppi1_pa,
     input  logic         [7:0] ppi1_pb,
+    // Turbo sound-board CN1 bundle, from the third 8255 (PPI2/IC123/CSFA)
+    // on the CPU board -- raw port bytes in, named per the schematic
+    // internally (see below). Buck Rogers ties these to their PPI2 idle
+    // levels (0xFF/0x00/0x00) via segavco.v; not yet consumed by any
+    // channel (Phase 4 Step 4 -- plumbing only, no channel built yet).
+    input  logic         [7:0] ppi2_pa,
+    input  logic         [7:0] ppi2_pb,
+    input  logic         [7:0] ppi2_pc,
     output logic signed [15:0] audio_l,
     output logic signed [15:0] audio_r,
     output logic               sample_ce,
@@ -25,8 +33,85 @@ module audio_top (
     output logic signed [15:0] dbg_rebound_mix,
     output logic signed [15:0] dbg_ship_mix,
     // Mute state, for the bench. Synthesises away when unconnected.
-    output logic               dbg_dc_mute
+    output logic               dbg_dc_mute,
+    // Turbo ALARM channel (Phase 4 Step 5), first Turbo channel built. Not
+    // yet in the Buck mix or any Turbo mixer -- driven from the bench only.
+    // See turbo_alarm_chan.sv.
+    output logic signed [15:0] dbg_turbo_alarm_mix,
+    output logic                dbg_turbo_alarm_node,
+    // CN1 bundle, decoded and named per the schematic, for the Verilator
+    // bench to confirm the game's PPI2 writes actually reach here (Phase 4
+    // Step 4's gate). Not consumed by any channel yet. Synthesises away
+    // when unconnected. Bit map: docs/hardware-turbo.md's CN1 pinout
+    // (Phase 4 Step 2 ledger), cross-checked against turbo_a.cpp's
+    // sound_a_w/sound_b_w/sound_c_w.
+    output logic                dbg_cn1_crash_s_n,
+    output logic         [3:0]  dbg_cn1_trig_n,   // [0]=TRIG1 .. [3]=TRIG4
+    output logic                dbg_cn1_osel0,     // active-high; see note below
+    output logic                dbg_cn1_slip_n,
+    output logic                dbg_cn1_crash_l_n,
+    output logic         [5:0]  dbg_cn1_acc,       // ACC0-5
+    output logic                dbg_cn1_ambu_n,
+    output logic                dbg_cn1_spin_n,
+    output logic         [1:0]  dbg_cn1_osel12,    // [0]=OSEL1 [1]=OSEL2
+    output logic         [1:0]  dbg_cn1_bsel,      // BSEL0-1
+    output logic         [3:0]  dbg_cn1_speed      // SPEED0-3
 );
+
+    // ---------------------------------------------------------------
+    // CN1 bundle: decode PPI2's three ports into the schematic's own
+    // signal names. Active-low stays active-low in the name -- no
+    // polarity normalisation here. `OSEL0` is active-HIGH despite the
+    // CN1-sheet's printed bar over it: docs/hardware-turbo.md's Step 2
+    // ledger, Item (c), resolves the bar as a drafting artifact (D-5/11,
+    // the sheet that actually USES the signal, shows no inverter and
+    // treats it identically to the unbarred OSEL1/OSEL2; turbo_a.cpp's
+    // sound_a_w agrees, taking bit 5 direct with no inversion). Bit
+    // positions: sound_a = {CRASH.L, /SLIP, OSEL0, TRIG4, TRIG3, TRIG2,
+    // TRIG1, /CRASH.S} (MSB..LSB), sound_b = {/SPIN, /AMBU, ACC5..ACC0},
+    // sound_c = {SPEED3..0, BSEL1, BSEL0, OSEL2, OSEL1}.
+    // ---------------------------------------------------------------
+    wire        cn1_crash_s_n = ppi2_pa[0];
+    wire [3:0]  cn1_trig_n    = ppi2_pa[4:1];
+    wire        cn1_osel0     = ppi2_pa[5];
+    wire        cn1_slip_n    = ppi2_pa[6];
+    wire        cn1_crash_l_n = ppi2_pa[7];
+
+    wire [5:0]  cn1_acc       = ppi2_pb[5:0];
+    wire        cn1_ambu_n    = ppi2_pb[6];
+    wire        cn1_spin_n    = ppi2_pb[7];
+
+    wire [1:0]  cn1_osel12    = ppi2_pc[1:0];
+    wire [1:0]  cn1_bsel      = ppi2_pc[3:2];
+    wire [3:0]  cn1_speed     = ppi2_pc[7:4];
+
+    assign dbg_cn1_crash_s_n = cn1_crash_s_n;
+    assign dbg_cn1_trig_n    = cn1_trig_n;
+    assign dbg_cn1_osel0     = cn1_osel0;
+    assign dbg_cn1_slip_n    = cn1_slip_n;
+    assign dbg_cn1_crash_l_n = cn1_crash_l_n;
+    assign dbg_cn1_acc       = cn1_acc;
+    assign dbg_cn1_ambu_n    = cn1_ambu_n;
+    assign dbg_cn1_spin_n    = cn1_spin_n;
+    assign dbg_cn1_osel12    = cn1_osel12;
+    assign dbg_cn1_bsel      = cn1_bsel;
+    assign dbg_cn1_speed     = cn1_speed;
+
+    // ---------------------------------------------------------------
+    // Turbo ALARM channel (D-2/11), Phase 4 Step 5. Driven from the CN1
+    // bundle above. Not summed into audio_l/audio_r and not wired into any
+    // Turbo mixer yet (Mixer I/II are a later step, per
+    // docs/WORKPLAN_TURBO_AUDIO.md's build order) -- exposed only as a
+    // debug tap for the bench.
+    // ---------------------------------------------------------------
+    turbo_alarm_chan u_turbo_alarm (
+        .clk              (clk),
+        .rst_n            (rst_n),
+        .trig_n           (cn1_trig_n),
+        .sample_ce        (sample_ce),
+        .turbo_alarm_mix  (dbg_turbo_alarm_mix),
+        .node             (dbg_turbo_alarm_node)
+    );
 
     // ---------------------------------------------------------------
     // Sample-rate generator: clk_sys / 832 = 47,999.4 Hz
