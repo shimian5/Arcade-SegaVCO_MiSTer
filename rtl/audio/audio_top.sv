@@ -39,6 +39,13 @@ module audio_top (
     // See turbo_alarm_chan.sv.
     output logic signed [15:0] dbg_turbo_alarm_mix,
     output logic                dbg_turbo_alarm_node,
+    // Turbo CRASH channel (Phase 4 Step 6). Same status as ALARM above --
+    // driven from the bench only. See turbo_crash_chan.sv.
+    output logic signed [15:0] dbg_turbo_crash_s_mix,
+    output logic signed [15:0] dbg_turbo_crash_l_mix,
+    output logic                dbg_turbo_crash_q_s,
+    output logic                dbg_turbo_crash_q_l_main,
+    output logic                dbg_turbo_crash_q_l_tail,
     // CN1 bundle, decoded and named per the schematic, for the Verilator
     // bench to confirm the game's PPI2 writes actually reach here (Phase 4
     // Step 4's gate). Not consumed by any channel yet. Synthesises away
@@ -111,6 +118,23 @@ module audio_top (
         .sample_ce        (sample_ce),
         .turbo_alarm_mix  (dbg_turbo_alarm_mix),
         .node             (dbg_turbo_alarm_node)
+    );
+
+    // ---------------------------------------------------------------
+    // Turbo CRASH channel (D-4/11), Phase 4 Step 6. Same status as ALARM
+    // above -- driven from the CN1 bundle, exposed only as debug taps.
+    // ---------------------------------------------------------------
+    turbo_crash_chan u_turbo_crash (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .crash_s_n          (cn1_crash_s_n),
+        .crash_l_n          (cn1_crash_l_n),
+        .sample_ce          (sample_ce),
+        .turbo_crash_s_mix  (dbg_turbo_crash_s_mix),
+        .turbo_crash_l_mix  (dbg_turbo_crash_l_mix),
+        .dbg_q_crash_s      (dbg_turbo_crash_q_s),
+        .dbg_q_crash_l_main (dbg_turbo_crash_q_l_main),
+        .dbg_q_crash_l_tail (dbg_turbo_crash_q_l_tail)
     );
 
     // ---------------------------------------------------------------

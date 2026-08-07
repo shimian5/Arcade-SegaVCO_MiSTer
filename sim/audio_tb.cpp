@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 #include "verilated.h"
 #include "Vaudio_top.h"
 
@@ -58,6 +59,13 @@ struct Harness {
     // non-constant/returns-to-rest assertions don't depend on Buck's chain.
     int pk_turbo_alarm = 0;
     std::vector<int16_t> turbo_alarm_samples;
+    // Turbo CRASH channel (Phase 4 Step 6). Not summed into audio_l either.
+    int pk_turbo_crash_s = 0, pk_turbo_crash_l = 0;
+    std::vector<int16_t> turbo_crash_s_samples, turbo_crash_l_samples;
+    // Q edges observed, to prove the retrigger-tail assertion (a transient
+    // on CRASH.L's tap with no second CN1 edge) without re-deriving timing
+    // from the WAV alone.
+    bool crash_l_tail_seen = false;
 
     Harness() {
         dut = new Vaudio_top;
@@ -114,6 +122,11 @@ struct Harness {
             absmax(pk_ship,  (int16_t)dut->dbg_ship_mix);
             absmax(pk_turbo_alarm, (int16_t)dut->dbg_turbo_alarm_mix);
             turbo_alarm_samples.push_back((int16_t)dut->dbg_turbo_alarm_mix);
+            absmax(pk_turbo_crash_s, (int16_t)dut->dbg_turbo_crash_s_mix);
+            absmax(pk_turbo_crash_l, (int16_t)dut->dbg_turbo_crash_l_mix);
+            turbo_crash_s_samples.push_back((int16_t)dut->dbg_turbo_crash_s_mix);
+            turbo_crash_l_samples.push_back((int16_t)dut->dbg_turbo_crash_l_mix);
+            if (dut->dbg_turbo_crash_q_l_tail) crash_l_tail_seen = true;
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -250,6 +263,23 @@ struct Harness {
         for (int w : which) ppi2_pa |= (uint8_t)(1 << w);
     }
 
+    // /CRASH.S (ppi2_pa bit0) and /CRASH.L (ppi2_pa bit7), Phase 4 Step 6.
+    void pulse_crash_s(double low_ms = 1.0) {
+        ppi2_pa &= (uint8_t)~0x01;
+        run_ms(low_ms);
+        ppi2_pa |= (uint8_t)0x01;
+    }
+    void pulse_crash_l(double low_ms = 1.0) {
+        ppi2_pa &= (uint8_t)~0x80;
+        run_ms(low_ms);
+        ppi2_pa |= (uint8_t)0x80;
+    }
+    void pulse_crash_both(double low_ms = 1.0) {
+        ppi2_pa &= (uint8_t)~0x81;
+        run_ms(low_ms);
+        ppi2_pa |= (uint8_t)0x81;
+    }
+
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
             switch (w) {
@@ -300,11 +330,34 @@ static void write_wav(const std::string &path, const std::vector<int16_t> &sampl
     fclose(f);
 }
 
+// Shared non-triviality check for a channel tap: non-constant somewhere in
+// the recording, and settled (near its own opening level) by the end.
+// Returns {non_constant, returned_to_rest}.
+static std::pair<bool,bool> check_channel(const std::vector<int16_t> &s) {
+    if (s.size() < 40) return {false, false};
+    int16_t rest_min = s[0], rest_max = s[0];
+    for (size_t i = 0; i < 20 && i < s.size(); i++) {
+        if (s[i] < rest_min) rest_min = s[i];
+        if (s[i] > rest_max) rest_max = s[i];
+    }
+    int16_t all_min = s[0], all_max = s[0];
+    for (int16_t v : s) { if (v < all_min) all_min = v; if (v > all_max) all_max = v; }
+    int16_t tail_min = s[s.size() - 20], tail_max = s[s.size() - 20];
+    for (size_t i = s.size() - 20; i < s.size(); i++) {
+        if (s[i] < tail_min) tail_min = s[i];
+        if (s[i] > tail_max) tail_max = s[i];
+    }
+    bool non_constant  = (all_max - all_min) > 4;
+    bool returned_rest = std::abs((int)tail_max - (int)rest_min) < 8 &&
+                          std::abs((int)tail_min - (int)rest_max) < 8;
+    return {non_constant, returned_rest};
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-24>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-25>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -611,6 +664,24 @@ int main(int argc, char **argv) {
             // on top, not just the filter tau alone.
             h.run_ms(800);
             break;
+        // ---- Turbo CRASH (Phase 4 Step 6) ----
+        case 25:
+            // phase 1: CRASH.S alone -- 51.2 ms one-shot, generous decay margin.
+            h.run_ms(10);
+            h.pulse_crash_s(5);
+            h.run_ms(300);
+            // phase 2: CRASH.L alone -- 72.9 ms main pulse, then the
+            // retrigger tail fires ~7.3 ms after the MAIN pulse ends (i.e.
+            // ~80.2 ms after this trigger), not at trigger time -- see
+            // turbo_crash_chan.sv's header for why (Q, not Q-bar, feeds the
+            // tail's A input). Generous margin past both.
+            h.pulse_crash_l(5);
+            h.run_ms(400);
+            // phase 3: both together -- the real gameplay case (a crash
+            // could plausibly assert both CN1 lines close together).
+            h.pulse_crash_both(5);
+            h.run_ms(400);
+            break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
             return 1;
@@ -675,6 +746,25 @@ int main(int argc, char **argv) {
                rest_min, rest_max, win_min, win_max, tail_min, tail_max,
                non_constant ? "PASS" : "FAIL",
                returned_rest ? "PASS" : "FAIL");
+        return 0;
+    }
+
+    if (scen == 25) {
+        write_wav("out/audio/turbo_crash_s_scen25.wav", h.turbo_crash_s_samples);
+        write_wav("out/audio/turbo_crash_l_scen25.wav", h.turbo_crash_l_samples);
+
+        auto [s_nc, s_rest] = check_channel(h.turbo_crash_s_samples);
+        auto [l_nc, l_rest] = check_channel(h.turbo_crash_l_samples);
+
+        printf("turbo_crash: scenario=25 samples_s=%zu peak_s=%d (%.4fV) samples_l=%zu peak_l=%d (%.4fV) "
+               "CRASH.S[non_constant=%s returned_to_rest=%s] "
+               "CRASH.L[non_constant=%s returned_to_rest=%s] "
+               "retrigger_tail_fired=%s\n",
+               h.turbo_crash_s_samples.size(), h.pk_turbo_crash_s, h.pk_turbo_crash_s / 4096.0,
+               h.turbo_crash_l_samples.size(), h.pk_turbo_crash_l, h.pk_turbo_crash_l / 4096.0,
+               s_nc ? "PASS" : "FAIL", s_rest ? "PASS" : "FAIL",
+               l_nc ? "PASS" : "FAIL", l_rest ? "PASS" : "FAIL",
+               h.crash_l_tail_seen ? "PASS" : "FAIL");
         return 0;
     }
 
