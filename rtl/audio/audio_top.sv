@@ -46,6 +46,11 @@ module audio_top (
     output logic                dbg_turbo_crash_q_s,
     output logic                dbg_turbo_crash_q_l_main,
     output logic                dbg_turbo_crash_q_l_tail,
+    // Turbo SKID channel (Phase 4 Step 7). Same status as ALARM/CRASH above.
+    // See turbo_skid_chan.sv.
+    output logic signed [15:0] dbg_turbo_skid_mix,
+    output logic                dbg_turbo_skid_q_slip,
+    output logic                dbg_turbo_skid_gate,
     // CN1 bundle, decoded and named per the schematic, for the Verilator
     // bench to confirm the game's PPI2 writes actually reach here (Phase 4
     // Step 4's gate). Not consumed by any channel yet. Synthesises away
@@ -135,6 +140,21 @@ module audio_top (
         .dbg_q_crash_s      (dbg_turbo_crash_q_s),
         .dbg_q_crash_l_main (dbg_turbo_crash_q_l_main),
         .dbg_q_crash_l_tail (dbg_turbo_crash_q_l_tail)
+    );
+
+    // ---------------------------------------------------------------
+    // Turbo SKID channel (D-3/11), Phase 4 Step 7. Same status as ALARM/
+    // CRASH above -- driven from the CN1 bundle, exposed only as debug taps.
+    // ---------------------------------------------------------------
+    turbo_skid_chan u_turbo_skid (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .slip_n          (cn1_slip_n),
+        .spin_n          (cn1_spin_n),
+        .sample_ce       (sample_ce),
+        .turbo_skid_mix  (dbg_turbo_skid_mix),
+        .dbg_q_slip      (dbg_turbo_skid_q_slip),
+        .dbg_gate        (dbg_turbo_skid_gate)
     );
 
     // ---------------------------------------------------------------

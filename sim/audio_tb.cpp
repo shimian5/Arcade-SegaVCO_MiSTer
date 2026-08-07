@@ -66,6 +66,9 @@ struct Harness {
     // on CRASH.L's tap with no second CN1 edge) without re-deriving timing
     // from the WAV alone.
     bool crash_l_tail_seen = false;
+    // Turbo SKID channel (Phase 4 Step 7).
+    int pk_turbo_skid = 0;
+    std::vector<int16_t> turbo_skid_samples;
 
     Harness() {
         dut = new Vaudio_top;
@@ -127,6 +130,8 @@ struct Harness {
             turbo_crash_s_samples.push_back((int16_t)dut->dbg_turbo_crash_s_mix);
             turbo_crash_l_samples.push_back((int16_t)dut->dbg_turbo_crash_l_mix);
             if (dut->dbg_turbo_crash_q_l_tail) crash_l_tail_seen = true;
+            absmax(pk_turbo_skid, (int16_t)dut->dbg_turbo_skid_mix);
+            turbo_skid_samples.push_back((int16_t)dut->dbg_turbo_skid_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -280,6 +285,20 @@ struct Harness {
         ppi2_pa |= (uint8_t)0x81;
     }
 
+    // /SLIP (ppi2_pa bit6, pulsed -- Skid's own monostable) and /SPIN
+    // (ppi2_pb bit7, a level, not an edge -- see turbo_skid_chan.sv's
+    // header on why D-3/11 treats them differently). Phase 4 Step 7.
+    void pulse_slip(double low_ms = 1.0) {
+        ppi2_pa &= (uint8_t)~0x40;
+        run_ms(low_ms);
+        ppi2_pa |= (uint8_t)0x40;
+    }
+    void spin(bool on) {
+        if (on) ppi2_pb &= (uint8_t)~0x80;
+        else    ppi2_pb |= (uint8_t)0x80;
+        apply_ports();
+    }
+
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
             switch (w) {
@@ -357,7 +376,7 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-25>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-26>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -682,6 +701,25 @@ int main(int argc, char **argv) {
             h.pulse_crash_both(5);
             h.run_ms(400);
             break;
+        // ---- Turbo SKID (Phase 4 Step 7) ----
+        case 26:
+            // phase 1: SLIP alone -- 51.2 ms one-shot, decay margin.
+            h.run_ms(10);
+            h.pulse_slip(5);
+            h.run_ms(200);
+            // phase 2: SPIN held as a level for a while, then released --
+            // exercises the level-gate path independently of any monostable.
+            h.spin(true);
+            h.run_ms(150);
+            h.spin(false);
+            h.run_ms(150);
+            // phase 3: both together.
+            h.pulse_slip(5);
+            h.spin(true);
+            h.run_ms(150);
+            h.spin(false);
+            h.run_ms(300);
+            break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
             return 1;
@@ -765,6 +803,15 @@ int main(int argc, char **argv) {
                s_nc ? "PASS" : "FAIL", s_rest ? "PASS" : "FAIL",
                l_nc ? "PASS" : "FAIL", l_rest ? "PASS" : "FAIL",
                h.crash_l_tail_seen ? "PASS" : "FAIL");
+        return 0;
+    }
+
+    if (scen == 26) {
+        write_wav("out/audio/turbo_skid_scen26.wav", h.turbo_skid_samples);
+        auto [nc, rest] = check_channel(h.turbo_skid_samples);
+        printf("turbo_skid: scenario=26 samples=%zu peak=%d (%.4fV) non_constant=%s returned_to_rest=%s\n",
+               h.turbo_skid_samples.size(), h.pk_turbo_skid, h.pk_turbo_skid / 4096.0,
+               nc ? "PASS" : "FAIL", rest ? "PASS" : "FAIL");
         return 0;
     }
 
