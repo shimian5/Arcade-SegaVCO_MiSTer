@@ -3,34 +3,38 @@
 // /SLIP or /SPIN is active, into an IC18 VCA -> VR1 trim -> four identical
 // coupled outputs (SKID.F/R/L/M).
 //
-// This is the most topologically ambiguous sheet built so far -- more so
-// than Crash. Two structural findings from docs/trace/turbo_audio_D3of11.md
-// drove real architecture decisions here, not just component-value
-// approximations:
+// One structural finding from docs/trace/turbo_audio_D3of11.md drove the
+// output-stage architecture here, not just component-value approximations:
+// the noise-filter chain (IC1 A/B/C) and the SLIP/SPIN combiner (through
+// IC1 section D, a follower) converge on THE SAME node feeding IC37's 555
+// timing network -- i.e., on the real board, SLIP/SPIN and NOISE both
+// bias/modulate the 555's oscillation, they do not gate a VCA the way every
+// other channel's trigger does at the point they converge.
 //
-//   1. IC18's CON pin (VCA gain control) is UNTRACED on this sheet -- its
-//      wire "runs down, destination off the bottom of the crop, not traced
-//      further." No component on D-3/11 confirms what gates the VCA.
-//   2. What IS traced is that BOTH the noise-filter chain (IC1 A/B/C) AND
-//      the SLIP/SPIN combiner (through IC1 section D, a follower) converge
-//      on THE SAME node feeding IC37's 555 timing network -- i.e., on the
-//      real board, SLIP/SPIN and NOISE both bias/modulate the 555's
-//      oscillation, they do not obviously gate a VCA on/off the way every
-//      other channel's trigger does.
+// **IC18's CON pin, RESOLVED 2026-08-06** (was UNTRACED as of Step 7's
+// original build): a wider full-page 6x-DPI re-render followed CON's wire
+// past where the original narrower crop cut it off, and found it lands
+// exactly on IC1 section D's own output (pin 8) -- the identical node
+// already known to feed the 555's bias network above. This CONFIRMS, not
+// infers, that IC18's VCA gain control is driven by the SLIP/SPIN
+// combiner. Step 7's original gate (below) was chosen as a board-wide-
+// pattern INFERENCE with no supporting wire at all; it now matches a
+// directly-traced fact instead. See docs/hardware-turbo.md's D-3/11
+// section for the full resolution.
 //
-// SIMPLIFICATIONS, all deliberate and documented (finding 1 in particular
-// leaves a real gap the sheet cannot close):
+// SIMPLIFICATIONS, all deliberate and documented:
 //
-//   A. GATING (mitigates finding 1): since CON's real source is untraced,
-//      and the board-wide pattern is that every VCA is gated by SOME
-//      trigger-derived signal (never left permanently open), this module
-//      INFERS the gate to be "/SLIP's monostable active OR /SPIN asserted"
-//      -- the only two trigger-derived signals this sheet actually shows
-//      converging near the 555/VCA chain. This is a board-wide-pattern
-//      inference, not a confirmed wire trace, and is the single largest
-//      open item this channel carries forward (see the report).
-//   B. MODULATION -> TEXTURE (reworks finding 2 into something buildable):
-//      rather than literally frequency-modulating a 555 model (which
+//   A. GATING (now CONFIRMED, not inferred, per the resolution above):
+//      "/SLIP's monostable active OR /SPIN asserted" is the real gating
+//      condition. What remains a simplification is HOW it gates: the real
+//      IC1-section-D node is an analog combiner voltage (shaped by R7/D1/R6
+//      for SLIP and R5 for SPIN, bypassed by C1), not an idealised hard
+//      digital 0/1 -- modelled here as a hard gate anyway, the same
+//      ordinary category of simplification used for every other channel's
+//      VCA response curve in this phase, not a gap unique to this sheet.
+//   B. MODULATION -> TEXTURE (reworks the noise/555 convergence noted above
+//      into something buildable): rather than literally frequency-
+//      modulating a 555 model (which
 //      ttl_555_astable.sv does not support, and building a fully variable
 //      relaxation oscillator here is out of this step's scope), IC37 is
 //      modelled as a FIXED-frequency tone, and the noise-filter chain's
