@@ -69,6 +69,9 @@ struct Harness {
     // Turbo SKID channel (Phase 4 Step 7).
     int pk_turbo_skid = 0;
     std::vector<int16_t> turbo_skid_samples;
+    // Turbo AMBULANCE channel (Phase 4 Step 8).
+    int pk_turbo_ambulance = 0;
+    std::vector<int16_t> turbo_ambulance_samples;
 
     Harness() {
         dut = new Vaudio_top;
@@ -132,6 +135,8 @@ struct Harness {
             if (dut->dbg_turbo_crash_q_l_tail) crash_l_tail_seen = true;
             absmax(pk_turbo_skid, (int16_t)dut->dbg_turbo_skid_mix);
             turbo_skid_samples.push_back((int16_t)dut->dbg_turbo_skid_mix);
+            absmax(pk_turbo_ambulance, (int16_t)dut->dbg_turbo_ambulance_mix);
+            turbo_ambulance_samples.push_back((int16_t)dut->dbg_turbo_ambulance_mix);
         }
         time_ps += CLK_PERIOD_PS / 2;
     }
@@ -298,6 +303,12 @@ struct Harness {
         else    ppi2_pb |= (uint8_t)0x80;
         apply_ports();
     }
+    // /AMBU (ppi2_pb bit6), a level like /SPIN. Phase 4 Step 8.
+    void ambu(bool on) {
+        if (on) ppi2_pb &= (uint8_t)~0x40;
+        else    ppi2_pb |= (uint8_t)0x40;
+        apply_ports();
+    }
 
     void pulse_alarms_together(std::vector<int> which, double low_ms = 1.0) {
         for (int w : which) {
@@ -376,7 +387,7 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <scenario 0-26>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario 0-27>\n", argv[0]);
         return 1;
     }
     int scen = atoi(argv[1]);
@@ -720,6 +731,22 @@ int main(int argc, char **argv) {
             h.spin(false);
             h.run_ms(300);
             break;
+        // ---- Turbo AMBULANCE (Phase 4 Step 8) ----
+        case 27:
+            // /AMBU held for long enough to see several warble cycles (the
+            // placeholder LFO is ~1.46 Hz, i.e. ~685 ms/cycle -- 2.5s covers
+            // ~3.6 cycles), then released, then asserted again briefly to
+            // confirm it retriggers cleanly rather than latching.
+            h.run_ms(10);
+            h.ambu(true);
+            h.run_ms(2500);
+            h.ambu(false);
+            h.run_ms(300);
+            h.ambu(true);
+            h.run_ms(400);
+            h.ambu(false);
+            h.run_ms(300);
+            break;
         default:
             fprintf(stderr, "unknown scenario %d\n", scen);
             return 1;
@@ -812,6 +839,26 @@ int main(int argc, char **argv) {
         printf("turbo_skid: scenario=26 samples=%zu peak=%d (%.4fV) non_constant=%s returned_to_rest=%s\n",
                h.turbo_skid_samples.size(), h.pk_turbo_skid, h.pk_turbo_skid / 4096.0,
                nc ? "PASS" : "FAIL", rest ? "PASS" : "FAIL");
+        return 0;
+    }
+
+    if (scen == 27) {
+        write_wav("out/audio/turbo_ambulance_scen27.wav", h.turbo_ambulance_samples);
+        auto [nc, rest] = check_channel(h.turbo_ambulance_samples);
+        // Ambulance is a hard gate with no filter tail, so it should be
+        // EXACTLY silent (not just "near rest") once /AMBU releases and a
+        // few samples have passed -- a stricter check than the generic
+        // returned_to_rest tolerance.
+        const auto &s = h.turbo_ambulance_samples;
+        bool exact_silence_at_end = true;
+        for (size_t i = s.size() - 50; i < s.size(); i++) {
+            if (s[i] != 0) { exact_silence_at_end = false; break; }
+        }
+        printf("turbo_ambulance: scenario=27 samples=%zu peak=%d (%.4fV) non_constant=%s "
+               "returned_to_rest=%s exact_silence_at_end=%s\n",
+               s.size(), h.pk_turbo_ambulance, h.pk_turbo_ambulance / 4096.0,
+               nc ? "PASS" : "FAIL", rest ? "PASS" : "FAIL",
+               exact_silence_at_end ? "PASS" : "FAIL");
         return 0;
     }
 
