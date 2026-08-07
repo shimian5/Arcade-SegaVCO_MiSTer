@@ -78,7 +78,11 @@ localparam CONF_STR = {
 	// to DDRAM); VGA output is always the raw, unrotated picture, matching
 	// a genuinely rotated cabinet monitor wired via VGA. No effect on Buck
 	// Rogers (forced off below regardless of this bit).
-	"O[6],Rotate HDMI (Turbo),Auto,Off;",
+	// H0 hides these two Turbo-only entries when Buck Rogers is loaded
+	// (status_menumask[0] driven by ~mod_turbo below) -- no point showing
+	// Turbo's rotate/steering options on a game that ignores both bits.
+	"H0O[6],Rotate HDMI (Turbo),Auto,Off;",
+	"H0O[10],D-Pad Steering (Turbo),Velocity,Position;",
 	"-;",
 	// DIP switch VALUES are not declared here -- per MiSTer arcade-core
 	// convention (mister-devel MkDocs_MiSTer, developer/mra) they live in
@@ -165,7 +169,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask(16'h0), // no CONF_STR pages need hiding now that DIPs are MRA-sourced
+	.status_menumask({15'h0, ~mod_turbo}), // H0: hide Turbo-only rotate/steering entries on Buck Rogers
 
 	.ps2_key(ps2_key)
 );
@@ -278,11 +282,29 @@ reg vblank_d;
 always @(posedge clk_sys) vblank_d <= VBlank;
 wire ce_frame = VBlank & ~vblank_d;
 
+// Tuned against the real Turbo steering mechanism, not just MAME's DIAL port:
+// the schematic's LS191 counter is a x1 quadrature relative encoder (no HW
+// accel/spring), and the photographed wheel-shaft gearing (~5:1) + encoder
+// disk (~40 slots) puts one hardware count at roughly 45 degrees of wheel
+// rotation -- i.e. the observed real-cabinet "~1/4 turn = ~1 car width"
+// correction is only ~2 counts. SHIFT=4 (unchanged) keeps the analog stick's
+// full-deflection contribution around 7 counts/frame. RAMP_STEP dropped
+// 8->2 so the velocity ramp (contribution = velocity>>>1, VEL_MAX=8
+// unchanged) actually ramps instead of jumping straight to its ceiling:
+// a 1-frame tap now yields 1 count, climbing 1/2/3/4 over the first four
+// held frames and capping at 4 counts/frame thereafter -- small taps stay
+// small, sustained holds still allow full wheel rotation. POS_MAX cut
+// 127->64 to match: the spring-return position mode's contribution
+// (deflect>>>4) now tops out at 4 counts/frame too, down from ~15. Position
+// mode remains a convenience alternative, not a cabinet-accurate model --
+// the real wheel has no spring return.
 wire [7:0] turbo_dial;
-steering_input u_steering
+steering_input #(
+	.RAMP_STEP(9'sd2), .VEL_MAX(9'sd8), .POS_MAX(9'sd64), .SHIFT(4)
+) u_steering
 (
 	.clk_sys(clk_sys), .reset(reset), .ce_frame(ce_frame),
-	.dpad_pos_mode(1'b0),
+	.dpad_pos_mode(status[10]), // OSD "D-Pad Steering": 0 = velocity ramp (default), 1 = position w/ spring-return
 	.analog_x(joystick_l_analog_0[7:0]),
 	.dpad_left(joystick_0[1]), .dpad_right(joystick_0[0]),
 	.spinner(spinner_0),
