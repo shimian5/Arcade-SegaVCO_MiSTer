@@ -287,22 +287,25 @@ wire ce_frame = VBlank & ~vblank_d;
 // accel/spring), and the photographed wheel-shaft gearing (~5:1) + encoder
 // disk (~40 slots) puts one hardware count at roughly 45 degrees of wheel
 // rotation -- i.e. the observed real-cabinet "~1/4 turn = ~1 car width"
-// correction is only ~2 counts. RAMP_STEP dropped 8->2 so the velocity
-// ramp (contribution = velocity>>>1, VEL_MAX=8 unchanged) actually ramps
-// instead of jumping straight to its ceiling: a 1-frame tap now yields 1
-// count, climbing 1/2/3/4 over the first four held frames and capping at
-// 4 counts/frame thereafter -- small taps stay small, sustained holds
-// still allow full wheel rotation. POS_MAX cut 127->64 to match: the
-// spring-return position mode's contribution (deflect>>>4) now tops out
-// at 4 counts/frame too, down from ~15. Position mode remains a
-// convenience alternative, not a cabinet-accurate model -- the real wheel
-// has no spring return. ANALOG_SHIFT split out to 5 (SHIFT stays 4 for the
-// dpad) because full analog-stick deflection at SHIFT=4 (127>>>4 = 7
-// counts/frame) was reported just as twitchy as the old dpad ramp; 5 caps
-// it at 127>>>5 = 3 counts/frame, in line with the dpad's ceiling.
+// correction is only ~2 counts. RAMP_STEP=2/VEL_MAX=6 (post >>>1 shift) so
+// the velocity ramp actually ramps instead of jumping straight to its
+// ceiling: a 1-frame tap yields 1 count, climbing 1/2/3 over the first
+// three held frames and capping at 3 counts/frame thereafter -- small taps
+// stay small, and the 3-count/frame sustained ceiling (~135 degrees/frame)
+// avoids constantly injecting the ~180-degree-plus swings a higher ceiling
+// would imply, while still allowing full wheel rotation over a longer
+// hold. POS_MAX=48 matches: the spring-return position mode's contribution
+// (deflect>>>4) also tops out at 3 counts/frame, down from ~15 at the
+// module's original default. Position mode remains a convenience
+// alternative, not a cabinet-accurate model -- the real wheel has no
+// spring return. ANALOG_SHIFT split out to 5 (SHIFT stays 4 for the dpad)
+// so full analog-stick deflection (127>>>5 = 3 counts/frame) lines up with
+// the same 3-count/frame ceiling as the dpad's sustained hold and the
+// initial tap stays at 1 -- one coherent ceiling across all three digital
+// input paths for the first hardware test.
 wire [7:0] turbo_dial;
 steering_input #(
-	.RAMP_STEP(9'sd2), .VEL_MAX(9'sd8), .POS_MAX(9'sd64), .SHIFT(4), .ANALOG_SHIFT(5)
+	.RAMP_STEP(9'sd2), .VEL_MAX(9'sd6), .POS_MAX(9'sd48), .SHIFT(4), .ANALOG_SHIFT(5)
 ) u_steering
 (
 	.clk_sys(clk_sys), .reset(reset), .ce_frame(ce_frame),
