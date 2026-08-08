@@ -299,14 +299,20 @@ wire ce_frame = VBlank & ~vblank_d;
 // (deflect>>>4) also tops out at 3 counts/frame, down from ~15 at the
 // module's original default. Position mode remains a convenience
 // alternative, not a cabinet-accurate model -- the real wheel has no
-// spring return. ANALOG_SHIFT split out to 5 (SHIFT stays 4 for the dpad)
-// so full analog-stick deflection (127>>>5 = 3 counts/frame) lines up with
-// the same 3-count/frame ceiling as the dpad's sustained hold and the
-// initial tap stays at 1 -- one coherent ceiling across all three digital
-// input paths for the first hardware test.
+// spring return. ANALOG_SHIFT split out from SHIFT (dpad stays 4) so the
+// stick's sensitivity is independently tunable. First pass used
+// ANALOG_SHIFT=5 (max 127>>>5 = 3 counts/frame), but that meant no
+// contribution at all below ~25% stick throw (32/128) -- reported
+// sluggish alongside the dpad. Bumped to ANALOG_SHIFT=4: the dead zone
+// halves to ~12.5% (16/128) and every deflection level responds roughly
+// twice as fast, at the cost of raising the full-deflection ceiling to
+// 127>>>4 = 7 counts/frame (only reached by holding the stick fully
+// over). If sustained full-deflection turns out too fast again, the
+// next step is a proper fixed-point gain instead of a bit-shift, so the
+// dead zone and the ceiling can be tuned independently.
 wire [7:0] turbo_dial;
 steering_input #(
-	.RAMP_STEP(9'sd3), .VEL_MAX(9'sd6), .POS_MAX(9'sd48), .SHIFT(4), .ANALOG_SHIFT(5)
+	.RAMP_STEP(9'sd3), .VEL_MAX(9'sd6), .POS_MAX(9'sd48), .SHIFT(4), .ANALOG_SHIFT(4)
 ) u_steering
 (
 	.clk_sys(clk_sys), .reset(reset), .ce_frame(ce_frame),
