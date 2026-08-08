@@ -287,11 +287,12 @@ wire ce_frame = VBlank & ~vblank_d;
 // accel/spring), and the photographed wheel-shaft gearing (~5:1) + encoder
 // disk (~40 slots) puts one hardware count at roughly 45 degrees of wheel
 // rotation -- i.e. the observed real-cabinet "~1/4 turn = ~1 car width"
-// correction is only ~2 counts. RAMP_STEP=2/VEL_MAX=6 (post >>>1 shift) so
+// correction is only ~2 counts. RAMP_STEP=3/VEL_MAX=6 (post >>>1 shift) so
 // the velocity ramp actually ramps instead of jumping straight to its
-// ceiling: a 1-frame tap yields 1 count, climbing 1/2/3 over the first
-// three held frames and capping at 3 counts/frame thereafter -- small taps
-// stay small, and the 3-count/frame sustained ceiling (~135 degrees/frame)
+// ceiling: a 1-frame tap still yields 1 count, but the ramp now reaches
+// the 3-count/frame ceiling by the 2nd held frame instead of the 3rd
+// (RAMP_STEP=2 felt a hair too slow to spool up in real play) -- small
+// taps stay small, and the 3-count/frame sustained ceiling (~135 degrees/frame)
 // avoids constantly injecting the ~180-degree-plus swings a higher ceiling
 // would imply, while still allowing full wheel rotation over a longer
 // hold. POS_MAX=48 matches: the spring-return position mode's contribution
@@ -305,7 +306,7 @@ wire ce_frame = VBlank & ~vblank_d;
 // input paths for the first hardware test.
 wire [7:0] turbo_dial;
 steering_input #(
-	.RAMP_STEP(9'sd2), .VEL_MAX(9'sd6), .POS_MAX(9'sd48), .SHIFT(4), .ANALOG_SHIFT(5)
+	.RAMP_STEP(9'sd3), .VEL_MAX(9'sd6), .POS_MAX(9'sd48), .SHIFT(4), .ANALOG_SHIFT(5)
 ) u_steering
 (
 	.clk_sys(clk_sys), .reset(reset), .ce_frame(ce_frame),
