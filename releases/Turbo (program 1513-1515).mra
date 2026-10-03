@@ -19,7 +19,7 @@
 	<about></about>
 
 	<resolution>15kHz</resolution>
-	<rotation>vertical (cw)</rotation>
+	<rotation>vertical (ccw)</rotation>
 	<flip>no</flip>
 
 	<players>1</players>
@@ -28,7 +28,7 @@
 	<num_buttons>2</num_buttons>
 	<button_names>Gear Shift,Pedal</button_names>
 
-	<buttons names="-,-,-,Start,Coin,Gear Shift,Pedal" default="-,-,-,Start,Select,Y,A"></buttons>
+	<buttons names="-,-,-,Start,Coin,Gear Shift,Pedal" default="Start,Select,Y,A"></buttons>
 	<switches default="EF,FF,B0">
 		<dip bits="0,1" name="Lives" ids="2,3,4,5"/>
 		<dip bits="2" name="Game Time" ids="Fixed (55 sec),Adjustable"/>

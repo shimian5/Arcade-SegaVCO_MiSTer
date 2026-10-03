@@ -183,7 +183,7 @@ MRA_TIMESTAMP = "20261002000000"
 MRA_META = {
     "turbo": {
         "name": "Turbo", "region": "World", "version": "Program 1513-1515", "series": "Turbo",
-        "category": "Driving - Race", "parent": "turbo", "rotation": "vertical (cw)",  # MAME ROT270, the label Arcade-DonkeyKong uses for its ROT270 set
+        "category": "Driving - Race", "parent": "turbo", "rotation": "vertical (ccw)",  # MAME ROT270 (ROT90 is "vertical (cw)")
         "players": "1", "joystick": "analog", "special_controls": "steering wheel (dial), accelerator pedal, gear shift",
         "num_buttons": "2", "button_names": "Gear Shift,Pedal",
     },
@@ -375,7 +375,7 @@ GAMES = {
         # default="..." maps each named button to a virtual-gamepad input
         # (A/B/X/Y/L/R/Start/Select/...) so a freshly-plugged pad gets a
         # sane default instead of landing fully unassigned.
-        "buttons_default": "-,-,-,Start,Select,Y,A",
+        "buttons_default": "Start,Select,Y,A",   # defaults list only the named buttons, not the "-" placeholders
         "regions": {
             "maincpu": [
                 ("epr-1513.cpu-ic76",  0x0000, 0x2000, "0326adfc"),
