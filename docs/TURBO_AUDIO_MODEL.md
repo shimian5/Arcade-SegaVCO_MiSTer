@@ -43,3 +43,19 @@ character not reproduced; the alarm and the CRASH.L filter networks not re-deriv
 never triggered by the game, so its one-pole filter does not matter); absolute VCA gains for the engine and Other Cars
 not applied; comparator delay not modelled; op-amp output limits are symmetric where the single-supply sheet implies
 asymmetric ones (follow-up). The CRASH.L tail one-shot uses R330 = 47K from the schematic (72.9 ms).
+
+## Future work (needs a real Turbo board and an oscilloscope)
+The remaining gaps cannot be closed from the schematics, datasheets and cabinet recordings alone. With a working
+board, in priority order:
+1. **MB4391 (MC3340 proxy):** gain against CONT voltage, input impedance and overload behaviour. Most likely the cause of the
+   weak engine upper products (444 / 743 Hz).
+2. **S2688 noise source (IC8):** output swing and internal clock (the datasheet bounds the clock to about 55-119 kHz).
+3. **Trimmers VR1-VR5:** wiper positions on a board in a known-good state, replacing the listening-balance trim values.
+4. **Player car at fixed speeds:** a recording or scope capture of the oscillator frequencies, to replace the one-cabinet tolerance profile.
+5. **Other Cars B and C oscillators:** waveform shape (rounder than a triangle would explain the 404 Hz second harmonic).
+6. **One-shot types:** markings of IC54 and IC55 (standard TTL or LS 74123), which shifts widths by about 14 %.
+7. **Supply and op-amp limits:** measured output limits on the 0/12 V supply with the 6 V reference, replacing the symmetric +-4.5 V assumption.
+
+Work that needs no hardware but cannot be verified without it: re-deriving the alarm and CRASH.L filters, asymmetric op-amp
+limits, and applying the absolute VCA gains. The tunnel's room character is acoustic (speaker, cabinet, room) and is not on the board.
+
