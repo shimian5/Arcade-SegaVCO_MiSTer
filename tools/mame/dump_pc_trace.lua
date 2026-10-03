@@ -1,4 +1,4 @@
--- CPU/game-state divergence investigation (session 6 continuation): log the
+-- CPU/game-state divergence check: log the
 -- main CPU's PC and cumulative executed cycles once per frame (register_
 -- periodic runs on vblank, matching the point sim/tb_z80_3d.cpp's vblank_rise
 -- fires -- see rtl/z80_3d.v's SIM_DEBUG_TRACE PCTRACE line, added for this

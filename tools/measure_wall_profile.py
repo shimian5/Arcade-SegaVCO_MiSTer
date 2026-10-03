@@ -84,8 +84,7 @@ def main():
         print("  x mod 16          =", [x % 16 for x in notches])
         print("  spacing           =", [j - i for i, j in zip(notches, notches[1:])])
         print("\n  A spacing of 16 means one per tile column -- see the module")
-        print("  header in rtl/video/fg_tilemap.v and the session-4 update in")
-        print("  docs/INVESTIGATION_title_logo_garbling.md.")
+        print("  header in rtl/video/fg_tilemap.v.")
     else:
         print("\nno backward notches -- profile is monotonic.")
 

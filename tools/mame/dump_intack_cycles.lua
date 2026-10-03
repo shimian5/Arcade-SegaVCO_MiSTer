@@ -1,4 +1,4 @@
--- Phase 3 follow-up (session 7): measure absolute T-state-since-start at
+-- Interrupt timing: measure absolute T-state-since-start at
 -- which the main CPU accepts each of the first ~15 vblank interrupts.
 -- Z80 clock: MASTER_CLOCK/4 = 4,992,000 Hz (docs/reference/turbo.cpp). No
 -- wait states in this design, so T-states == machine.time(sec) * 4,992,000.

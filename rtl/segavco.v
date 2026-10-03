@@ -1,1199 +1,1158 @@
-// Z80-3D system top: main CPU, sub CPU, memory decode, video pipeline.
+// System top: main CPU, sub CPU, memory decode and video/mixer pipeline for
+// the Sega Buck Rogers / Turbo boards (one RBF, selected by mod_turbo).
 //
-// PHASE 1c SCOPE (see docs/PLAN.md): sub CPU + bitmap/starfield + bgcolor +
-// full mixer priority chain, on top of phase 1a (main CPU/video RAM/fg
-// tilemap) and phase 1b (sprite engine). This is the full `buckrogn`
-// memory map and mixer -- boots, coin-up, playable.
-//
-// MEMORY READS ARE ALL REGISTERED (synchronous), including both CPUs'
-// program ROM/work RAM ports, so Quartus infers real M10K block RAM instead
-// of large combinational muxes. This needs no Z80 wait-state handling:
-// cpu_a/sub_a are held stable for the CPU's whole T-state (many core-clk
-// cycles, since ce_z80 only pulses once every 8), far longer than the
-// 1-cycle read latency. The video path's registered reads (fg_tilemap,
-// sprite_engine, and the local color-table/sprcolor-table/bitmap-ram/
-// bgcolor-ROM/palette lookups below) form a fixed-depth pipeline instead;
-// see VIDEO_PIPE_LATENCY, which delay-matches hblank/vblank/hsync/vsync/
-// ce_pix so the sync bundle output stays aligned with the pixel data it
-// describes.
+// All memory reads are registered so Quartus infers block RAM. No Z80 wait
+// states are needed: cpu_a/sub_a stay stable for the whole T-state (ce_z80
+// pulses once every 8 clks), far longer than the 1-clk read latency. The video
+// path's registered reads form a fixed-depth pipeline; VIDEO_PIPE_LATENCY
+// delay-matches hblank/vblank/hsync/vsync/ce_pix to the pixel data.
 module segavco
 (
-    input  wire        clk,             // core clock, ~39.936 MHz nominal
-    input  wire        reset,
+	input  wire        clk,             // core clock, ~39.936 MHz nominal
+	input  wire        reset,
 
-    input  wire         ioctl_download,
-    input  wire         ioctl_wr,
-    input  wire [24:0]  ioctl_addr,
-    input  wire [7:0]   ioctl_dout,
+	// Game strap from the MRA mod byte (ioctl_index 1): 0 = Buck Rogers, 1 = Turbo.
+	// Selects between the games' data in LUTs loaded by $readmemh (palette_rom
+	// here, xscale_lut in sprite_engine.v), the PROM layout and the CPU memory map.
+	input  wire         mod_turbo,
 
-    // IN0/IN1/DSW1/DSW2, real player controls + coin/start/service + DIP
-    // switches. See docs/PLAN.md phase 1 CPU/memory table and the buckrog
-    // INPUT_PORTS_START block in docs/reference/turbo.cpp for bit layout.
-    // All active-low (idle = 1), matching MAME's ACTIVE_LOW convention.
-    input  wire [7:0]   in0,
-    input  wire [7:0]   in1,
-    input  wire [7:0]   dsw1,
-    input  wire [7:0]   dsw2,
+	input  wire         ioctl_download,
+	input  wire         ioctl_wr,
+	input  wire [24:0]  ioctl_addr,
+	input  wire [7:0]   ioctl_dout,
+	// Qualifies ROM-blob writes against non-blob MRA transfers (index 1, the mod
+	// byte) sharing the ioctl bus; see rom_download.v.
+	input  wire [15:0]  ioctl_index,
 
-    output wire         hblank,
-    output wire         vblank,
-    output wire         hsync,
-    output wire         vsync,
-    output wire         ce_pix,
-    output wire [7:0]   video_r,
-    output wire [7:0]   video_g,
-    output wire [7:0]   video_b,
+	// IN0/IN1/DSW1/DSW2: player controls, coin/start/service and DIP switches
+	// (bit layout per the buckrog input ports). All active-low (idle = 1).
+	input  wire [7:0]   in0,
+	input  wire [7:0]   in1,
+	input  wire [7:0]   dsw1,
+	input  wire [7:0]   dsw2,
 
-    // Sound board 834-5122 (discrete/analog on real hardware). Modelled in
-    // rtl/audio; see docs/hardware-audio.md and docs/audio-rtl-design.md.
-    output wire signed [15:0] audio_l,
-    output wire signed [15:0] audio_r
+	// Turbo-only I/O: its own IN0 layout, three DIP banks (DSW3's low nibble is
+	// collision, forced 0 by the top level) and the free-running dial position
+	// (steering_input.sv). Ignored when !mod_turbo.
+	input  wire [7:0]   turbo_in0,
+	input  wire [7:0]   turbo_dsw1,
+	input  wire [7:0]   turbo_dsw2,
+	input  wire [7:0]   turbo_dsw3,
+	input  wire [7:0]   turbo_dial,
+
+	output wire         hblank,
+	output wire         vblank,
+	output wire         hsync,
+	output wire         vsync,
+	output wire         ce_pix,
+	output wire [7:0]   video_r,
+	output wire [7:0]   video_g,
+	output wire [7:0]   video_b,
+
+	// Sound board 834-5122 (discrete/analog on real hardware), modelled in rtl/audio.
+	output wire signed [15:0] audio_l,
+	output wire signed [15:0] audio_r
 
 `ifdef VERILATOR_SIM
-    // Phase0-1a sprite debug harness (see sprite_engine.v's VERILATOR_SIM
-    // block): real-time, zero-latency sprite_engine outputs, exposed so
-    // sim/tb_z80_3d.cpp can dump them per-pixel for the chosen frame without
-    // needing to re-derive the mixer's delay-matched copies.
-    , output wire [31:0] dbg_sprbits
-    , output wire [7:0]  dbg_plb
-    , output wire [9:0]  dbg_hpos
-    , output wire [8:0]  dbg_vpos
-    // Star-motion investigation: direct combinational read of bitmap_ram
-    // (the sub-CPU-written star layer), addressed the same way as the
-    // mixer's read (y*256+x). Lets the testbench dump the raw star bitmap
-    // once per frame for trajectory analysis against MAME's bitmap_ram
-    // memory_share, with no rendering/palette/capture step in between.
-    , input  wire [15:0] dbg_bitmap_addr
-    , output wire        dbg_bitmap_bit
-    // Star-motion investigation: direct combinational read of the sub CPU's
-    // work RAM (0xe000-0xe7ff, per docs/reference/turbo.cpp sub_prg_map --
-    // the star-position/velocity table almost certainly lives here), for a
-    // per-frame state diff against MAME's subcpu program-space read of the
-    // same addresses (no MAME named memory_share exists for this RAM -- it's
-    // a plain `.ram()` -- so the comparison is done via address, not tag).
-    , input  wire [10:0] dbg_workram_addr
-    , output wire [7:0]  dbg_workram_data
-    // SECT-2 investigation: fg tilemap VRAM (0xc000-0xc7ff) read port. The
-    // HUD lives here in plain ASCII tile codes, so "did this run reach
-    // SECT 2, and how did it end?" is answerable identically in sim and in
-    // MAME without guessing at a RAM variable.
-    , input  wire [10:0] dbg_vram_addr
-    , output wire [7:0]  dbg_vram_data
-    // Main CPU work RAM (0xf800-0xffff) read port, for locating the
-    // lives/timer/sector game-state variables behind the HUD.
-    , input  wire [10:0] dbg_mainram_addr
-    , output wire [7:0]  dbg_mainram_data
+	// Sim debug: real-time, zero-latency sprite_engine outputs for per-pixel dumps.
+	, output wire [31:0] dbg_sprbits
+	, output wire [7:0]  dbg_plb
+	, output wire [9:0]  dbg_hpos
+	, output wire [8:0]  dbg_vpos
+	// Sim debug: raw Turbo road_gen/mixer_turbo outputs and the PPI0/1/3 inputs
+	// driving them (real-time, not delay-matched).
+	, output wire [7:0]  dbg_babit
+	, output wire [15:0] dbg_bacol
+	, output wire        dbg_road
+	, output wire [7:0]  dbg_pen
+	, output wire [3:0]  dbg_fbpla
+	, output wire [2:0]  dbg_fbcol
+	, output wire [7:0]  dbg_opa
+	, output wire [7:0]  dbg_opb
+	, output wire [7:0]  dbg_opc
+	, output wire [7:0]  dbg_ipa
+	, output wire [7:0]  dbg_ipb
+	, output wire [7:0]  dbg_ipc
+	, output wire [3:0]  dbg_collision
+	, output wire [15:0] dbg_i8279_rd_count
+	, output wire [7:0]  dbg_i8279_last_rl
+	, output wire [15:0] dbg_i8279_wr_count
+	, output wire [15:0] dbg_i8279_sel_count
+	, output wire [15:0] dbg_ppi3_rd_count
+	, output wire [7:0]  dbg_ppi3_last_inb
+	, output wire [31:0] dbg_coll_sprbits_nz_count
+	, output wire [31:0] dbg_coll_addr_nz_count
+	, output wire [4:0]  dbg_coll_addr_max
+	, output wire [3:0]  dbg_coll_max
+	, output wire [15:0] dbg_coll_clear_count
+	, output wire [15:0] dbg_coll_first_hit_frame
+	// Sim debug: combinational read of the sub-CPU-written star bitmap (address y*256+x).
+	, input  wire [15:0] dbg_bitmap_addr
+	, output wire        dbg_bitmap_bit
+	// Sim debug: combinational read of sub CPU work RAM (e000-e7ff).
+	, input  wire [10:0] dbg_workram_addr
+	, output wire [7:0]  dbg_workram_data
+	// Sim debug: fg tilemap VRAM (c000-c7ff) read port; the HUD is plain ASCII tile codes.
+	, input  wire [10:0] dbg_vram_addr
+	, output wire [7:0]  dbg_vram_data
+	// Sim debug: main CPU work RAM (f800-ffff) read port.
+	, input  wire [10:0] dbg_mainram_addr
+	, output wire [7:0]  dbg_mainram_data
+	// Sim debug: CN1 ACC0-5 and BSEL0-1 as audio_top decodes them. Unused in real builds.
+	, output wire [5:0]  dbg_cn1_acc
+	, output wire [1:0]  dbg_cn1_bsel
+	// Sim debug: Turbo audio taps forwarded from audio_top (OSEL and the signal
+	// path after the channel, mixer and STK439 stage).
+	, output wire        dbg_cn1_osel0
+	, output wire [1:0]  dbg_cn1_osel12
+	, output wire signed [15:0] dbg_turbo_othercars_f
+	, output wire signed [15:0] dbg_turbo_othercars_w
+	, output wire signed [15:0] dbg_turbo_mixer_f
+	, output wire signed [15:0] dbg_turbo_mixer_w
+	, output wire signed [15:0] dbg_turbo_out_l
+	, output wire signed [15:0] dbg_turbo_out_r
+	, output wire signed [63:0] dbg_turbo_amp_f_raw
+	, output wire signed [63:0] dbg_turbo_amp_w_raw
+	, output wire               dbg_turbo_amp_f_clip
+	, output wire               dbg_turbo_amp_w_clip
 `endif
 );
 
-    // ------------------------------------------------------------------
-    // Clock enables
-    // ------------------------------------------------------------------
-    // Z80 CE: core_clk / 8 = 4.992 MHz, shared by both CPUs (real hardware
-    // clocks the sub CPU from the same MASTER_CLOCK/4 as the main CPU --
-    // see docs/reference/turbo.cpp Z80(config, m_subcpu, MASTER_CLOCK/4)).
-    reg [2:0] z80_div;
-    wire      ce_z80 = (z80_div == 3'd0);
-    always @(posedge clk) begin
-        if (reset) z80_div <= 0;
-        else       z80_div <= z80_div + 3'd1;
-    end
+	// ------------------------------------------------------------------
+	// Clock enables
+	// ------------------------------------------------------------------
+	// Z80 CE: core_clk / 8 = 4.992 MHz, shared by both CPUs (both run from MASTER_CLOCK/4).
+	reg [2:0] z80_div;
+	wire      ce_z80 = (z80_div == 3'd0);
+	always @(posedge clk) begin
+		if (reset) z80_div <= 0;
+		else       z80_div <= z80_div + 3'd1;
+	end
 
-    // ------------------------------------------------------------------
-    // Video timing (already at 2x horizontal, per docs/PLAN.md)
-    // ------------------------------------------------------------------
-    wire [9:0] hpos;
-    wire [8:0] vpos;
-    wire       hblank_raw, vblank_raw, hsync_raw, vsync_raw;
-    video_timing vtiming
-    (
-        .clk         (clk),
-        .ce_pix      (ce_pix_int),
-        .reset       (reset),
-        .hpos        (hpos),
-        .vpos        (vpos),
-        .hblank      (hblank_raw),
-        .vblank      (vblank_raw),
-        .hsync       (hsync_raw),
-        .vsync       (vsync_raw),
-        .vblank_rise (vblank_rise)
-    );
+	// ------------------------------------------------------------------
+	// Video timing (already at 2x horizontal)
+	// ------------------------------------------------------------------
+	wire [9:0] hpos;
+	wire [8:0] vpos;
+	wire       hblank_raw, vblank_raw, hsync_raw, vsync_raw;
+	video_timing vtiming
+	(
+		.clk         (clk),
+		.ce_pix      (ce_pix_int),
+		.reset       (reset),
+		.hpos        (hpos),
+		.vpos        (vpos),
+		.hblank      (hblank_raw),
+		.vblank      (vblank_raw),
+		.hsync       (hsync_raw),
+		.vsync       (vsync_raw),
+		.vblank_rise (vblank_rise)
+	);
 
-    // core_clk / 4 = 9.984 MHz pixel CE
-    reg [1:0] pix_div;
-    wire ce_pix_int = (pix_div == 2'd0);
-    always @(posedge clk) begin
-        if (reset) pix_div <= 0;
-        else       pix_div <= pix_div + 2'd1;
-    end
+	// core_clk / 4 = 9.984 MHz pixel CE
+	reg [1:0] pix_div;
+	wire ce_pix_int = (pix_div == 2'd0);
+	always @(posedge clk) begin
+		if (reset) pix_div <= 0;
+		else       pix_div <= pix_div + 2'd1;
+	end
 
-    wire vblank_rise;
+	wire vblank_rise;
 
-    // ------------------------------------------------------------------
-    // ROM download decode
-    // ------------------------------------------------------------------
-    wire        maincpu_we;
-    wire [14:0] maincpu_wraddr;
-    wire        fgtiles_we;
-    wire [11:0] fgtiles_wraddr;
-    wire        proms_we;
-    wire [12:0] proms_wraddr;
-    wire        subcpu_we, road_we, sprites_we;
-    wire [12:0] subcpu_wraddr;
-    wire [14:0] road_wraddr;
-    wire [17:0] sprites_wraddr;
-    wire [7:0]  rom_dout;
+	// ------------------------------------------------------------------
+	// ROM download decode
+	// ------------------------------------------------------------------
+	wire        maincpu_we;
+	wire [14:0] maincpu_wraddr;
+	wire        fgtiles_we;
+	wire [11:0] fgtiles_wraddr;
+	wire        proms_we;
+	wire [12:0] proms_wraddr;
+	wire        subcpu_we, road_we, sprites_we;
+	wire [12:0] subcpu_wraddr;
+	wire [14:0] road_wraddr;
+	wire [17:0] sprites_wraddr;
+	wire [7:0]  rom_dout;
 
-    rom_download u_download
-    (
-        .clk            (clk),
-        .ioctl_download (ioctl_download),
-        .ioctl_wr       (ioctl_wr),
-        .ioctl_addr     (ioctl_addr),
-        .ioctl_dout     (ioctl_dout),
-        .maincpu_we     (maincpu_we),
-        .maincpu_addr   (maincpu_wraddr),
-        .subcpu_we      (subcpu_we),
-        .subcpu_addr    (subcpu_wraddr),
-        .fgtiles_we     (fgtiles_we),
-        .fgtiles_addr   (fgtiles_wraddr),
-        .proms_we       (proms_we),
-        .proms_addr     (proms_wraddr),
-        .road_we        (road_we),
-        .road_addr      (road_wraddr),
-        .sprites_we     (sprites_we),
-        .sprites_addr   (sprites_wraddr),
-        .dout           (rom_dout)
-    );
+	rom_download u_download
+	(
+		.clk            (clk),
+		.ioctl_download (ioctl_download),
+		.ioctl_wr       (ioctl_wr),
+		.ioctl_addr     (ioctl_addr),
+		.ioctl_dout     (ioctl_dout),
+		.ioctl_index    (ioctl_index),
+		.maincpu_we     (maincpu_we),
+		.maincpu_addr   (maincpu_wraddr),
+		.subcpu_we      (subcpu_we),
+		.subcpu_addr    (subcpu_wraddr),
+		.fgtiles_we     (fgtiles_we),
+		.fgtiles_addr   (fgtiles_wraddr),
+		.proms_we       (proms_we),
+		.proms_addr     (proms_wraddr),
+		.road_we        (road_we),
+		.road_addr      (road_wraddr),
+		.sprites_we     (sprites_we),
+		.sprites_addr   (sprites_wraddr),
+		.dout           (rom_dout)
+	);
 
-    // pr-5194 (X-shift, 32B @ proms offset 0x000) forwarded into fg_tilemap
-    wire        xshift_we   = proms_we && (proms_wraddr < 13'h0020);
-    wire [4:0]  xshift_addr = proms_wraddr[4:0];
+	// pr-5194 (X-shift, 32B @ proms offset 0x000) forwarded into fg_tilemap
+	wire        xshift_we   = proms_we && (proms_wraddr < 13'h0020);
+	wire [4:0]  xshift_addr = proms_wraddr[4:0];
 
-    // pr-5198 (char color table, 512B @ proms offset 0x500), kept local
-    reg [7:0] color_table[0:511];
-    wire proms_is_colortab = proms_we && (proms_wraddr >= 13'h500) && (proms_wraddr < 13'h700);
-    always @(posedge clk) begin
-        if (proms_is_colortab) color_table[proms_wraddr - 13'h500] <= rom_dout;
-    end
+	// pr-5198 (char color table, 512B @ proms offset 0x500), kept local
+	reg [7:0] color_table[0:511];
+	wire proms_is_colortab = proms_we && (proms_wraddr >= 13'h500) && (proms_wraddr < 13'h700);
+	always @(posedge clk) begin
+		if (proms_is_colortab) color_table[proms_wraddr - 13'h500] <= rom_dout;
+	end
 
-    // Buck Rogers' bgcolor ROM (8KB) shares the "road" download slot with
-    // Turbo's road generator (mutually exclusive alternatives, see
-    // docs/PLAN.md "ROM loading"). Registered read, same pattern as
-    // color_table/sprcolor_table.
-    //
-    // road_wraddr spans the FULL 32KB shared road/bgcolor download slot,
-    // but Buck Rogers' real bgcolor ROM only fills the first 8KB of it --
-    // the rest is 0xFF filler (sim/build_rom.py's blob-fill default;
-    // real hardware simply has no ROM chip there). Gate the write on the
-    // low 8KB, matching xshift_we/proms_is_colortab's range-gated
-    // forwarding above: without this, the filler bytes alias back onto
-    // the same 8192 entries via truncation and, arriving later in the
-    // download stream, silently overwrite every real bgcolor byte with
-    // 0xFF.
-    wire        bgcolorrom_we = road_we && (road_wraddr < 15'h2000);
-    reg [7:0] bgcolorrom[0:8191];
-    always @(posedge clk) if (bgcolorrom_we) bgcolorrom[road_wraddr[12:0]] <= rom_dout;
+	// Buck Rogers' bgcolor ROM (8KB) shares the "road" download slot with Turbo's
+	// road generator. Registered read.
+	//
+	// The slot spans 32KB but only the first 8KB is real ROM; the rest is 0xFF
+	// filler. Gate the write on the low 8KB so the filler cannot alias back onto
+	// the same entries and overwrite the real bytes.
+	wire        bgcolorrom_we = road_we && (road_wraddr < 15'h2000);
+	reg [7:0] bgcolorrom[0:8191];
+	always @(posedge clk) if (bgcolorrom_we) bgcolorrom[road_wraddr[12:0]] <= rom_dout;
 
-    // ------------------------------------------------------------------
-    // Main program ROM (32KB, 0000-7fff) -- registered read
-    // ------------------------------------------------------------------
-    reg [7:0] maincpu_rom[0:32767];
-    reg [7:0] maincpu_dout;
-    always @(posedge clk) begin
-        if (maincpu_we) maincpu_rom[maincpu_wraddr] <= rom_dout;
-        maincpu_dout <= maincpu_rom[cpu_a[14:0]];
-    end
+	// ------------------------------------------------------------------
+	// Main program ROM (32KB, 0000-7fff) -- registered read
+	// ------------------------------------------------------------------
+	reg [7:0] maincpu_rom[0:32767];
+	reg [7:0] maincpu_dout;
+	always @(posedge clk) begin
+		if (maincpu_we) maincpu_rom[maincpu_wraddr] <= rom_dout;
+		maincpu_dout <= maincpu_rom[cpu_a[14:0]];
+	end
 
-    // ------------------------------------------------------------------
-    // Work RAM (f800-ffff, 2KB) -- registered read
-    // ------------------------------------------------------------------
-    reg [7:0] work_ram[0:2047];
-    reg [7:0] work_ram_dout;
-    always @(posedge clk) begin
-        if (sel_workram && cpu_write) work_ram[cpu_a[10:0]] <= cpu_do;
-        work_ram_dout <= work_ram[cpu_a[10:0]];
-    end
+	// ------------------------------------------------------------------
+	// Work RAM (f800-ffff, 2KB) -- registered read
+	// ------------------------------------------------------------------
+	reg [7:0] work_ram[0:2047];
+	reg [7:0] work_ram_dout;
+	always @(posedge clk) begin
+		if (sel_workram && cpu_write) work_ram[cpu_a[10:0]] <= cpu_do;
+		work_ram_dout <= work_ram[cpu_a[10:0]];
+	end
 
-    // ------------------------------------------------------------------
-    // Main CPU
-    // ------------------------------------------------------------------
-    wire [15:0] cpu_a;
-    wire [7:0]  cpu_di;
-    wire [7:0]  cpu_do;
-    wire        cpu_wr_n, cpu_rd_n, cpu_mreq_n, cpu_m1_n, cpu_iorq_n;
-    wire        int_n;
+	// ------------------------------------------------------------------
+	// Main CPU
+	// ------------------------------------------------------------------
+	wire [15:0] cpu_a;
+	wire [7:0]  cpu_di;
+	wire [7:0]  cpu_do;
+	wire        cpu_wr_n, cpu_rd_n, cpu_mreq_n, cpu_m1_n, cpu_iorq_n;
+	wire        int_n;
 
-    cpu_z80 u_cpu
-    (
-        .clk     (clk),
-        .cen     (ce_z80),
-        .reset_n (~reset),
-        .wait_n  (1'b1),
-        .int_n   (int_n),
-        .nmi_n   (1'b1),
-        .busrq_n (1'b1),
-        .m1_n    (cpu_m1_n),
-        .mreq_n  (cpu_mreq_n),
-        .iorq_n  (cpu_iorq_n),
-        .rd_n    (cpu_rd_n),
-        .wr_n    (cpu_wr_n),
-        .rfsh_n  (),
-        .halt_n  (),
-        .busak_n (),
-        .a       (cpu_a),
-        .di      (cpu_di),
-        .dout    (cpu_do)
-    );
+	cpu_z80 u_cpu
+	(
+		.clk     (clk),
+		.cen     (ce_z80),
+		.reset_n (~reset),
+		.wait_n  (1'b1),
+		.int_n   (int_n),
+		.nmi_n   (1'b1),
+		.busrq_n (1'b1),
+		.m1_n    (cpu_m1_n),
+		.mreq_n  (cpu_mreq_n),
+		.iorq_n  (cpu_iorq_n),
+		.rd_n    (cpu_rd_n),
+		.wr_n    (cpu_wr_n),
+		.rfsh_n  (),
+		.halt_n  (),
+		.busak_n (),
+		.a       (cpu_a),
+		.di      (cpu_di),
+		.dout    (cpu_do)
+	);
 
-    // VBLANK IRQ, cleared by the int-ack (M1 & IORQ) cycle. No interrupt
-    // controller is modeled, so the data bus during int-ack floats to FF,
-    // which both IM0 (executes as RST 38) and IM1 CPUs handle the same way.
-    // Sub CPU has no VBLANK IRQ (docs/PLAN.md) -- see sub_int_n below,
-    // which is driven directly from PPI0 port C bit 7 instead.
-    reg irq_pending;
-    wire int_ack = ~cpu_m1_n && ~cpu_iorq_n;
-    always @(posedge clk) begin
-        if (reset) irq_pending <= 0;
-        else begin
-            if (vblank_rise) irq_pending <= 1'b1;
-            else if (int_ack) irq_pending <= 1'b0;
-        end
-    end
-    assign int_n = ~irq_pending;
+	// VBLANK IRQ, cleared by the int-ack (M1 & IORQ) cycle. No interrupt controller
+	// is modeled, so the bus floats to FF during int-ack, which IM0 (RST 38) and
+	// IM1 CPUs handle identically. The sub CPU has no VBLANK IRQ; its /INT comes
+	// from PPI0 port C bit 7 (sub_int_n).
+	reg irq_pending;
+	wire int_ack = ~cpu_m1_n && ~cpu_iorq_n;
+	always @(posedge clk) begin
+		if (reset) irq_pending <= 0;
+		else begin
+			if (vblank_rise) irq_pending <= 1'b1;
+			else if (int_ack) irq_pending <= 1'b0;
+		end
+	end
+	assign int_n = ~irq_pending;
 
-    // ------------------------------------------------------------------
-    // Sub CPU (Buck Rogers' second Z80 -- bitmap/starfield generator)
-    // ------------------------------------------------------------------
-    wire [15:0] sub_a;
-    wire [7:0]  sub_di, sub_do;
-    wire        sub_wr_n, sub_rd_n, sub_mreq_n, sub_m1_n, sub_iorq_n;
+	// ------------------------------------------------------------------
+	// Sub CPU (Buck Rogers' second Z80 -- bitmap/starfield generator)
+	// ------------------------------------------------------------------
+	wire [15:0] sub_a;
+	wire [7:0]  sub_di, sub_do;
+	wire        sub_wr_n, sub_rd_n, sub_mreq_n, sub_m1_n, sub_iorq_n;
 
-    cpu_z80 u_subcpu
-    (
-        .clk     (clk),
-        .cen     (ce_z80),
-        .reset_n (~reset),
-        .wait_n  (1'b1),
-        .int_n   (sub_int_n),
-        .nmi_n   (1'b1),
-        .busrq_n (1'b1),
-        .m1_n    (sub_m1_n),
-        .mreq_n  (sub_mreq_n),
-        .iorq_n  (sub_iorq_n),
-        .rd_n    (sub_rd_n),
-        .wr_n    (sub_wr_n),
-        .rfsh_n  (),
-        .halt_n  (),
-        .busak_n (),
-        .a       (sub_a),
-        .di      (sub_di),
-        .dout    (sub_do)
-    );
+	// Turbo has no sub CPU: hold it in reset under mod_turbo so it does not
+	// free-run its all-0xFF ROM (an RST 38 loop) while its /INT (sub_int_n, from
+	// ppi0_pc[7]) follows Turbo's opc[7] road-invert bit.
+	cpu_z80 u_subcpu
+	(
+		.clk     (clk),
+		.cen     (ce_z80),
+		.reset_n (~(reset || mod_turbo)),
+		.wait_n  (1'b1),
+		.int_n   (sub_int_n),
+		.nmi_n   (1'b1),
+		.busrq_n (1'b1),
+		.m1_n    (sub_m1_n),
+		.mreq_n  (sub_mreq_n),
+		.iorq_n  (sub_iorq_n),
+		.rd_n    (sub_rd_n),
+		.wr_n    (sub_wr_n),
+		.rfsh_n  (),
+		.halt_n  (),
+		.busak_n (),
+		.a       (sub_a),
+		.di      (sub_di),
+		.dout    (sub_do)
+	);
 
-    // Same trailing-edge, one-clock write strobe as the main CPU's -- see
-    // the cpu_write comment below for why. sub_io_read stays a level: it is
-    // a read, and reads have no data-capture edge on this side.
-    wire sub_write_lvl = ~sub_mreq_n && ~sub_wr_n;
-    reg  sub_write_d;
-    always @(posedge clk) sub_write_d <= sub_write_lvl;
-    wire sub_write   = sub_write_d && !sub_write_lvl;
-    wire sub_io_read = ~sub_iorq_n && ~sub_rd_n;
+	// Trailing-edge, one-clock write strobe, as for the main CPU (see the memory
+	// decode comment). sub_io_read stays a level: reads have no capture edge.
+	wire sub_write_lvl = ~sub_mreq_n && ~sub_wr_n;
+	reg  sub_write_d;
+	always @(posedge clk) sub_write_d <= sub_write_lvl;
+	wire sub_write   = sub_write_d && !sub_write_lvl;
+	wire sub_io_read = ~sub_iorq_n && ~sub_rd_n;
 
-    // sub_prg_map (docs/reference/turbo.cpp buckrog_state::sub_prg_map):
-    // 0000-1fff ROM (read), 0000-dfff write -> bitmap_w, e000-e7ff mirrored
-    // (mirror 1800 covers the full e000-ffff span with an 11-bit RAM) work
-    // RAM.
-    reg [7:0] subcpu_rom[0:8191];
-    reg [7:0] sub_rom_dout;
-    always @(posedge clk) begin
-        if (subcpu_we) subcpu_rom[subcpu_wraddr] <= rom_dout;
-        sub_rom_dout <= subcpu_rom[sub_a[12:0]];
-    end
+	// sub_prg_map: 0000-1fff ROM (read), 0000-dfff write -> bitmap_w, e000-e7ff
+	// work RAM (mirror 1800 covers e000-ffff with an 11-bit RAM).
+	reg [7:0] subcpu_rom[0:8191];
+	reg [7:0] sub_rom_dout;
+	always @(posedge clk) begin
+		if (subcpu_we) subcpu_rom[subcpu_wraddr] <= rom_dout;
+		sub_rom_dout <= subcpu_rom[sub_a[12:0]];
+	end
 
-    wire sub_workram_sel = (sub_a >= 16'hE000);
-    reg [7:0] sub_workram[0:2047];
-    reg [7:0] sub_workram_dout;
-    always @(posedge clk) begin
-        if (sub_write && sub_workram_sel) sub_workram[sub_a[10:0]] <= sub_do;
-        sub_workram_dout <= sub_workram[sub_a[10:0]];
-    end
+	wire sub_workram_sel = (sub_a >= 16'hE000);
+	reg [7:0] sub_workram[0:2047];
+	reg [7:0] sub_workram_dout;
+	always @(posedge clk) begin
+		if (sub_write && sub_workram_sel) sub_workram[sub_a[10:0]] <= sub_do;
+		sub_workram_dout <= sub_workram[sub_a[10:0]];
+	end
 
-    // Bitmap RAM (star layer): 256x224x1bit = 57344 bits, addressed
-    // directly by sub_a (y = addr>>8, x = addr&0xff => addr == y*256+x,
-    // which is exactly sub_a for the 0000-dfff write window). See
-    // docs/PLAN.md "Bitmap RAM / starfield layer".
-    wire sub_bitmap_we = sub_write && (sub_a < 16'hE000);
-    reg bitmap_ram[0:57343];
-    always @(posedge clk) if (sub_bitmap_we) bitmap_ram[sub_a] <= sub_do[0];
+	// Bitmap RAM (star layer): 256x224x1bit, addressed by sub_a directly
+	// (addr == y*256+x for the 0000-dfff write window).
+	wire sub_bitmap_we = sub_write && (sub_a < 16'hE000);
+	reg bitmap_ram[0:57343];
+	always @(posedge clk) if (sub_bitmap_we) bitmap_ram[sub_a] <= sub_do[0];
 
-    // Sub CPU data-in mux: its entire I/O space reads the command latch
-    // (ppi0_pa, written by the main CPU); memory space reads ROM or
-    // mirrored work RAM.
-    assign sub_di = (~sub_iorq_n) ? ppi0_pa :
-                     (sub_a < 16'h2000) ? sub_rom_dout : sub_workram_dout;
+	// Sub CPU data-in mux: its entire I/O space reads the command latch
+	// (ppi0_pa, written by the main CPU); memory space reads ROM or
+	// mirrored work RAM.
+	assign sub_di = (~sub_iorq_n) ? ppi0_pa :
+					 (sub_a < 16'h2000) ? sub_rom_dout : sub_workram_dout;
 
-    // ------------------------------------------------------------------
-    // Main<->sub protocol (docs/PLAN.md "Main<->sub protocol"). This is
-    // NOT a software protocol: it is the 8255's own group-A mode-2 output
-    // handshake, entirely inside u_ppi0. The game programs PPI0 with
-    // control word 0xC0 once at boot, and after that:
-    //   1. Main writes PPI0 port A -> command latch (= ppi0_pa), and the
-    //      8255 itself drives PC7 (/OBF) low. PC7 is wired straight to the
-    //      sub CPU's /INT (834-5120 sheet 5: IC90 pin 10 -> IC50 pin 16,
-    //      no gating), so the command write *is* the interrupt.
-    //   2. The sub CPU's /IORQ is wired straight back to PC6 (/ACK)
-    //      (IC90 pin 11 <- IC50 pin 20). It pulses on the interrupt-
-    //      acknowledge cycle and again on the ISR's IN, and the first of
-    //      those raises /OBF, deasserting /INT. Nothing in software ever
-    //      clears it.
-    //   3. Main polls port C bit 7 to see the command was consumed.
-    // MAME clears the handshake one machine cycle later (on the IN, via
-    // subcpu_command_r's pc6_w) and its delayed_i8255_w/600Hz-quantum
-    // machinery is a pure emulator scheduling artifact; neither is
-    // reproduced here -- the schematic wins. See
-    // docs/INVESTIGATION_starfield_2x_speed.md.
-    // ------------------------------------------------------------------
-    wire sub_int_n = ppi0_pc[7];   // = /OBF, driven by u_ppi0 in mode 2
+	// ------------------------------------------------------------------
+	// Main<->sub protocol: not software, but the 8255's group-A mode-2 output
+	// handshake inside u_ppi0 (control word 0xC0 written once at boot):
+	//   1. Main writes PPI0 port A (the command latch, ppi0_pa) and the 8255
+	//      drives PC7 (/OBF) low. PC7 goes straight to the sub CPU's /INT
+	//      (834-5120 sheet 5: IC90 pin 10 -> IC50 pin 16), so the write is the
+	//      interrupt.
+	//   2. The sub CPU's /IORQ goes straight back to PC6 (/ACK) (IC90 pin 11 <-
+	//      IC50 pin 20). It pulses on the interrupt-acknowledge cycle and again
+	//      on the ISR's IN; the first pulse raises /OBF, releasing /INT.
+	//   3. Main polls port C bit 7 to see the command was consumed.
+	// MAME clears the handshake a machine cycle later through its own scheduling;
+	// that is an emulator artifact and is not reproduced.
+	// ------------------------------------------------------------------
+	wire sub_int_n = ppi0_pc[7];   // = /OBF, driven by u_ppi0 in mode 2
 
-    // ------------------------------------------------------------------
-    // Memory decode (main_prg_map, docs/PLAN.md phase 1)
-    // ------------------------------------------------------------------
-    // WRITE STROBES ARE TRAILING-EDGE, ONE CORE CLOCK WIDE.
-    //
-    // cpu_z80.v registers mreq_n/wr_n on every posedge clk, ungated by
-    // `cen`, while the CPU's data bus changes on the `cen` edge. Measured
-    // on a real write (docs/INVESTIGATION_starfield_2x_speed.md 6b), the
-    // raw ~mreq_n & ~wr_n window is 8 core clocks wide but only its LAST
-    // clock carries the byte being written -- the first 7 still hold the
-    // previous bus value:
-    //
-    //   7 clks:  mreq_n=0 wr_n=0  do=01   <- stale
-    //   1 clk :  mreq_n=0 wr_n=0  do=b9   <- the actual byte
-    //
-    // Latching on every clock of that window happens to end up with the
-    // right value (last write wins), which is why the RAMs were never
-    // visibly wrong. But any consumer whose latched value is used
-    // COMBINATIONALLY sees a 7-clock excursion to a garbage value -- e.g.
-    // PPI0 port C, whose bits drive fchg (a live video register) and, in
-    // mode 0, once drove the sub CPU's /INT as a runt pulse.
-    //
-    // Deriving a single-cycle strobe from the TRAILING edge fixes this: at
-    // that point wr_n has just risen while cpu_a/cpu_do still hold the
-    // write's address and data (they persist for many more clocks), so
-    // every consumer latches exactly the byte the RAMs were already
-    // getting, exactly once. Do NOT qualify with ce_z80 instead -- the cen
-    // pulse lands mid-window, where the data is still stale.
-    wire cpu_write_lvl = ~cpu_mreq_n && ~cpu_wr_n;
-    reg  cpu_write_d;
-    always @(posedge clk) cpu_write_d <= cpu_write_lvl;
-    wire cpu_write = cpu_write_d && !cpu_write_lvl;
+	// ------------------------------------------------------------------
+	// Memory decode (main_prg_map)
+	// ------------------------------------------------------------------
+	// WRITE STROBES ARE TRAILING-EDGE, ONE CORE CLOCK WIDE.
+	//
+	// cpu_z80.v registers mreq_n/wr_n every clk, ungated by `cen`, while the data
+	// bus changes on the `cen` edge. The raw ~mreq_n & ~wr_n window is 8 clks wide
+	// but only its last clk carries the byte being written; the first 7 still hold
+	// the previous bus value. Latching on every clk ends up right for RAMs (last
+	// write wins), but combinationally used values (e.g. PPI0 port C driving fchg
+	// and /INT) would see a 7-clk garbage excursion.
+	//
+	// A strobe from the trailing edge (wr_n just risen, cpu_a/cpu_do still hold
+	// the write's address and data) latches the right byte exactly once. Do not
+	// qualify with ce_z80: that pulse lands mid-window, where the data is stale.
+	wire cpu_write_lvl = ~cpu_mreq_n && ~cpu_wr_n;
+	reg  cpu_write_d;
+	always @(posedge clk) cpu_write_d <= cpu_write_lvl;
+	wire cpu_write = cpu_write_d && !cpu_write_lvl;
 
-    wire sel_rom     = (cpu_a < 16'h8000);
-    wire sel_vram    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
-    wire sel_ppi0    = (cpu_a >= 16'hC800) && (cpu_a < 16'hD000);
-    wire sel_ppi1    = (cpu_a >= 16'hD000) && (cpu_a < 16'hD800);
-    wire sel_i8279   = (cpu_a >= 16'hD800) && (cpu_a < 16'hE000);
-    wire sel_sprpos  = (cpu_a >= 16'hE000) && (cpu_a < 16'hE400);
-    wire sel_sprram  = (cpu_a >= 16'hE400) && (cpu_a < 16'hE800);
-    wire sel_io2     = (cpu_a >= 16'hE800) && (cpu_a < 16'hF000); // IN0/IN1/DSW
-    wire sel_workram = (cpu_a >= 16'hF800);
+	// Buck Rogers decode.
+	wire sel_rom_buck     = (cpu_a < 16'h8000);
+	wire sel_vram_buck    = (cpu_a >= 16'hC000) && (cpu_a < 16'hC800);
+	wire sel_ppi0_buck    = (cpu_a >= 16'hC800) && (cpu_a < 16'hD000);
+	wire sel_ppi1_buck    = (cpu_a >= 16'hD000) && (cpu_a < 16'hD800);
+	wire sel_i8279_buck   = (cpu_a >= 16'hD800) && (cpu_a < 16'hE000);
+	wire sel_sprpos_buck  = (cpu_a >= 16'hE000) && (cpu_a < 16'hE400);
+	wire sel_sprram_buck  = (cpu_a >= 16'hE400) && (cpu_a < 16'hE800);
+	wire sel_io2_buck     = (cpu_a >= 16'hE800) && (cpu_a < 16'hF000); // IN0/IN1/DSW
+	wire sel_workram_buck = (cpu_a >= 16'hF800);
 
-    wire [7:0] vram_rdata;
-    fg_tilemap u_fg
-    (
-        .clk          (clk),
-        .cpu_we       (sel_vram && cpu_write),
-        .cpu_addr     (cpu_a[10:0]),
-        .cpu_wdata    (cpu_do),
-        .cpu_rdata    (vram_rdata),
-        .tile_we      (fgtiles_we),
-        .tile_addr    (fgtiles_wraddr),
-        .tile_wdata   (rom_dout),
-        .xshift_we    (xshift_we),
-        .xshift_addr  (xshift_addr),
-        .xshift_wdata (rom_dout),
-        .xx           (xx_native),
-        .y            (y_native),
-        .foreraw      (foreraw)
+	// Turbo decode (turbo_state::prg_map). Mirrored ranges decode only the top
+	// address bits the real chip-select sees, e.g. "a000-a0ff mirror 0700" is
+	// cpu_a[15:11] alone: a000-a7ff with bits[10:8] don't-care.
+	wire sel_rom_turbo            = (cpu_a < 16'h6000);
+	wire sel_sprram_turbo         = (cpu_a[15:11] == 5'b10100); // a000-a7ff
+	wire sel_outlatch_turbo       = (cpu_a[15:11] == 5'b10101); // a800-afff
+	wire sel_sprpos_turbo         = (cpu_a[15:11] == 5'b10110); // b000-b7ff
+	wire sel_analog_reset_turbo   = (cpu_a[15:11] == 5'b10111); // b800-bfff
+	wire sel_vram_turbo           = (cpu_a[15:11] == 5'b11100); // e000-e7ff
+	wire sel_collision_clear_turbo= (cpu_a[15:11] == 5'b11101); // e800-efff
+	wire sel_workram_turbo        = (cpu_a[15:11] == 5'b11110); // f000-f7ff
+	wire sel_ppi0_turbo            = (cpu_a[15:8] == 8'hf8);
+	wire sel_ppi1_turbo            = (cpu_a[15:8] == 8'hf9);
+	wire sel_ppi2_turbo            = (cpu_a[15:8] == 8'hfa);
+	wire sel_ppi3_turbo            = (cpu_a[15:8] == 8'hfb);
+	wire sel_i8279_turbo           = (cpu_a[15:8] == 8'hfc);
+	wire sel_in0_turbo             = (cpu_a[15:8] == 8'hfd);
+	wire sel_collision_dsw3_turbo  = (cpu_a[15:8] == 8'hfe);
+
+	// Combined selects: vram, ppi0/1, i8279, sprram, sprpos and work_ram are shared
+	// between games, so each switches which decode drives it. Turbo-only resources
+	// (outlatch/analog_reset/collision_clear/ppi2/ppi3/in0/collision_dsw3) are
+	// gated on mod_turbo directly.
+	wire sel_rom     = mod_turbo ? sel_rom_turbo     : sel_rom_buck;
+	wire sel_vram    = mod_turbo ? sel_vram_turbo    : sel_vram_buck;
+	wire sel_ppi0    = mod_turbo ? sel_ppi0_turbo    : sel_ppi0_buck;
+	wire sel_ppi1    = mod_turbo ? sel_ppi1_turbo    : sel_ppi1_buck;
+	wire sel_i8279   = mod_turbo ? sel_i8279_turbo   : sel_i8279_buck;
+	wire sel_sprpos  = mod_turbo ? sel_sprpos_turbo  : sel_sprpos_buck;
+	wire sel_sprram  = mod_turbo ? sel_sprram_turbo  : sel_sprram_buck;
+	wire sel_io2     = !mod_turbo && sel_io2_buck; // IN0/IN1/DSW, Buck only
+	wire sel_workram = mod_turbo ? sel_workram_turbo : sel_workram_buck;
+
+	wire sel_ppi2           = mod_turbo && sel_ppi2_turbo;
+	wire sel_ppi3           = mod_turbo && sel_ppi3_turbo;
+	wire sel_outlatch       = mod_turbo && sel_outlatch_turbo;
+	wire sel_analog_reset   = mod_turbo && sel_analog_reset_turbo;
+	wire sel_collision_clear= mod_turbo && sel_collision_clear_turbo;
+	wire sel_in0_t          = mod_turbo && sel_in0_turbo;
+	wire sel_collision_dsw3 = mod_turbo && sel_collision_dsw3_turbo;
+
+	// Turbo sprite RAM address fold (turbo_state::spriteram_r/w): the 8-bit
+	// sub-address within the a000-a0ff/mirror window folds onto 128 physical
+	// bytes. Done here so sprite_engine.v just takes a 10-bit address.
+	wire [6:0] sprram_fold_turbo = (cpu_a[7:0] & 8'h07) | ((cpu_a[7:0] & 8'hf0) >> 1);
+	wire [9:0] sprram_addr_final = mod_turbo ? {3'b0, sprram_fold_turbo} : cpu_a[9:0];
+
+	wire [7:0] vram_rdata;
+	fg_tilemap u_fg
+	(
+		.clk          (clk),
+		.mod_turbo    (mod_turbo),
+		.cpu_we       (sel_vram && cpu_write),
+		.cpu_addr     (cpu_a[10:0]),
+		.cpu_wdata    (cpu_do),
+		.cpu_rdata    (vram_rdata),
+		.tile_we      (fgtiles_we),
+		.tile_addr    (fgtiles_wraddr),
+		.tile_wdata   (rom_dout),
+		.xshift_we    (xshift_we),
+		.xshift_addr  (xshift_addr),
+		.xshift_wdata (rom_dout),
+		.xx           (xx_native),
+		.y            (y_native),
+		.foreraw      (foreraw)
 `ifdef VERILATOR_SIM
-        , .dbg_vram_addr (dbg_vram_addr)
-        , .dbg_vram_data (dbg_vram_data)
+		, .dbg_vram_addr (dbg_vram_addr)
+		, .dbg_vram_data (dbg_vram_data)
 `endif
-    );
+	);
 
-    // pr-5196 (Y-scale, 512B @ proms offset 0x100) and pr-5199 (sprite
-    // color table, 1024B @ proms offset 0x700) forwarded from the shared
-    // PROMS blob, same pattern as xshift_we/color_table above. Full-width
-    // subtraction before slicing (not truncation) -- see rom_download.v's
-    // header comment on why that matters for non-zero-based windows.
-    wire        yscale_we_fwd = proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h300);
-    wire [12:0] yscale_off    = proms_wraddr - 13'h100;
+	// pr-5196 (Buck Y-scale, 512B @ proms offset 0x100), pr-1119 (Turbo Y-scale,
+	// 512B @ proms offset 0x200) and pr-5199 (Buck sprite color table, 1024B @
+	// proms offset 0x700) forwarded from the shared PROMS blob. Full-width
+	// subtraction before slicing (see rom_download.v).
+	//
+	// Y-scale goes through two always-active windows rather than one selected by
+	// mod_turbo: mod_turbo (ioctl_index 1) arrives after the whole proms blob, so
+	// it is not valid during download. sprite_engine.v keeps two Y-scale arrays
+	// and muxes their output by mod_turbo instead, which only matters in play.
+	wire        buck_yscale_we_fwd  = proms_we && (proms_wraddr >= 13'h100) && (proms_wraddr < 13'h300);
+	wire [12:0] buck_yscale_off     = proms_wraddr - 13'h100;
+	wire        turbo_yscale_we_fwd = proms_we && (proms_wraddr >= 13'h200) && (proms_wraddr < 13'h400);
+	wire [12:0] turbo_yscale_off    = proms_wraddr - 13'h200;
 
-    wire        sprcolor_we_fwd = proms_we && (proms_wraddr >= 13'h700) && (proms_wraddr < 13'hB00);
-    wire [12:0] sprcolor_off    = proms_wraddr - 13'h700;
+	wire        sprcolor_we_fwd = proms_we && (proms_wraddr >= 13'h700) && (proms_wraddr < 13'hB00);
+	wire [12:0] sprcolor_off    = proms_wraddr - 13'h700;
 
-    reg [7:0] sprcolor_table[0:1023]; // pr-5199
-    always @(posedge clk) if (sprcolor_we_fwd) sprcolor_table[sprcolor_off[9:0]] <= rom_dout;
+	reg [7:0] sprcolor_table[0:1023]; // pr-5199
+	always @(posedge clk) if (sprcolor_we_fwd) sprcolor_table[sprcolor_off[9:0]] <= rom_dout;
 
-    wire [7:0]  sprram_rdata, sprpos_rdata;
-    wire [31:0] sprbits;
-    wire [7:0]  spr_plb;
+	// ------------------------------------------------------------------
+	// Turbo PROM sub-window routing. Turbo's proms blob has a different layout
+	// from Buck's (see turbo_v.cpp and the MRA) but uses the same shared
+	// proms_we/proms_wraddr slot as Buck's PROMs above.
+	//
+	// mixer_turbo.v owns PR-1118/1121/1122/1123 and road_gen.v owns PR-1114/1115/
+	// 1117. PR-1116 (collision detect) is held here. PR-1279 (sound) is not loaded.
+	// ------------------------------------------------------------------
+	reg [7:0] turbo_pr1116[0:31];   // collision detect
+	reg [7:0] turbo_pr1120[0:511];  // no consumer in MAME -- loaded, not wired
+
+	// Not gated on mod_turbo: the strap byte (ioctl_index 1) arrives after the ROM
+	// blob, so mod_turbo reads 0 for the whole PROM download. Buck's own PROM
+	// writes (0x000-0x020, 0x100-0x300, 0x500-0x700, 0x700-0xB00) do not overlap
+	// this window, so there is no aliasing risk.
+	wire        turbo_pr1116_we = proms_we && (proms_wraddr >= 13'h040) && (proms_wraddr < 13'h060);
+	wire        turbo_pr1120_we = proms_we && (proms_wraddr >= 13'h400) && (proms_wraddr < 13'h600);
+
+	wire [12:0] turbo_pr1120_off = proms_wraddr - 13'h400;
+
+	always @(posedge clk) begin
+		if (turbo_pr1116_we) turbo_pr1116[proms_wraddr[4:0]]   <= rom_dout;
+		if (turbo_pr1120_we) turbo_pr1120[turbo_pr1120_off[8:0]]  <= rom_dout;
+	end
+
+	// road_gen.v: five ROM-driven edge comparisons per pixel that replace Buck's
+	// starfield/bgcolor background. Owns PR-1114/1115/1117 (forwarded from the
+	// proms window above) and its own 5 road ROM banks (shared "road" slot, gated
+	// by mod_turbo like bgcolorrom_we). PPI0/PPI1 are shared hardware: Turbo's
+	// opa/opb/opc/ipa/ipb/ipc are the same ppi0/ppi1 pa/pb/pc wires, interpreted
+	// differently by its software. fbcol0 = PPI3 port C bit 4 (turbo_fbcol[0]).
+	wire [7:0]  turbo_babit;
+	wire [15:0] turbo_bacol;
+	wire        turbo_road;
+	road_gen u_road
+	(
+		.clk        (clk),
+
+		.road_we    (road_we),
+		.road_addr  (road_wraddr),
+		.road_wdata (rom_dout),
+
+		.proms_we   (proms_we),
+		.proms_addr (proms_wraddr),
+		.proms_wdata(rom_dout),
+
+		.y          (y_native),
+		.xx         (xx_native),
+		.opa        (ppi0_pa),
+		.opb        (ppi0_pb),
+		.opc        (ppi0_pc),
+		.ipa        (ppi1_pa),
+		.ipb        (ppi1_pb),
+		.ipc        (ppi1_pc),
+		.fbcol0     (turbo_fbcol[0]),
+
+		.babit      (turbo_babit),
+		.bacol      (turbo_bacol),
+		.road       (turbo_road)
+	);
+
+	wire [7:0]  sprram_rdata, sprpos_rdata;
+	wire [31:0] sprbits;
+	wire [7:0]  spr_plb;
 `ifdef VERILATOR_SIM
-    assign dbg_sprbits = sprbits;
-    assign dbg_plb      = spr_plb;
-    assign dbg_hpos      = hpos;
-    assign dbg_vpos      = vpos;
-    assign dbg_bitmap_bit = bitmap_ram[dbg_bitmap_addr];
-    assign dbg_workram_data  = sub_workram[dbg_workram_addr];
-    assign dbg_mainram_data  = work_ram[dbg_mainram_addr];
-
-    // Star-motion investigation: per-video-frame census of sub-CPU interrupt
-    // activity. Enabled with +subintcount (no rebuild-time define needed) so
-    // it can be turned on without dragging in the whole SIM_DEBUG_TRACE
-    // firehose. One line per frame:
-    //   intack   -- sub-CPU interrupt ACCEPTANCES (M1 & IORQ rises)
-    //   ioread   -- sub-CPU IN instructions (command-latch reads / ACK)
-    //   bmwr     -- bitmap_ram writes (star plotting work)
-    //   intlow   -- ce_z80 ticks with /INT asserted (how long it is held)
-    //   pcwr     -- main-CPU writes to PPI0 port C
-    integer si_intack = 0, si_ioread = 0, si_bmwr = 0, si_intlow = 0, si_pcwr = 0;
-    integer si_frame = 0;
-    reg     si_enabled = 0;
-    reg     si_intack_d = 0, si_ioread_d = 0, si_bmwr_d = 0;
-    reg [15:0] si_bmwr_a = 0;
-    reg [7:0]  si_bmwr_do = 0;
-    integer si_loop = 0, si_iter = 0, si_pawr = 0;
-    integer si_tick = 0;
-    reg        si_p0_d = 0;
-    reg [1:0]  si_p0_a = 0;
-    reg [7:0]  si_p0_first = 0, si_p0_last = 0;
-    reg        si_p0rd_d = 0;
-    reg [1:0]  si_p0rd_a = 0;
-    wire       si_p0rd_now = sel_ppi0 && ~cpu_mreq_n && ~cpu_rd_n;
-    reg si_int_d = 1;
-    reg si_iorq_d = 1;
-    integer si_iorq_clks = 0, si_iorq_cens = 0;
-    wire    si_intack_now = ~sub_m1_n && ~sub_iorq_n;
-    integer si_bmw_lo = -1, si_bmw_hi = -1;
-    initial begin
-        si_enabled = $test$plusargs("subintcount");
-        if (!$value$plusargs("bmwrtrace_lo=%d", si_bmw_lo)) si_bmw_lo = -1;
-        if (!$value$plusargs("bmwrtrace_hi=%d", si_bmw_hi)) si_bmw_hi = -1;
-    end
-    // Address of the most recent sub-CPU opcode fetch, so BMWR lines carry a
-    // PC comparable to MAME's tap-side subcpu PC.
-    reg [15:0] si_last_pc = 0;
-    reg [15:0] si_main_pc = 0;
-    reg        si_mm1_d = 0;
-    wire       si_mm1_now = ~cpu_m1_n && ~cpu_mreq_n && ~cpu_rd_n;
-    reg        si_m1_d = 0;
-    wire       si_m1_now = ~sub_m1_n && ~sub_mreq_n && ~sub_rd_n;
-    always @(posedge clk) begin
-        si_m1_d <= si_m1_now;
-        if (si_m1_now && !si_m1_d) si_last_pc <= sub_a;
-        si_mm1_d <= si_mm1_now;
-        if (si_mm1_now && !si_mm1_d) si_main_pc <= cpu_a;
-    end
-
-    always @(posedge clk) begin
-        si_intack_d <= si_intack_now;
-        si_ioread_d <= sub_io_read;
-        si_bmwr_d   <= sub_bitmap_we;
-        if (sub_bitmap_we) begin si_bmwr_a <= sub_a; si_bmwr_do <= sub_do; end
-        // Star-loop invocations and per-star iterations: sub ROM $030B is the
-        // top of buckrogn's star updater (LD A,($F40B) = star count; the loop
-        // body starts at $0310 and runs once per star).
-        if (si_m1_now && !si_m1_d && sub_a == 16'h030B) si_loop = si_loop + 1;
-        if (si_m1_now && !si_m1_d && sub_a == 16'h0310) si_iter = si_iter + 1;
-        if (si_intack_now && !si_intack_d) si_intack = si_intack + 1;
-        if (sub_io_read   && !si_ioread_d) si_ioread = si_ioread + 1;
-        if (sub_bitmap_we && !si_bmwr_d)   si_bmwr   = si_bmwr + 1;
-        if (ce_z80 && !sub_int_n)          si_intlow = si_intlow + 1;
-        if (sel_ppi0 && cpu_write && (cpu_a[1:0] == 2'd2)) si_pcwr = si_pcwr + 1;
-        // Commands the main CPU OFFERS (port A writes) vs commands the sub
-        // CPU actually TAKES (intack). Equal => the mode-2 handshake is
-        // lossless; pawr > intack => bytes are being overwritten before the
-        // sub CPU services them.
-        if (sel_ppi0 && cpu_write && (cpu_a[1:0] == 2'd0)) si_pawr = si_pawr + 1;
-        // Per-write trace of the star plotting itself: address + bit value.
-        // Bitmap addressing is addr == y*256+x, so the address delta between
-        // the clear of a star's old cell and the set of its new one IS the
-        // per-frame step. Bounded by +bmwrtrace_lo=N +bmwrtrace_hi=N.
-        // Sample at the END of the write strobe (the value bitmap_ram
-        // actually keeps), not the first cycle -- sub_do is still settling
-        // on the leading edge and a leading-edge sample reads garbage.
-        if (si_bmwr_d && !sub_bitmap_we &&
-            si_frame >= si_bmw_lo && si_frame <= si_bmw_hi)
-            $display("BMWR frame=%0d addr=%04x d=%0d do=%02x pc=%04x",
-                      si_frame, si_bmwr_a, si_bmwr_do[0], si_bmwr_do, si_last_pc);
-        // /INT waveform + every PPI0 write, over the +bmwrtrace window. The
-        // sub CPU's whole command channel is its ISR ($0038: IN A,($00) ->
-        // $F600+nibble), so how long PC7 is held low decides how many
-        // commands ever reach it.
-        si_tick <= si_tick + (ce_z80 ? 1 : 0);
-        si_p0_d <= sel_ppi0 && cpu_write;
-        if (sel_ppi0 && cpu_write) begin
-            si_p0_a    <= cpu_a[1:0];
-            si_p0_last <= cpu_do;
-            if (!si_p0_d) si_p0_first <= cpu_do;
-        end
-        si_int_d <= sub_int_n;
-        si_iorq_d <= sub_iorq_n;
-        if (!sub_iorq_n) begin
-            si_iorq_clks <= si_iorq_d ? 1 : si_iorq_clks + 1;
-            si_iorq_cens <= si_iorq_d ? (ce_z80 ? 1 : 0)
-                                      : si_iorq_cens + (ce_z80 ? 1 : 0);
-        end
-        si_p0rd_d <= si_p0rd_now;
-        if (si_p0rd_now) si_p0rd_a <= cpu_a[1:0];
-        if (si_frame >= si_bmw_lo && si_frame <= si_bmw_hi) begin
-            if (si_int_d != sub_int_n)
-                $display("INTEDGE frame=%0d tick=%0d int_n=%0b", si_frame, si_tick, sub_int_n);
-            // Print once per PPI0 write, at the END of the strobe, showing
-            // BOTH the value present on the first cycle of the strobe and
-            // the value present on the last -- if they differ, the i8255
-            // latches the wrong byte.
-            if (si_p0_d && !(sel_ppi0 && cpu_write))
-                $display("PPI0WR frame=%0d tick=%0d addr=%0d first=%02x last=%02x pc=%04x",
-                          si_frame, si_tick, si_p0_a, si_p0_first, si_p0_last, si_main_pc);
-            // Main-CPU READS of PPI0. The command loop polls port C for
-            // /OBF, so what it sees there decides when (and how often) it
-            // writes the next command. Printed at the end of the read
-            // strobe, where ppi0_dout has settled.
-            if (si_p0rd_d && !si_p0rd_now)
-                $display("PPI0RD frame=%0d tick=%0d addr=%0d data=%02x pc=%04x",
-                          si_frame, si_tick, si_p0rd_a, ppi0_dout, si_main_pc);
-            // What the SUB CPU actually latches. `subdi` is the byte on its
-            // data bus during the IN; `pa` is the command latch at that
-            // instant. If they differ, the sub_di mux is wrong; if `pa` has
-            // already moved on, the main CPU overwrote the command.
-            if (sub_io_read && !si_ioread_d)
-                $display("SUBIN  frame=%0d tick=%0d subpc=%04x suba=%04x subdi=%02x pa=%02x",
-                          si_frame, si_tick, si_last_pc, sub_a, sub_di, ppi0_pa);
-            // Width of the sub CPU's /IORQ pulse -- this net IS the 8255's
-            // /ACK on the real board, so its width is a hardware-fidelity
-            // quantity (8255-5 spec has a minimum /ACK pulse width).
-            if (si_iorq_d && sub_iorq_n)
-                $display("IORQW  frame=%0d clks=%0d cens=%0d",
-                          si_frame, si_iorq_clks, si_iorq_cens);
-            if (si_intack_now && !si_intack_d)
-                $display("SUBACK frame=%0d tick=%0d subdi=%02x pa=%02x",
-                          si_frame, si_tick, sub_di, ppi0_pa);
-            // Sub-CPU stores into the $F600 command block -- the ground
-            // truth for "which command byte the ISR decided it saw".
-            if (sub_write && sub_a[15:12] >= 4'he && sub_a[11:0] >= 12'h600
-                          && sub_a[11:0] <= 12'h60f)
-                $display("F600WR frame=%0d tick=%0d addr=%04x data=%02x subpc=%04x",
-                          si_frame, si_tick, sub_a, sub_do, si_last_pc);
-        end
-        if (vblank_rise) begin
-            if (si_enabled)
-                // dx/dy/nstars/horizon are the sub CPU's own star-motion
-                // state: $F402 = per-frame X step, $F403 = Y step,
-                // $F40B = number of stars processed, $F410 = row limit
-                // above which a star is not plotted.
-                $display("SUBINT frame=%0d intack=%0d pawr=%0d ioread=%0d bmwr=%0d intlow=%0d pcwr=%0d loop=%0d iter=%0d dx=%02x dy=%02x nstars=%02x horiz=%02x f600=%02x%02x%02x%02x%02x%02x%02x%02x",
-                          si_frame, si_intack, si_pawr, si_ioread, si_bmwr, si_intlow, si_pcwr,
-                          si_loop, si_iter,
-                          sub_workram[11'h402], sub_workram[11'h403],
-                          sub_workram[11'h40b], sub_workram[11'h410],
-                          sub_workram[11'h600], sub_workram[11'h601],
-                          sub_workram[11'h602], sub_workram[11'h603],
-                          sub_workram[11'h604], sub_workram[11'h605],
-                          sub_workram[11'h606], sub_workram[11'h607]);
-            si_frame = si_frame + 1;
-            si_intack = 0; si_ioread = 0; si_bmwr = 0; si_intlow = 0; si_pcwr = 0;
-            si_loop = 0; si_iter = 0; si_pawr = 0;
-        end
-    end
+	assign dbg_sprbits = sprbits;
+	assign dbg_plb      = spr_plb;
+	assign dbg_hpos      = hpos;
+	assign dbg_vpos      = vpos;
+	assign dbg_babit = turbo_babit;
+	assign dbg_bacol = turbo_bacol;
+	assign dbg_road  = turbo_road;
+	assign dbg_pen   = turbo_pen;
+	assign dbg_fbpla = turbo_fbpla;
+	assign dbg_fbcol = turbo_fbcol;
+	assign dbg_opa = ppi0_pa;
+	assign dbg_opb = ppi0_pb;
+	assign dbg_opc = ppi0_pc;
+	assign dbg_ipa = ppi1_pa;
+	assign dbg_ipb = ppi1_pb;
+	assign dbg_ipc = ppi1_pc;
+	assign dbg_collision = turbo_collision_acc;
+	assign dbg_bitmap_bit = bitmap_ram[dbg_bitmap_addr];
+	assign dbg_workram_data  = sub_workram[dbg_workram_addr];
+	assign dbg_mainram_data  = work_ram[dbg_mainram_addr];
 `endif
-    sprite_engine u_sprites
-    (
-        .clk              (clk),
-        .reset            (reset),
+	sprite_engine u_sprites
+	(
+		.clk              (clk),
+		.reset            (reset),
 
-        .cpu_sprram_we    (sel_sprram && cpu_write),
-        .cpu_sprram_addr  (cpu_a[9:0]),
-        .cpu_sprram_wdata (cpu_do),
-        .cpu_sprram_rdata (sprram_rdata),
+		.mod_turbo        (mod_turbo),
+		.road_in          (turbo_road),
 
-        .cpu_sprpos_we    (sel_sprpos && cpu_write),
-        .cpu_sprpos_addr  (cpu_a[9:0]),
-        .cpu_sprpos_wdata (cpu_do),
-        .cpu_sprpos_rdata (sprpos_rdata),
+		.cpu_sprram_we    (sel_sprram && cpu_write),
+		.cpu_sprram_addr  (sprram_addr_final),
+		.cpu_sprram_wdata (cpu_do),
+		.cpu_sprram_rdata (sprram_rdata),
 
-        .sproms_we        (sprites_we),
-        .sproms_addr      (sprites_wraddr),
-        .sproms_wdata     (rom_dout),
+		.cpu_sprpos_we    (sel_sprpos && cpu_write),
+		.cpu_sprpos_addr  (cpu_a[9:0]),
+		.cpu_sprpos_wdata (cpu_do),
+		.cpu_sprpos_rdata (sprpos_rdata),
 
-        .yscale_we        (yscale_we_fwd),
-        .yscale_addr      (yscale_off[8:0]),
-        .yscale_wdata     (rom_dout),
+		.sproms_we        (sprites_we),
+		.sproms_addr      (sprites_wraddr),
+		.sproms_wdata     (rom_dout),
 
-        .ce_pix           (ce_pix_int),
-        .hblank           (hblank_raw),
-        .hpos             (hpos),
-        .vpos             (vpos),
+		.buck_yscale_we   (buck_yscale_we_fwd),
+		.buck_yscale_addr (buck_yscale_off[8:0]),
+		.buck_yscale_wdata(rom_dout),
+		.turbo_yscale_we   (turbo_yscale_we_fwd),
+		.turbo_yscale_addr (turbo_yscale_off[8:0]),
+		.turbo_yscale_wdata(rom_dout),
 
-        .obch             (obch), // PPI1 port C bits 0-2
+		.ce_pix           (ce_pix_int),
+		.hblank           (hblank_raw),
+		.hpos             (hpos),
+		.vpos             (vpos),
 
-        .sprbits          (sprbits),
-        .plb              (spr_plb)
-    );
+		.obch             (obch), // PPI1 port C bits 0-2
 
-    // ------------------------------------------------------------------
-    // i8255 PPI0 (c800-c803, mirror 07fc) and PPI1 (d000-d003, mirror
-    // 07fc). Both are programmed all-output on real hardware (see
-    // docs/reference/turbo.cpp buckrog_state's I8255 machine-config: only
-    // out_p*_callback are registered, no in_p*_callback), so external
-    // input ports are tied off.
-    // ------------------------------------------------------------------
-    wire [7:0] ppi0_dout, ppi0_pa, ppi0_pb, ppi0_pc;
-    wire       ppi0_pc_wr;
-    i8255 u_ppi0
-    (
-        .clk   (clk), .reset (reset),
-        .cs    (sel_ppi0), .we (cpu_write), .addr (cpu_a[1:0]),
-        .din   (cpu_do), .dout (ppi0_dout),
-        .in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
-        // PC6 (/ACK) is the sub CPU's /IORQ, wired straight through on the
-        // real board -- ungated, so it also fires on the sub CPU's
-        // interrupt-acknowledge cycle. See "Main<->sub protocol" above.
-        .ack_n (sub_iorq_n),
-        .pa    (ppi0_pa), .pb (ppi0_pb), .pc (ppi0_pc),
-        .pa_wr (), .pb_wr (), .pc_wr (ppi0_pc_wr)
-    );
+		.sprbits          (sprbits),
+		.plb              (spr_plb)
+	);
 
-    // PPI1: buckrog_state's out_pc_callback is ppi1c_w (docs/reference/
-    // turbo.cpp lines 393-405) -- OBCH0-2, coin meters (bits 4/5), start
-    // lamp (bit 6). Left as internal wires (no top-level MiSTer port for
-    // coin meters/lamp exists yet in Arcade-SegaVCO.sv) -- TODO if/when one
-    // is added. Port A/B are the sound-generator interface (phase 2, not
-    // acted on here beyond decoding the writes).
-    wire [7:0] ppi1_dout, ppi1_pa, ppi1_pb, ppi1_pc;
-    i8255 u_ppi1
-    (
-        .clk   (clk), .reset (reset),
-        .cs    (sel_ppi1), .we (cpu_write), .addr (cpu_a[1:0]),
-        .din   (cpu_do), .dout (ppi1_dout),
-        .in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
-        .ack_n (1'b1),                 // PPI1 is mode 0 only
-        .pa    (ppi1_pa), .pb (ppi1_pb), .pc (ppi1_pc),
-        .pa_wr (), .pb_wr (), .pc_wr ()
-    );
-    // The sound board hangs off PPI1 ports A and B over a 20-pin flat cable.
-    // Only the four /ALARM lines are consumed so far (phase 1); the rest of
-    // the channels land later. Full pinout in docs/hardware-audio.md.
-    audio_top u_audio
-    (
-        .clk     (clk),
-        .rst_n   (~reset),
-        .ppi1_pa (ppi1_pa),
-        .ppi1_pb (ppi1_pb),
-        .audio_l (audio_l),
-        .audio_r (audio_r),
-        .sample_ce ()
-    );
+	// ------------------------------------------------------------------
+	// i8255 PPI0 (c800-c803, mirror 07fc) and PPI1 (d000-d003, mirror 07fc). Both
+	// are programmed all-output on the real board, so the input ports are tied off.
+	// ------------------------------------------------------------------
+	wire [7:0] ppi0_dout, ppi0_pa, ppi0_pb, ppi0_pc;
+	wire       ppi0_pc_wr;
+	i8255 u_ppi0
+	(
+		.clk   (clk), .reset (reset),
+		.cs    (sel_ppi0), .we (cpu_write), .addr (cpu_a[1:0]),
+		.din   (cpu_do), .dout (ppi0_dout),
+		.in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+		// PC6 (/ACK) is the sub CPU's /IORQ, ungated, so it also fires on the
+		// interrupt-acknowledge cycle (see "Main<->sub protocol").
+		.ack_n (sub_iorq_n),
+		.pa    (ppi0_pa), .pb (ppi0_pb), .pc (ppi0_pc),
+		.pa_wr (), .pb_wr (), .pc_wr (ppi0_pc_wr)
+	);
 
-    wire [2:0] obch          = ppi1_pc[2:0];
-    wire       coin_meter1   = ppi1_pc[4];
-    wire       coin_meter2   = ppi1_pc[5];
-    wire       start_lamp    = ppi1_pc[6];
-
-    // Video registers pulled from PPI0 (docs/PLAN.md "Video registers"):
-    // fchg = port C bits 0-2 (only bits 0-1 feed the pr5198 address, per
-    // turbo_v.cpp's mixer -- see color_addr below), mov = port B bits 0-5
-    // (only bits 0-4 feed the bgcolor address).
-    wire [1:0] fchg = ppi0_pc[1:0];
-    wire [5:0] mov  = ppi0_pb[5:0];
-
-    // ------------------------------------------------------------------
-    // i8279 (d800-d801, mirror 07fe). Only DSW1-via-RL is required for
-    // playability; digit/scanline output is cosmetic and unimplemented
-    // (see rtl/io/i8279.v).
-    // ------------------------------------------------------------------
-    wire [7:0] i8279_dout;
-    i8279 u_i8279
-    (
-        .clk  (clk), .reset (reset),
-        .cs   (sel_i8279), .we (cpu_write), .addr (cpu_a[0]),
-        .din  (cpu_do), .dout (i8279_dout),
-        .rl   (dsw1)
-    );
-
-    // ------------------------------------------------------------------
-    // IN0/IN1/DSW real reads (e800-e803, mirror 07fc). e802/e803 are DSW
-    // bitswaps (docs/PLAN.md phase 1 CPU/memory table / buckrog_state::
-    // port_2_r/port_3_r in docs/reference/turbo.cpp).
-    // ------------------------------------------------------------------
-    function [3:0] bitswap4;
-        input [7:0] d;
-        input [2:0] i3, i2, i1, i0;
-        bitswap4 = {d[i3], d[i2], d[i1], d[i0]};
-    endfunction
-
-    wire [7:0] port2_bits = {bitswap4(dsw2, 6, 4, 3, 0), bitswap4(dsw1, 6, 4, 3, 0)};
-    wire [7:0] port3_bits = {bitswap4(dsw2, 7, 5, 2, 1), bitswap4(dsw1, 7, 5, 2, 1)};
-
-    reg [7:0] io2_reg;
-    always @(posedge clk) begin
-        case (cpu_a[1:0])
-            2'd0: io2_reg <= in0;
-            2'd1: io2_reg <= in1;
-            2'd2: io2_reg <= port2_bits;
-            2'd3: io2_reg <= port3_bits;
-        endcase
-    end
-
-    assign cpu_di = sel_rom     ? maincpu_dout   :
-                     sel_vram   ? vram_rdata     :
-                     sel_ppi0   ? ppi0_dout      :
-                     sel_ppi1   ? ppi1_dout      :
-                     sel_i8279  ? i8279_dout     :
-                     sel_sprram ? sprram_rdata   :
-                     sel_sprpos ? sprpos_rdata   :
-                     sel_io2    ? io2_reg        :
-                     sel_workram? work_ram_dout  :
-                                  8'hFF;
-
-    // ------------------------------------------------------------------
-    // Video: native (pre-2x) coordinates for the fg tilemap / bitmap /
-    // bgcolor fetches
-    // ------------------------------------------------------------------
-    wire [7:0] xx_native = hpos[9:1];
-    wire [7:0] y_native  = vpos[7:0];
-    wire [7:0] foreraw;
-
-    // ------------------------------------------------------------------
-    // Full mixer priority chain (docs/PLAN.md "Mixer" / mixer_buckrog.v):
-    //   fg tier 1 -> sprite -> fg tier 2 -> star (bitmap) -> bgcolor
-    // fchg/mov/obch are now the real PPI-derived registers above.
-    // ------------------------------------------------------------------
-    wire [8:0] color_addr = ({7'b0, foreraw[1:0]}) |
-                            ({1'b0, foreraw & 8'hF8} >> 1) |
-                            ({fchg, 7'b0});
-    reg [7:0] forebits_reg;
-    always @(posedge clk) forebits_reg <= color_table[color_addr];
-
-    // sprbits/plb are real-time (0-latency vs. hpos/vpos, see
-    // sprite_engine.v's header). forebits_reg lands on foreraw's stage +1
-    // (fg_tilemap's 4 + this module's color_table stage = 5), but that total
-    // is 1.25 output pixels (ce_pix = clk/4): every input feeding the final
-    // palbits mux must land on the SAME whole number of pixels from a common
-    // origin cycle, or the mixer combines a stale layer with a fresh one for
-    // 1 clk out of every 4 -- exactly the sub-pixel skew that garbles
-    // multi-colour sprites while leaving solid-colour ones untouched (no
-    // interior pixel boundary to get wrong). Delay by 7 clk (an extra 2
-    // beyond the 5 needed to just reach forebits_reg's stage) so this path's
-    // total -- 7 + this module's sprcolor_table stage = 8 clk = 2 whole
-    // pixels -- matches the fg-tier path once it's also re-timed to 8 below.
-    localparam SPR_TO_MIX_DELAY = 7;
-    reg [39:0] spr_pipe [0:SPR_TO_MIX_DELAY-1];
-    integer si;
-    always @(posedge clk) begin
-        spr_pipe[0] <= {sprbits, spr_plb};
-        for (si = 1; si < SPR_TO_MIX_DELAY; si = si + 1) spr_pipe[si] <= spr_pipe[si-1];
-    end
-    wire [31:0] sprbits_d7 = spr_pipe[SPR_TO_MIX_DELAY-1][39:8];
-    wire [7:0]  plb_d7     = spr_pipe[SPR_TO_MIX_DELAY-1][7:0];
-
-    // LS148 priority encoder: index of the lowest-numbered set bit in plb
-    // (0-7), or 4'hf if plb==0 -- equivalent to MAME's
-    // countl_zero(bitswap<8>(plb,0,1,2,3,4,5,6,7)) with the mux==8 clamp
-    // folded in.
-    function [3:0] find_lsb;
-        input [7:0] p;
-        begin
-            casez (p)
-                8'b???????1: find_lsb = 4'd0;
-                8'b??????10: find_lsb = 4'd1;
-                8'b?????100: find_lsb = 4'd2;
-                8'b????1000: find_lsb = 4'd3;
-                8'b???10000: find_lsb = 4'd4;
-                8'b??100000: find_lsb = 4'd5;
-                8'b?1000000: find_lsb = 4'd6;
-                8'b10000000: find_lsb = 4'd7;
-                default:     find_lsb = 4'hf;
-            endcase
-        end
-    endfunction
-
-    wire [3:0]  mux             = find_lsb(plb_d7);
-    wire [31:0] sprbits_shifted = sprbits_d7 >> mux[2:0];
-    wire [3:0]  cd              = {sprbits_shifted[24], sprbits_shifted[16], sprbits_shifted[8], sprbits_shifted[0]};
-
-    reg [7:0] sprcolor_dout;
-    always @(posedge clk) sprcolor_dout <= sprcolor_table[{obch, mux[2:0], cd}];
-
-    // One more register stage on the fg-tier-1 path + mux so both operands
-    // of the final select land on sprcolor_dout's cycle (+8: the +7 above,
-    // plus this module's own sprcolor_table read). forebits_reg is only 5
-    // clk deep (fg_tilemap's 4 + color_table's 1), so it needs 3 more
-    // register hops -- not 1 -- to reach the same 8-clk/2-pixel total; the
-    // extra 2 are forebits_reg3/forebits_reg4 below.
-    reg [7:0] forebits_reg2, forebits_reg3, forebits_reg4;
-    reg [3:0] mux_reg;
-    always @(posedge clk) begin
-        forebits_reg2 <= forebits_reg;
-        forebits_reg3 <= forebits_reg2;
-        forebits_reg4 <= forebits_reg3;
-        mux_reg       <= mux;
-    end
-
-    // Star (bitmap RAM) / bgcolor branches: both are addressed from
-    // xx_native/y_native directly (like fg_tilemap's stage-0 input), not
-    // from foreraw, so they need their own delay chain to land on the same
-    // pipeline stage (stage8, aligned with forebits_reg4/sprcolor_dout/
-    // mux_reg above) as everything else feeding the final palbits mux.
-    // COORD_DELAY (7 regs) + the bitmap_ram/bgcolorrom read itself (1 reg)
-    // = 8 register hops from xx_native/y_native, matching forebits_reg4's
-    // 8 hops (fg_tilemap's 4 + color_table's 1 + forebits_reg2/3/4's 3) and
-    // sprcolor_dout/mux_reg's 8 hops (spr_pipe's 7 + 1). 8 clk = 2 whole
-    // output pixels (ce_pix = clk/4), so every input to the final palbits
-    // mux is pixel-aligned, not just clock-count-aligned -- see
-    // SPR_TO_MIX_DELAY's comment for why that distinction matters. This
-    // bumps VIDEO_PIPE_LATENCY below from 7 to 9 (8 + palette_rom's 1).
-    localparam COORD_DELAY = 7;
-    reg [15:0] coord_pipe [0:COORD_DELAY-1];
-    integer ci;
-    always @(posedge clk) begin
-        coord_pipe[0] <= {y_native, xx_native};
-        for (ci = 1; ci < COORD_DELAY; ci = ci + 1) coord_pipe[ci] <= coord_pipe[ci-1];
-    end
-    wire [7:0] y_d7  = coord_pipe[COORD_DELAY-1][15:8];
-    wire [7:0] xx_d7 = coord_pipe[COORD_DELAY-1][7:0];
-
-    reg star_bit;
-    always @(posedge clk) star_bit <= bitmap_ram[{y_d7, xx_d7}];
-
-    reg [7:0] bgcolor_reg;
-    always @(posedge clk) bgcolor_reg <= bgcolorrom[{mov[4:0], y_d7}];
-
-    function [7:0] repack;
-        input [7:0] f;
-        repack = ((f & 8'h3c) << 2) | ((f & 8'h06) << 1) | (f & 8'h01);
-    endfunction
-
-    // NOTE: repack_bg's shifts genuinely overflow 8 bits -- in MAME's C++
-    // (turbo_v.cpp) `palbits` is a plain `int`, and this is how the bgcolor
-    // branch reaches the upper 3/4 of Buck Rogers' 1024-entry (10-bit)
-    // palette; the other three branches (repack()/pr5199/0xff) all happen
-    // to stay within the low 256 entries. Truncating palbits to 8 bits and
-    // forcing the palette address's top 2 bits to 0 (an earlier version of
-    // this code did exactly that) silently collapses every bgcolor pixel
-    // onto the wrong palette bank -- keep the full 10-bit width end to end.
-    function [9:0] repack_bg;
-        input [7:0] p;
-        repack_bg = ({2'b00, p} & 10'h0c0) | (({2'b00, p} & 10'h030) << 4) | (({2'b00, p} & 10'h00f) << 2);
-    endfunction
-
-    wire [9:0] palbits_fg = {2'b00, repack(forebits_reg4)};
-    wire [9:0] palbits = (!forebits_reg4[7]) ? palbits_fg :             // fg tier 1
-                          (!mux_reg[3])       ? {2'b00, sprcolor_dout} : // sprite
-                          (!forebits_reg4[6]) ? palbits_fg :             // fg tier 2
-                          star_bit             ? 10'h0ff :                // bitmap/star
-                                                  repack_bg(bgcolor_reg);  // bgcolor
-
-    reg [23:0] palette_rom[0:1023];
-    initial $readmemh("roms/palette_buckrog.hex", palette_rom);
-
-    reg [23:0] rgb_reg;
-    always @(posedge clk) rgb_reg <= palette_rom[palbits];
-
-    assign video_r = (hblank | vblank) ? 8'h0 : rgb_reg[23:16];
-    assign video_g = (hblank | vblank) ? 8'h0 : rgb_reg[15:8];
-    assign video_b = (hblank | vblank) ? 8'h0 : rgb_reg[7:0];
-
-    // ------------------------------------------------------------------
-    // Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with
-    // the pipeline latency above (fg_tilemap's 4 + color_table's 1 +
-    // forebits_reg2/3/4's 3 = 8 clk = 2 whole output pixels, matching
-    // sprcolor_dout/mux_reg's and the star/bgcolor branches' 8 hops, see
-    // SPR_TO_MIX_DELAY/COORD_DELAY comments above; + palette_rom's 1 = 9),
-    // so the sync signals output alongside rgb_reg describe the same
-    // original hpos/vpos that produced it.
-    // ------------------------------------------------------------------
-    localparam VIDEO_PIPE_LATENCY = 9;
-
-    reg [VIDEO_PIPE_LATENCY-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
-    always @(posedge clk) begin
-        hblank_pipe <= {hblank_pipe[VIDEO_PIPE_LATENCY-2:0], hblank_raw};
-        vblank_pipe <= {vblank_pipe[VIDEO_PIPE_LATENCY-2:0], vblank_raw};
-        hsync_pipe  <= {hsync_pipe [VIDEO_PIPE_LATENCY-2:0], hsync_raw};
-        vsync_pipe  <= {vsync_pipe [VIDEO_PIPE_LATENCY-2:0], vsync_raw};
-        ce_pix_pipe <= {ce_pix_pipe[VIDEO_PIPE_LATENCY-2:0], ce_pix_int};
-    end
-    assign hblank = hblank_pipe[VIDEO_PIPE_LATENCY-1];
-    assign vblank = vblank_pipe[VIDEO_PIPE_LATENCY-1];
-    assign hsync  = hsync_pipe [VIDEO_PIPE_LATENCY-1];
-    assign vsync  = vsync_pipe [VIDEO_PIPE_LATENCY-1];
-    assign ce_pix = ce_pix_pipe[VIDEO_PIPE_LATENCY-1];
-
-`ifdef SIM_DEBUG_TRACE
-    // Session-6-continued (CPU/game-state divergence investigation): latch
-    // the main CPU's PC at every opcode fetch (M1 & MREQ & RD asserted --
-    // the point cpu_a *is* PC, before any operand/data bytes move the bus
-    // off it) and print it at each vblank interrupt, so per-frame PC-at-
-    // vblank can be diffed against a MAME Lua trace of the same instant
-    // (see tools/mame/dump_pc_trace.lua). Also count total main-CPU M1
-    // (opcode fetch) cycles as a coarse proxy for "how far execution has
-    // progressed" independent of PC (loops/calls revisit the same PC).
-    reg  [15:0] pc_reg;
-    integer     m1_count = 0;
-    reg         main_m1_fetch_d;
-    wire        main_m1_fetch = ~cpu_m1_n && ~cpu_mreq_n && ~cpu_rd_n;
-    wire        main_m1_fetch_rise = main_m1_fetch && !main_m1_fetch_d;
-    always @(posedge clk) begin
-        main_m1_fetch_d <= main_m1_fetch;
-        if (main_m1_fetch_rise) begin
-            pc_reg   <= cpu_a;
-            m1_count <= m1_count + 1;
-        end
-        if (vblank_rise) $display("[%0t] PCTRACE frame=%0d pc=%04x m1_count=%0d", $time, dbg_frame, pc_reg, m1_count);
-    end
-
-    // Session-6-continued-further: measure TV80's ACTUAL T-state cost for
-    // the IM1 interrupt-acceptance sequence directly, independent of any
-    // MAME comparison -- the real Z80 spec (Zilog Z80 Family CPU User
-    // Manual) fixes this at exactly 13 T-states (extended 7T M1 cycle + two
-    // 3T M-cycles pushing PC), regardless of vector/data-bus content in
-    // IM1. Ground truth here is the spec, not MAME's own number, per this
-    // investigation's "validate against an independent reference, not just
-    // MAME" discipline.
-    //
-    // Method: count ce_z80 pulses (each pulse == one Z80 T-state, see
-    // z80_div above) from the rising edge of int_ack (the M1+IORQ
-    // interrupt-acknowledge cycle, already computed below for irq_pending)
-    // to the very next main-CPU M1 opcode fetch -- i.e. the fetch of the
-    // ISR's first opcode at 0x0038 (RST 38, confirmed via
-    // sim/buckrogn.rom's reset code using IM 1). That gap, in T-states, IS
-    // the interrupt-acceptance cost as TV80 actually implements it; any
-    // deviation from 13 is a real, self-contained TV80 bug report, not
-    // something that needs MAME to confirm.
-    reg        intack_pending;
-    reg        int_ack_d;
-    integer    tstates_since_intack;
-    wire       int_ack_rise = int_ack && !int_ack_d;
-    always @(posedge clk) begin
-        int_ack_d <= int_ack;
-        if (int_ack_rise) begin
-            intack_pending       <= 1'b1;
-            tstates_since_intack <= 0;
-        end else if (intack_pending && ce_z80) begin
-            tstates_since_intack <= tstates_since_intack + 1;
-        end
-        if (intack_pending && main_m1_fetch_rise) begin
-            intack_pending <= 1'b0;
-            $display("[%0t] INTACK_TSTATES frame=%0d tstates=%0d isr_pc=%04x (spec=13)",
-                      $time, dbg_frame, tstates_since_intack, cpu_a);
-        end
-    end
-
-    // Session-7 follow-up: the full-instruction-trace diff (see doc UPDATE
-    // 2026-07-30) found the FIRST real sim/MAME PC divergence at frame 11,
-    // inside a plain DEC-HL/JR-NZ delay loop with no data-dependent branch --
-    // sim takes the vblank interrupt one loop iteration later than MAME. The
-    // next scoped question: is that because sim's vblank interrupt is
-    // asserted/recognized at a different absolute T-state-since-reset than
-    // MAME's, or because the two harnesses' CPUs already carry a small
-    // T-state offset from a different reset-to-first-fetch startup latency?
-    // Free-running T-state counter, gated only by `reset` (never re-armed),
-    // logged at every int_ack -- gives the absolute T-state-since-reset of
-    // each interrupt-accept event directly comparable against a MAME-side
-    // measurement of the same quantity (see tools/mame/dump_intack_cycles.lua).
-    // Counts from simulation t=0 (not gated by `reset`) so it is directly
-    // comparable to MAME's `machine.time` (also measured from t=0), sidestepping
-    // any difference in how long each harness's own reset pulse lasts.
-    integer reset_tstate_count = 0;
-    always @(posedge clk) begin
-        if (ce_z80) reset_tstate_count <= reset_tstate_count + 1;
-        if (int_ack_rise) $display("[%0t] INTACK_ABS_TSTATE frame=%0d abs_tstate=%0d", $time, dbg_frame, reset_tstate_count);
-    end
-
-    // Session-6-continued-yet-further: with interrupt-acceptance cost
-    // proven spec-exact (above), the ISR at 0x0e56 (reached via 0x0038's
-    // JP) branches on three work-RAM flags (0xf834/0xf835/0xf836,
-    // disassembled from sim/buckrogn.rom) before returning -- log the flag
-    // byte values as seen at every interrupt-entry (work_ram[] is this
-    // module's own registered-read work RAM array, offsets 0x34/0x35/0x36 =
-    // real addresses 0xf834/0xf835/0xf836, per work_ram's F800-FFFF mapping
-    // above) so a per-frame diff against MAME's own read of the same
-    // addresses (tools/mame/dump_pc_trace.lua) can find the first frame the
-    // two sides' game state actually disagrees on, independent of PC.
-    //
-    // An earlier version of this instrument also tried to measure the ISR's
-    // total T-state length, by capturing the interrupt-ack's 2-byte PC push
-    // (the only way to get the true return address -- see the retracted
-    // paragraph below) and watching for the matching return fetch. That
-    // measurement never completed even once in 60 frames: the first
-    // captured push (frame 1) had return_pc=0x0007, and no later M1 fetch
-    // ever landed back on 0x0007, while a SECOND push was captured on frame
-    // 2 with the SAME return_pc=0x0007 -- i.e. a second interrupt got
-    // accepted before the first one's RET ever fired. That's only possible
-    // if this ISR chain re-enables interrupts (EI) before it finishes
-    // running, which is consistent with the disassembly: the f834-nonzero
-    // path pops AF/EIs/RETs quickly (0x0e5e-0x0e60), but the observed
-    // f834==0 path dives into a longer chain (0x0e61 onward, eventually
-    // 0x0e70's PUSH BC/DE/HL block) whose EI point hasn't been located. A
-    // naive single-level "watch the stack push, watch for the matching
-    // return fetch" probe can't handle a re-entrant/nesting ISR -- it needs
-    // real call-depth tracking to be trustworthy here, which is a bigger
-    // instrument than this session has scoped. Findings doc records this as
-    // a real (if unproven) data point: the ISR is structurally capable of
-    // nesting, which is itself a plausible source of frame-to-frame
-    // scheduling differences independent of anything TV80 does wrong.
-    always @(posedge clk) begin
-        if (int_ack_rise) begin
-            $display("[%0t] ISRFLAGS frame=%0d f834=%02x f835=%02x f836=%02x",
-                      $time, dbg_frame, work_ram[8'h34], work_ram[8'h35], work_ram[8'h36]);
-        end
-    end
-
-    // Session-6-continued-still-further: with interrupt-accept cost proven
-    // spec-exact and the game-state divergence's downstream symptom traced
-    // to (but not yet pinned down as) the frame-9-to-44 T-state drift, do
-    // the direct thing -- log every main-CPU instruction's measured T-state
-    // cost and let an offline script (tools/z80_tstate_check.py) check each
-    // one against the real Zilog Z80 timing tables. Bounded to a frame
-    // window to keep the log a manageable size -- unprefixed and CB-prefixed
-    // opcodes are both common in the code this window exercises (the ISR's
-    // 0x0e70+ chain uses CB opcodes, e.g. `cb 7e` = BIT 7,(HL)), so log the
-    // raw opcode byte un-interpreted and let the Python side decode it,
-    // rather than build a second copy of the Z80 opcode table in Verilog.
-    //
-    // IMPORTANT: this window MUST extend through the actual PC-divergence
-    // event (frame 44-45, per PCTRACE) to be conclusive -- an earlier pass
-    // bounded this to dbg_frame 5..30 and found zero mismatches, but that
-    // only audits the *lead-up* to the branch point, not the branch point
-    // itself, so it couldn't actually rule out a TV80 bug as the cause of
-    // the divergence it was nominally investigating. 5..48 covers the whole
-    // lead-up plus the branch event with margin.
-    //
-    // Method: same "T-states between consecutive M1 fetches" technique as
-    // the ISR-length attempt above, but reporting every instruction instead
-    // of just watching for one return address, and explicitly flagging
-    // (not attempting to exclude) any instruction whose window contained an
-    // interrupt -- the offline checker skips those rather than trying to
-    // subtract out ISR execution time.
-    reg  [15:0] optrace_pc;
-    reg  [7:0]  optrace_op;
-    integer     optrace_tstates;
-    reg         optrace_interrupted;
-    reg         optrace_valid;
-    always @(posedge clk) begin
-        if (main_m1_fetch_rise) begin
-            if (optrace_valid && dbg_frame <= 48)
-                $display("OPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
-                          dbg_frame, optrace_pc, optrace_op, optrace_tstates, optrace_interrupted, cpu_a);
-            optrace_pc          <= cpu_a;
-            optrace_op          <= cpu_di;
-            optrace_tstates     <= 0;
-            optrace_interrupted <= 1'b0;
-            optrace_valid       <= 1'b1;
-        end else if (ce_z80) begin
-            optrace_tstates <= optrace_tstates + 1;
-        end
-        if (int_ack_rise) optrace_interrupted <= 1'b1;
-    end
-
-    // Star-motion investigation: same OPTRACE technique as the main-CPU
-    // audit above (PC/opcode/T-states/interrupted-flag per instruction),
-    // applied to the SUB CPU instead -- the star-position math lives
-    // entirely in its program, which the earlier main-CPU-focused T-state
-    // audit never exercised. Bounded to SUBOPTRACE_FRAME (set via
-    // $value$plusargs, default off) to keep the log a manageable size; one
-    // frame is ~5-15k sub-CPU instructions at 4.992 MHz/60 Hz.
-    integer subtrace_frame_lo = -1, subtrace_frame_hi = -1;
-    initial begin
-        if (!$value$plusargs("suboptrace_lo=%d", subtrace_frame_lo)) subtrace_frame_lo = -1;
-        if (!$value$plusargs("suboptrace_hi=%d", subtrace_frame_hi)) subtrace_frame_hi = -1;
-    end
-    reg         sub_m1_fetch_d;
-    wire        sub_m1_fetch      = ~sub_m1_n && ~sub_mreq_n && ~sub_rd_n;
-    wire        sub_m1_fetch_rise = sub_m1_fetch && !sub_m1_fetch_d;
-    wire        sub_int_ack       = ~sub_m1_n && ~sub_iorq_n;
-    reg         sub_int_ack_d;
-    wire        sub_int_ack_rise  = sub_int_ack && !sub_int_ack_d;
-    reg  [15:0] subtrace_pc;
-    reg  [7:0]  subtrace_op;
-    integer     subtrace_tstates;
-    reg         subtrace_interrupted;
-    reg         subtrace_valid;
-    always @(posedge clk) begin
-        sub_m1_fetch_d <= sub_m1_fetch;
-        sub_int_ack_d  <= sub_int_ack;
-        if (sub_m1_fetch_rise) begin
-            if (subtrace_valid && dbg_frame >= subtrace_frame_lo && dbg_frame <= subtrace_frame_hi)
-                $display("SUBOPTRACE frame=%0d pc=%04x op=%02x tstates=%0d irq=%0d next_pc=%04x",
-                          dbg_frame, subtrace_pc, subtrace_op, subtrace_tstates, subtrace_interrupted, sub_a);
-            subtrace_pc          <= sub_a;
-            subtrace_op          <= sub_di;
-            subtrace_tstates     <= 0;
-            subtrace_interrupted <= 1'b0;
-            subtrace_valid       <= 1'b1;
-        end else if (ce_z80) begin
-            subtrace_tstates <= subtrace_tstates + 1;
-        end
-        if (sub_int_ack_rise) subtrace_interrupted <= 1'b1;
-    end
-
-    integer trace_count = 0;
-    always @(posedge clk) begin
-        if (!reset && trace_count < 400) begin
-            $display("[%0t] a=%04x m1_n=%b mreq_n=%b rd_n=%b wr_n=%b di=%02x do=%02x cen=%b",
-                      $time, cpu_a, cpu_m1_n, cpu_mreq_n, cpu_rd_n, cpu_wr_n, cpu_di, cpu_do, ce_z80);
-            trace_count = trace_count + 1;
-        end
-        if (sel_vram && cpu_write) $display("[%0t] VRAM write addr=%04x data=%02x", $time, cpu_a, cpu_do);
-    end
-
-    // Phase 1c debug: per-frame summary counters -- vram/sprram/sprpos
-    // writes, PPI/i8279 activity, sub-CPU liveness. Printed once per vblank.
-    integer dbg_vram_wr = 0, dbg_sprram_wr = 0, dbg_sprpos_wr = 0;
-    integer dbg_ppi0_wr = 0, dbg_ppi1_wr = 0, dbg_i8279_wr = 0;
-    integer dbg_sub_fetch = 0, dbg_bitmap_wr = 0, dbg_frame = 0;
-    integer dbg_tier1 = 0, dbg_sprite = 0, dbg_tier2 = 0, dbg_star = 0, dbg_bg = 0;
-    integer dbg_plb_nz = 0;
-    always @(posedge clk) begin
-        if (spr_plb != 8'h00) begin
-            if (dbg_plb_nz < 20) $display("[%0t] spr_plb=%02x sprbits=%08x hpos=%0d vpos=%0d", $time, spr_plb, sprbits, hpos, vpos);
-            dbg_plb_nz = dbg_plb_nz + 1;
-        end
-    end
-    always @(posedge clk) begin
-        if (ce_pix_pipe[VIDEO_PIPE_LATENCY-1] && !vblank_pipe[VIDEO_PIPE_LATENCY-1] && !hblank_pipe[VIDEO_PIPE_LATENCY-1]) begin
-            if (!forebits_reg4[7])      dbg_tier1  = dbg_tier1 + 1;
-            else if (!mux_reg[3])       dbg_sprite = dbg_sprite + 1;
-            else if (!forebits_reg4[6]) dbg_tier2  = dbg_tier2 + 1;
-            else if (star_bit)          dbg_star   = dbg_star + 1;
-            else                        dbg_bg     = dbg_bg + 1;
-        end
-        if (vblank_rise) begin
-            $display("[%0t] MIX FRAME %0d: tier1=%0d sprite=%0d tier2=%0d star=%0d bg=%0d",
-                      $time, dbg_frame, dbg_tier1, dbg_sprite, dbg_tier2, dbg_star, dbg_bg);
-            dbg_tier1 = 0; dbg_sprite = 0; dbg_tier2 = 0; dbg_star = 0; dbg_bg = 0;
-        end
-    end
-    always @(posedge clk) begin
-        if (sel_vram   && cpu_write) dbg_vram_wr   = dbg_vram_wr + 1;
-        if (sel_sprram && cpu_write) dbg_sprram_wr = dbg_sprram_wr + 1;
-        if (sel_sprpos && cpu_write) dbg_sprpos_wr = dbg_sprpos_wr + 1;
-        if (sel_ppi0   && cpu_write) dbg_ppi0_wr   = dbg_ppi0_wr + 1;
-        if (sel_ppi1   && cpu_write) dbg_ppi1_wr   = dbg_ppi1_wr + 1;
-        if (sel_i8279  && cpu_write) dbg_i8279_wr  = dbg_i8279_wr + 1;
-        if (~sub_m1_n && ~sub_mreq_n) dbg_sub_fetch = dbg_sub_fetch + 1;
-        if (sub_bitmap_we) dbg_bitmap_wr = dbg_bitmap_wr + 1;
-        if (vblank_rise) begin
-            $display("[%0t] FRAME %0d: vram_wr=%0d sprram_wr=%0d sprpos_wr=%0d ppi0_wr=%0d ppi1_wr=%0d i8279_wr=%0d sub_fetch=%0d bitmap_wr=%0d ppi0_pa=%02x ppi0_pb=%02x ppi0_pc=%02x ppi1_pc=%02x sub_a=%04x sub_int_n=%b cpu_a=%04x",
-                      $time, dbg_frame, dbg_vram_wr, dbg_sprram_wr, dbg_sprpos_wr, dbg_ppi0_wr, dbg_ppi1_wr, dbg_i8279_wr, dbg_sub_fetch, dbg_bitmap_wr,
-                      ppi0_pa, ppi0_pb, ppi0_pc, ppi1_pc, sub_a, sub_int_n, cpu_a);
-            dbg_frame = dbg_frame + 1;
-            dbg_vram_wr = 0; dbg_sprram_wr = 0; dbg_sprpos_wr = 0;
-            dbg_ppi0_wr = 0; dbg_ppi1_wr = 0; dbg_i8279_wr = 0;
-            dbg_sub_fetch = 0; dbg_bitmap_wr = 0;
-        end
-    end
+	// PPI1: port C = OBCH0-2, coin meters (bits 4/5), start lamp (bit 6); kept as
+	// internal wires (no top-level port for meters/lamp). Ports A/B are the
+	// sound-generator interface.
+	wire [7:0] ppi1_dout, ppi1_pa, ppi1_pb, ppi1_pc;
+	i8255 u_ppi1
+	(
+		.clk   (clk), .reset (reset),
+		.cs    (sel_ppi1), .we (cpu_write), .addr (cpu_a[1:0]),
+		.din   (cpu_do), .dout (ppi1_dout),
+		.in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+		.ack_n (1'b1),                 // PPI1 is mode 0 only
+		.pa    (ppi1_pa), .pb (ppi1_pb), .pc (ppi1_pc),
+		.pa_wr (), .pb_wr (), .pc_wr ()
+	);
+	// The sound board hangs off PPI1 ports A and B over a 20-pin flat cable.
+	// PPI1 is shared hardware: for Turbo it carries ipa/ipb (road_gen's
+	// AREA-select inputs), not Buck's trigger lines, so audio_top is muted under
+	// Turbo. Idle values hold every active-low trigger high and every active-high
+	// level (ship_on/game_on) low, so no spurious edge fires.
+	wire [7:0] audio_ppi1_pa = mod_turbo ? 8'hFF : ppi1_pa;
+	wire [7:0] audio_ppi1_pb = mod_turbo ? 8'h3F : ppi1_pb;
+	audio_top u_audio
+	(
+		.clk     (clk),
+		.rst_n   (~reset),
+		.ppi1_pa (audio_ppi1_pa),
+		.ppi1_pb (audio_ppi1_pb),
+		// Turbo sound-board CN1 bundle (PPI2, u_ppi2). For Buck Rogers ppi2_pa/pb/pc
+		// idle at the PPI reset value (8'hFF), so it cannot affect Buck's audio.
+		.ppi2_pa (ppi2_pa),
+		.ppi2_pb (ppi2_pb),
+		.ppi2_pc (ppi2_pc),
+		// IC40's D address input: sound-board DIP bit, mapped to the "Sound System"
+		// MRA option.
+		.turbo_dsw3_7 (turbo_dsw3[7]),
+		// Selects which game's mix reaches audio_l/audio_r.
+		.mod_turbo (mod_turbo),
+		.audio_l (audio_l),
+		.audio_r (audio_r),
+		.sample_ce (),
+		.dbg_cn1_acc  (dbg_cn1_acc),
+		.dbg_cn1_bsel (dbg_cn1_bsel)
+`ifdef VERILATOR_SIM
+		, .dbg_cn1_osel0          (dbg_cn1_osel0)
+		, .dbg_cn1_osel12         (dbg_cn1_osel12)
+		, .dbg_turbo_othercars_f  (dbg_turbo_othercars_f)
+		, .dbg_turbo_othercars_w  (dbg_turbo_othercars_w)
+		, .dbg_turbo_mixer_f      (dbg_turbo_mixer_f)
+		, .dbg_turbo_mixer_w      (dbg_turbo_mixer_w)
+		, .dbg_turbo_out_l        (dbg_turbo_out_l)
+		, .dbg_turbo_out_r        (dbg_turbo_out_r)
+		, .dbg_turbo_amp_f_raw    (dbg_turbo_amp_f_raw)
+		, .dbg_turbo_amp_w_raw    (dbg_turbo_amp_w_raw)
+		, .dbg_turbo_amp_f_clip   (dbg_turbo_amp_f_clip)
+		, .dbg_turbo_amp_w_clip   (dbg_turbo_amp_w_clip)
 `endif
+	);
+
+	wire [2:0] obch          = ppi1_pc[2:0];
+	wire       coin_meter1   = ppi1_pc[4];
+	wire       coin_meter2   = ppi1_pc[5];
+	wire       start_lamp    = ppi1_pc[6];
+
+	// Video registers from PPI0: fchg = port C bits 0-2 (only bits 0-1 feed the
+	// pr5198 address, see color_addr), mov = port B bits 0-5 (only bits 0-4 feed
+	// the bgcolor address).
+	wire [1:0] fchg = ppi0_pc[1:0];
+	wire [5:0] mov  = ppi0_pb[5:0];
+
+	// ------------------------------------------------------------------
+	// i8279 (d800-d801, mirror 07fe); only DSW1 via RL is implemented (see
+	// rtl/io/i8279.v).
+	// ------------------------------------------------------------------
+	wire [7:0] i8279_dout;
+	i8279 u_i8279
+	(
+		.clk  (clk), .reset (reset),
+		.cs   (sel_i8279), .we (cpu_write), .addr (cpu_a[0]),
+		.din  (cpu_do), .dout (i8279_dout),
+		.rl   (mod_turbo ? turbo_dsw1 : dsw1)
+	);
+
+	// Sim debug: count CPU reads of the i8279 data register (DSW1/RL path) and
+	// latch the last rl value seen.
+	reg [15:0] dbg_i8279_rd_count_r;
+	reg [7:0]  dbg_i8279_last_rl_r;
+	wire       i8279_rd_now = sel_i8279 && ~cpu_a[0] && ~cpu_rd_n && ~cpu_mreq_n;
+	reg        i8279_rd_now_d;
+	always @(posedge clk) begin
+		i8279_rd_now_d <= i8279_rd_now;
+		if (reset) begin
+			dbg_i8279_rd_count_r <= 16'h0;
+			dbg_i8279_last_rl_r  <= 8'h0;
+		end else if (i8279_rd_now && !i8279_rd_now_d) begin
+			dbg_i8279_rd_count_r <= dbg_i8279_rd_count_r + 16'h1;
+			dbg_i8279_last_rl_r  <= mod_turbo ? turbo_dsw1 : dsw1;
+		end
+	end
+	assign dbg_i8279_rd_count = dbg_i8279_rd_count_r;
+	assign dbg_i8279_last_rl  = dbg_i8279_last_rl_r;
+
+	reg [15:0] dbg_i8279_wr_count_r;
+	reg [15:0] dbg_i8279_sel_count_r;
+	reg        sel_i8279_d;
+	always @(posedge clk) begin
+		sel_i8279_d <= sel_i8279;
+		if (reset) begin
+			dbg_i8279_wr_count_r  <= 16'h0;
+			dbg_i8279_sel_count_r <= 16'h0;
+		end else begin
+			if (sel_i8279 && cpu_write) dbg_i8279_wr_count_r <= dbg_i8279_wr_count_r + 16'h1;
+			if (sel_i8279 && !sel_i8279_d) dbg_i8279_sel_count_r <= dbg_i8279_sel_count_r + 16'h1;
+		end
+	end
+	assign dbg_i8279_wr_count  = dbg_i8279_wr_count_r;
+	assign dbg_i8279_sel_count = dbg_i8279_sel_count_r;
+
+	// ------------------------------------------------------------------
+	// Turbo-only I/O.
+	// ------------------------------------------------------------------
+
+	// PPI2 (fa00-fa03, mirror 00fc): sound generator interface (sound_a_w/b_w/c_w,
+	// the CN1 bundle to the sound board).
+	wire [7:0] ppi2_dout, ppi2_pa, ppi2_pb, ppi2_pc;
+	i8255 u_ppi2
+	(
+		.clk   (clk), .reset (reset),
+		.cs    (sel_ppi2), .we (cpu_write), .addr (cpu_a[1:0]),
+		.din   (cpu_do), .dout (ppi2_dout),
+		.in_a  (8'hFF), .in_b (8'hFF), .in_c (8'hFF),
+		.ack_n (1'b1),
+		.pa    (ppi2_pa), .pb (ppi2_pb), .pc (ppi2_pc),
+		.pa_wr (), .pb_wr (), .pc_wr ()
+	);
+
+	// PPI3 (fb00-fb03, mirror 00fc): port A = steering dial delta (analog_r),
+	// port B = DSW2, port C write = fbpla/fbcol (inputs of road_gen.v and
+	// mixer_turbo.v).
+	reg [7:0] turbo_last_analog;
+	always @(posedge clk) begin
+		if (reset) turbo_last_analog <= 8'h0;
+		else if (sel_analog_reset && cpu_write) turbo_last_analog <= turbo_dial;
+	end
+	wire [7:0] turbo_analog_delta = turbo_dial - turbo_last_analog;
+
+	wire [7:0] ppi3_dout, ppi3_pa, ppi3_pb;
+	wire       ppi3_pc_wr;
+	wire [7:0] ppi3_pc;
+	i8255 u_ppi3
+	(
+		.clk   (clk), .reset (reset),
+		.cs    (sel_ppi3), .we (cpu_write), .addr (cpu_a[1:0]),
+		.din   (cpu_do), .dout (ppi3_dout),
+		.in_a  (turbo_analog_delta), .in_b (turbo_dsw2), .in_c (8'hFF),
+		.ack_n (1'b1),
+		.pa    (ppi3_pa), .pb (ppi3_pb), .pc (ppi3_pc),
+		.pa_wr (), .pb_wr (), .pc_wr (ppi3_pc_wr)
+	);
+	// Sim debug: count CPU reads of PPI3 port B (DSW2) and latch the last
+	// turbo_dsw2 value seen.
+	reg [15:0] dbg_ppi3_rd_count_r;
+	reg [7:0]  dbg_ppi3_last_inb_r;
+	wire       ppi3_rd_now = sel_ppi3 && (cpu_a[1:0] == 2'd1) && ~cpu_rd_n && ~cpu_mreq_n;
+	reg        ppi3_rd_now_d;
+	always @(posedge clk) begin
+		ppi3_rd_now_d <= ppi3_rd_now;
+		if (reset) begin
+			dbg_ppi3_rd_count_r <= 16'h0;
+			dbg_ppi3_last_inb_r <= 8'h0;
+		end else if (ppi3_rd_now && !ppi3_rd_now_d) begin
+			dbg_ppi3_rd_count_r <= dbg_ppi3_rd_count_r + 16'h1;
+			dbg_ppi3_last_inb_r <= turbo_dsw2;
+		end
+	end
+	assign dbg_ppi3_rd_count = dbg_ppi3_rd_count_r;
+	assign dbg_ppi3_last_inb = dbg_ppi3_last_inb_r;
+
+	reg [3:0] turbo_fbpla;
+	reg [2:0] turbo_fbcol;
+	always @(posedge clk) begin
+		if (reset) begin
+			turbo_fbpla <= 4'h0;
+			turbo_fbcol <= 3'h0;
+		end else if (ppi3_pc_wr) begin
+			turbo_fbpla <= ppi3_pc[3:0];
+			turbo_fbcol <= ppi3_pc[6:4];
+		end
+	end
+
+	// LS259 outlatch (a800-a807, mirror 07f8): bit0/1 coin meters, bit3 start
+	// lamp. No top-level port exists for them.
+	reg [7:0] turbo_outlatch;
+	always @(posedge clk) begin
+		if (reset) turbo_outlatch <= 8'h0;
+		else if (sel_outlatch && cpu_write) turbo_outlatch[cpu_a[2:0]] <= cpu_do[0];
+	end
+	wire turbo_coin_meter1 = turbo_outlatch[0];
+	wire turbo_coin_meter2 = turbo_outlatch[1];
+	wire turbo_start_lamp  = turbo_outlatch[3];
+
+	// Collision detection: turbo_collision_acc is the PR-1116-driven per-pixel
+	// accumulator, declared below with the mixer_turbo instantiation.
+	wire [3:0] turbo_collision = turbo_collision_acc;
+
+	// Read back by the CPU ($fd00/IN0, $fe00/DSW3+collision). Reset to idle
+	// values (IN0 idle-high per its active-low convention, DSW3+collision
+	// uncollided) so a mid-session reset leaves no stale bytes.
+	reg [7:0] turbo_in0_reg;
+	always @(posedge clk) begin
+		if (reset) turbo_in0_reg <= 8'hFF;
+		else if (sel_in0_t) turbo_in0_reg <= turbo_in0;
+	end
+
+	reg [7:0] turbo_collision_dsw3_reg;
+	always @(posedge clk) begin
+		if (reset) turbo_collision_dsw3_reg <= 8'h00;
+		else if (sel_collision_dsw3) turbo_collision_dsw3_reg <= {turbo_dsw3[7:4], turbo_collision};
+	end
+
+	// Sim debug: highest turbo_collision value reached and clear-pulse count.
+	reg [3:0]  dbg_coll_max_r;
+	reg [15:0] dbg_coll_clear_count_r;
+	reg        coll_clear_now_d;
+	wire       coll_clear_now = sel_collision_clear && cpu_write;
+	always @(posedge clk) begin
+		coll_clear_now_d <= coll_clear_now;
+		if (reset) begin
+			dbg_coll_max_r         <= 4'h0;
+			dbg_coll_clear_count_r <= 16'h0;
+		end else begin
+			if (turbo_collision_acc > dbg_coll_max_r) dbg_coll_max_r <= turbo_collision_acc;
+			if (coll_clear_now && !coll_clear_now_d) dbg_coll_clear_count_r <= dbg_coll_clear_count_r + 16'h1;
+		end
+	end
+	assign dbg_coll_max         = dbg_coll_max_r;
+	assign dbg_coll_clear_count = dbg_coll_clear_count_r;
+
+	// Sim debug: latch the frame number of the first nonzero PROM collision hit.
+	reg [15:0] dbg_coll_first_hit_frame_r;
+	reg        dbg_coll_first_hit_seen_r;
+	reg [15:0] dbg_vblank_count_r;
+	always @(posedge clk) begin
+		if (reset) begin
+			dbg_coll_first_hit_frame_r <= 16'hFFFF;
+			dbg_coll_first_hit_seen_r  <= 1'b0;
+			dbg_vblank_count_r         <= 16'h0;
+		end else begin
+			if (vblank_rise) dbg_vblank_count_r <= dbg_vblank_count_r + 16'h1;
+			if (!dbg_coll_first_hit_seen_r && !hblank_pipe[7] && !vblank_pipe[7] &&
+				turbo_pr1116[turbo_coll_addr][3:0] != 4'h0) begin
+				dbg_coll_first_hit_seen_r  <= 1'b1;
+				dbg_coll_first_hit_frame_r <= dbg_vblank_count_r;
+			end
+		end
+	end
+	assign dbg_coll_first_hit_frame = dbg_coll_first_hit_frame_r;
+
+	// ------------------------------------------------------------------
+	// IN0/IN1/DSW reads (e800-e803, mirror 07fc); e802/e803 are DSW bitswaps
+	// (buckrog_state::port_2_r/port_3_r).
+	// ------------------------------------------------------------------
+	function [3:0] bitswap4;
+		input [7:0] d;
+		input [2:0] i3, i2, i1, i0;
+		bitswap4 = {d[i3], d[i2], d[i1], d[i0]};
+	endfunction
+
+	wire [7:0] port2_bits = {bitswap4(dsw2, 6, 4, 3, 0), bitswap4(dsw1, 6, 4, 3, 0)};
+	wire [7:0] port3_bits = {bitswap4(dsw2, 7, 5, 2, 1), bitswap4(dsw1, 7, 5, 2, 1)};
+
+	reg [7:0] io2_reg;
+	always @(posedge clk) begin
+		case (cpu_a[1:0])
+			2'd0: io2_reg <= in0;
+			2'd1: io2_reg <= in1;
+			2'd2: io2_reg <= port2_bits;
+			2'd3: io2_reg <= port3_bits;
+		endcase
+	end
+
+	assign cpu_di = sel_rom     ? maincpu_dout   :
+					 sel_vram   ? vram_rdata     :
+					 sel_ppi0   ? ppi0_dout      :
+					 sel_ppi1   ? ppi1_dout      :
+					 sel_i8279  ? i8279_dout     :
+					 sel_sprram ? sprram_rdata   :
+					 sel_sprpos ? sprpos_rdata   :
+					 sel_io2    ? io2_reg        :
+					 sel_workram? work_ram_dout  :
+					 sel_ppi2   ? ppi2_dout      :
+					 sel_ppi3   ? ppi3_dout      :
+					 sel_in0_t  ? turbo_in0_reg  :
+					 sel_collision_dsw3 ? turbo_collision_dsw3_reg :
+								  8'hFF;
+
+	// ------------------------------------------------------------------
+	// Video: native (pre-2x) coordinates for the fg tilemap / bitmap /
+	// bgcolor fetches
+	// ------------------------------------------------------------------
+	wire [7:0] xx_native = hpos[9:1];
+	wire [7:0] y_native  = vpos[7:0];
+	wire [7:0] foreraw;
+
+	// ------------------------------------------------------------------
+	// Mixer priority chain (see mixer_buckrog.v):
+	//   fg tier 1 -> sprite -> fg tier 2 -> star (bitmap) -> bgcolor
+	// ------------------------------------------------------------------
+	wire [8:0] color_addr = ({7'b0, foreraw[1:0]}) |
+							({1'b0, foreraw & 8'hF8} >> 1) |
+							({fchg, 7'b0});
+	reg [7:0] forebits_reg;
+	always @(posedge clk) forebits_reg <= color_table[color_addr];
+
+	// sprbits/plb are real-time (0 latency vs. hpos/vpos). forebits_reg lands 5 clk
+	// deep (fg_tilemap's 4 + color_table's 1), which is 1.25 output pixels
+	// (ce_pix = clk/4). Every input to the final palbits mux must land on the same
+	// whole number of pixels, or a stale layer is combined with a fresh one for
+	// 1 clk in 4, garbling multi-colour sprites. Delay by 7 clk so this path
+	// (7 + sprcolor_table's 1 = 8 clk = 2 pixels) matches the fg path re-timed to
+	// 8 below.
+	localparam SPR_TO_MIX_DELAY = 7;
+	reg [39:0] spr_pipe [0:SPR_TO_MIX_DELAY-1];
+	integer si;
+	always @(posedge clk) begin
+		spr_pipe[0] <= {sprbits, spr_plb};
+		for (si = 1; si < SPR_TO_MIX_DELAY; si = si + 1) spr_pipe[si] <= spr_pipe[si-1];
+	end
+	wire [31:0] sprbits_d7 = spr_pipe[SPR_TO_MIX_DELAY-1][39:8];
+	wire [7:0]  plb_d7     = spr_pipe[SPR_TO_MIX_DELAY-1][7:0];
+
+	// LS148 priority encoder: index of the lowest-numbered set bit in plb (0-7),
+	// or 4'hf if plb==0 (MAME: countl_zero(bitswap<8>(plb,0,1,2,3,4,5,6,7)) with
+	// the mux==8 clamp folded in).
+	function [3:0] find_lsb;
+		input [7:0] p;
+		begin
+			casez (p)
+				8'b???????1: find_lsb = 4'd0;
+				8'b??????10: find_lsb = 4'd1;
+				8'b?????100: find_lsb = 4'd2;
+				8'b????1000: find_lsb = 4'd3;
+				8'b???10000: find_lsb = 4'd4;
+				8'b??100000: find_lsb = 4'd5;
+				8'b?1000000: find_lsb = 4'd6;
+				8'b10000000: find_lsb = 4'd7;
+				default:     find_lsb = 4'hf;
+			endcase
+		end
+	endfunction
+
+	wire [3:0]  mux             = find_lsb(plb_d7);
+	wire [31:0] sprbits_shifted = sprbits_d7 >> mux[2:0];
+	wire [3:0]  cd              = {sprbits_shifted[24], sprbits_shifted[16], sprbits_shifted[8], sprbits_shifted[0]};
+
+	reg [7:0] sprcolor_dout;
+	always @(posedge clk) sprcolor_dout <= sprcolor_table[{obch, mux[2:0], cd}];
+
+	// One more register stage on the fg-tier-1 path so both operands of the final
+	// select land at +8 clk (sprcolor_dout's cycle). forebits_reg is 5 deep, so
+	// forebits_reg2..4 add the remaining 3 hops.
+	reg [7:0] forebits_reg2, forebits_reg3, forebits_reg4;
+	reg [3:0] mux_reg;
+	always @(posedge clk) begin
+		forebits_reg2 <= forebits_reg;
+		forebits_reg3 <= forebits_reg2;
+		forebits_reg4 <= forebits_reg3;
+		mux_reg       <= mux;
+	end
+
+	// Star (bitmap RAM) / bgcolor branches are addressed from xx_native/y_native
+	// directly, not from foreraw, so they need their own delay chain to land on
+	// stage 8 with everything else: COORD_DELAY (7 regs) + the bitmap_ram/
+	// bgcolorrom read (1 reg) = 8 hops = 2 whole output pixels. VIDEO_PIPE_LATENCY
+	// is thus 9 (8 + palette_rom's 1).
+	localparam COORD_DELAY = 7;
+	reg [15:0] coord_pipe [0:COORD_DELAY-1];
+	integer ci;
+	always @(posedge clk) begin
+		coord_pipe[0] <= {y_native, xx_native};
+		for (ci = 1; ci < COORD_DELAY; ci = ci + 1) coord_pipe[ci] <= coord_pipe[ci-1];
+	end
+	wire [7:0] y_d7  = coord_pipe[COORD_DELAY-1][15:8];
+	wire [7:0] xx_d7 = coord_pipe[COORD_DELAY-1][7:0];
+
+	reg star_bit;
+	always @(posedge clk) star_bit <= bitmap_ram[{y_d7, xx_d7}];
+
+	reg [7:0] bgcolor_reg;
+	always @(posedge clk) bgcolor_reg <= bgcolorrom[{mov[4:0], y_d7}];
+
+	function [7:0] repack;
+		input [7:0] f;
+		repack = ((f & 8'h3c) << 2) | ((f & 8'h06) << 1) | (f & 8'h01);
+	endfunction
+
+	// repack_bg's shifts overflow 8 bits on purpose: MAME's palbits is a plain
+	// int, and this is how the bgcolor branch reaches the upper 3/4 of the
+	// 1024-entry (10-bit) palette. Keep the full 10-bit width end to end.
+	function [9:0] repack_bg;
+		input [7:0] p;
+		repack_bg = ({2'b00, p} & 10'h0c0) | (({2'b00, p} & 10'h030) << 4) | (({2'b00, p} & 10'h00f) << 2);
+	endfunction
+
+	wire [9:0] palbits_buck = (!forebits_reg4[7]) ? palbits_fg :             // fg tier 1
+						  (!mux_reg[3])       ? {2'b00, sprcolor_dout} : // sprite
+						  (!forebits_reg4[6]) ? palbits_fg :             // fg tier 2
+						  star_bit             ? 10'h0ff :                // bitmap/star
+												  repack_bg(bgcolor_reg);  // bgcolor
+	wire [9:0] palbits_fg = {2'b00, repack(forebits_reg4)};
+
+	// mixer_turbo.v: bit-serial 16:1 mux, separate from Buck's priority chain.
+	// sprbits is the same real-time wire Buck's path taps; foreraw/babit/bacol
+	// come from fg_tilemap/road_gen, fbpla/fbcol from PPI3 port C.
+	wire [7:0] turbo_pen;
+	wire [31:0] turbo_coll_sprbits_d8;
+	wire [7:0]  turbo_coll_babit_d8;
+	mixer_turbo u_mixer_turbo
+	(
+		.clk         (clk),
+		.proms_we    (proms_we),
+		.proms_addr  (proms_wraddr),
+		.proms_wdata (rom_dout),
+		.sprbits     (sprbits),
+		.foreraw     (foreraw),
+		.babit       (turbo_babit),
+		.bacol       (turbo_bacol),
+		.fbpla       (turbo_fbpla),
+		.fbcol       (turbo_fbcol),
+		.pen         (turbo_pen),
+		.coll_sprbits_d8 (turbo_coll_sprbits_d8),
+		.coll_babit_d8   (turbo_coll_babit_d8)
+	);
+
+	// Collision detect. IC20 (PR-1116, TBP18S030 32x8 PROM; P-ROM board sheet
+	// 2/10) has address inputs PLB0-2 (A0-A2) and SLIPAR/ACCIAR (A3-A4), i.e.
+	// sprbits[26:24] and babit[4]/babit[5], matching turbo_v.cpp's
+	// ((sprbits>>24)&7) | ((babit&0x30)>>1). Its output feeds a 74LS376 latch
+	// (IC19) whose set/clear sequencing was not traced; the model OR-accumulates
+	// every visible pixel, is read at fe00 low nibble and cleared by any write to
+	// e800-efff. Uses mixer_turbo's cycle-8 sprbits_d8/babit_d8 taps, gated by
+	// hblank_pipe[7]/vblank_pipe[7] (tapped 8 stages in to match) so blanking
+	// garbage never registers; the schematic likewise gates the AREA5/ROAD latch
+	// (IC30) with "TV BLANK".
+	wire [4:0] turbo_coll_addr = {turbo_coll_babit_d8[5:4], turbo_coll_sprbits_d8[26:24]};
+	reg  [3:0] turbo_collision_acc;
+	always @(posedge clk) begin
+		if (reset)
+			turbo_collision_acc <= 4'h0;
+		else if (sel_collision_clear && cpu_write)
+			turbo_collision_acc <= 4'h0;
+		else if (!hblank_pipe[7] && !vblank_pipe[7])
+			turbo_collision_acc <= turbo_collision_acc | turbo_pr1116[turbo_coll_addr][3:0];
+	end
+
+	// Sim debug: count active-video cycles with sprbits[26:24] nonzero vs. cycles
+	// where the PROM lookup reports a hit.
+	reg [31:0] dbg_coll_sprbits_nz_count_r;
+	reg [31:0] dbg_coll_addr_nz_count_r;
+	reg [4:0]  dbg_coll_addr_max_r;
+	always @(posedge clk) begin
+		if (reset) begin
+			dbg_coll_sprbits_nz_count_r <= 32'h0;
+			dbg_coll_addr_nz_count_r    <= 32'h0;
+			dbg_coll_addr_max_r         <= 5'h0;
+		end else if (!hblank_pipe[7] && !vblank_pipe[7]) begin
+			if (turbo_coll_sprbits_d8[26:24] != 3'h0) dbg_coll_sprbits_nz_count_r <= dbg_coll_sprbits_nz_count_r + 32'h1;
+			if (turbo_pr1116[turbo_coll_addr][3:0] != 4'h0) dbg_coll_addr_nz_count_r <= dbg_coll_addr_nz_count_r + 32'h1;
+			if (turbo_coll_addr > dbg_coll_addr_max_r) dbg_coll_addr_max_r <= turbo_coll_addr;
+		end
+	end
+	assign dbg_coll_sprbits_nz_count = dbg_coll_sprbits_nz_count_r;
+	assign dbg_coll_addr_nz_count    = dbg_coll_addr_nz_count_r;
+	assign dbg_coll_addr_max         = dbg_coll_addr_max_r;
+
+	wire [9:0] palbits = mod_turbo ? {2'b00, turbo_pen} : palbits_buck;
+
+	// Combined palette: $readmemh cannot depend on mod_turbo, so both games' tables
+	// load into one 2048-entry BRAM indexed by mod_turbo as MSB: Buck at 0-1023
+	// (10-bit palbits), Turbo at 1024-1279 (8-bit pen, zero-extended by the two
+	// 0 bits below).
+	reg [23:0] palette_rom[0:2047];
+	initial $readmemh("rtl/tables/palette_combined.hex", palette_rom);
+
+	reg [23:0] rgb_reg;
+	always @(posedge clk) rgb_reg <= palette_rom[{mod_turbo, palbits}];
+
+	assign video_r = (hblank | vblank) ? 8'h0 : rgb_reg[23:16];
+	assign video_g = (hblank | vblank) ? 8'h0 : rgb_reg[15:8];
+	assign video_b = (hblank | vblank) ? 8'h0 : rgb_reg[7:0];
+
+	// ------------------------------------------------------------------
+	// Sync-bundle delay line: realigns hblank/vblank/hsync/vsync/ce_pix with the
+	// pixel pipeline. Buck: 8 clk (2 pixels, see SPR_TO_MIX_DELAY/COORD_DELAY) +
+	// palette_rom's 1 = 9. Turbo: mixer_turbo.v's 11-clk latency (3-deep
+	// PR-1122 -> PR-1123 -> PR-1121 ROM-read chain) + 1 = 12. The shift registers
+	// are sized for the larger and mod_turbo selects the tap, rather than
+	// duplicating the delay line.
+	// ------------------------------------------------------------------
+	localparam VIDEO_PIPE_LATENCY_BUCK  = 9;
+	localparam VIDEO_PIPE_LATENCY_TURBO = 12;
+	localparam VIDEO_PIPE_LATENCY_MAX   = 12;
+
+	wire [3:0] video_pipe_tap = (mod_turbo ? VIDEO_PIPE_LATENCY_TURBO : VIDEO_PIPE_LATENCY_BUCK) - 4'd1;
+
+	reg [VIDEO_PIPE_LATENCY_MAX-1:0] hblank_pipe, vblank_pipe, hsync_pipe, vsync_pipe, ce_pix_pipe;
+	always @(posedge clk) begin
+		hblank_pipe <= {hblank_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], hblank_raw};
+		vblank_pipe <= {vblank_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], vblank_raw};
+		hsync_pipe  <= {hsync_pipe [VIDEO_PIPE_LATENCY_MAX-2:0], hsync_raw};
+		vsync_pipe  <= {vsync_pipe [VIDEO_PIPE_LATENCY_MAX-2:0], vsync_raw};
+		ce_pix_pipe <= {ce_pix_pipe[VIDEO_PIPE_LATENCY_MAX-2:0], ce_pix_int};
+	end
+	assign hblank = hblank_pipe[video_pipe_tap];
+	assign vblank = vblank_pipe[video_pipe_tap];
+	assign hsync  = hsync_pipe [video_pipe_tap];
+	assign vsync  = vsync_pipe [video_pipe_tap];
+	assign ce_pix = ce_pix_pipe[video_pipe_tap];
+
 
 endmodule

@@ -1,47 +1,99 @@
 # Arcade-SegaVCO
 
-A MiSTer FPGA core for Sega's "Z80-3D" arcade board family (Buck Rogers:
-Planet of Zoom, Turbo, Subroc-3D) — three Z80-based games built around a
-shared sprite engine and an analog VCO-driven scaling/road-generator front
-end, targeted at the DE10-Nano (Cyclone V).
+A MiSTer FPGA core for Sega's Z80-3D arcade board family. It plays two games today:
+
+- **Turbo** (Sega, 1981) - `turbo`
+- **Buck Rogers: Planet of Zoom** (Sega, 1982) - `buckrogn`, the unencrypted ROM set
+
+Both run on one bitstream. The game is picked by the MRA file you launch.
+
+## The sound is the standout
+
+Neither game's sound is sampled or approximated with WAV playback. Both sound boards are rebuilt as discrete
+circuits in fixed-point DSP, working from the original schematics: oscillators, 555 timers, one-shots, noise
+source, voltage-controlled amplifiers, op-amp stages and the output amplifier, all running at 48 kHz and
+reacting to the game's sound triggers the way the board does.
+
+**Buck Rogers** - noise generator, the six sound channels (alarm, explosion, fire, hit, rebound, ship) and the
+LA4460 output stage.
+
+**Turbo** - the full sound board (834-5122), including:
+- the player-car engine: the D-8/11 tone cells and gating, the 4.7k/15k bus divider, the MB4391 gain stages,
+  the sub-audio "SLF" rumble branch, and the tunnel filter chain with its 555 ramp;
+- Other Cars: three free-running oscillators with PROM-selected volume;
+- ambulance (two relaxation cells frequency-modulated by a 555), skid (relaxation oscillator modulating a
+  555), crash and alarm;
+- the STK-439 output amplifier stage, summed to a single output, because the cabinet's two speakers (two
+  12 cm drivers on F, one 30 cm woofer on W) sit in one box and are heard together.
+
+### What is schematic, and what is not
+
+The aim is that every audio choice can be traced to the schematic, the parts list, a cabinet component, or
+a part tolerance. Nothing is tuned by ear and there are no sound-shaping options in the menu. The things
+that cannot be traced to the original documents are listed rather than hidden:
+
+- **Reference-cabinet tolerances.** Capacitor and resistor values are not all nominal: a few timing parts
+  (player-car warble, the SLF rumble cells, the Other Cars oscillators, the ambulance repeat rate) sit at
+  in-tolerance values measured from one cabinet recording, which assumes a recapped board. Another
+  cabinet will warble differently.
+- **MB4391.** Sega's custom VCA has no datasheet. It is modelled as two Motorola MC3340s using the
+  manufacturer's gain curve.
+- **Noise source.** The board's S2688 is the same part as the MM5837 (17-bit shift register, taps 17 and 14,
+  per the National datasheet); its clock is only bounded by the datasheet.
+- **Trimmers.** The board has trimmers for skid, crash, ambulance and alarm. Their positions in a given
+  cabinet are unknowable, so the core uses fixed mid-range settings chosen for listening balance.
+- **Known gaps.** Some upper engine harmonics, the Other Cars second harmonic and the tunnel's room
+  character do not yet match the cabinet recording, and the alarm and the CRASH.L filtering have not
+  been re-derived from the schematic.
+
+The full decision list, with the basis for each choice, is in [docs/TURBO_AUDIO_MODEL.md](docs/TURBO_AUDIO_MODEL.md).
+
+## Installing
+
+Copy into your MiSTer SD card:
+
+- `releases/Arcade-SegaVCO_<date>.rbf` -> `_Arcade/cores/`
+- `releases/*.mra` -> `_Arcade/`
+- the MAME 0288 ROM sets `turbo.zip`, `buckrogn.zip` and `buckrog.zip` -> `games/mame/`
+
+## Controls
+
+Turbo: steering by spinner, analog stick or D-pad (menu option *D-Pad Steering*: velocity or position), pedal
+and gear-shift buttons, Start and Coin. Buck Rogers: stick, fire, accelerate fast and slow. Button names
+follow the MRA mappings; DIP switches are in the menu.
+
+## Menu
+
+Aspect ratio, *Rotate HDMI (Turbo)* (Turbo's native raster is portrait), *D-Pad Steering (Turbo)*,
+*Gear Overlay (Turbo)*, DIP switches, Reset.
+
+*Gear Overlay* (off by default) shows a small L or H beside the TIME readout for the gear lever position the
+game is reading, like the lever graphic in MAME's artwork. It is a display aid and not part of the original board.
 
 ## Status
 
-**Known working**
-- **Buck Rogers: Planet of Zoom** (`buckrogn`, the unencrypted ROM set) —
-  main CPU, sub CPU, video (tilemap, sprite engine, starfield/bitmap
-  background, priority mixer), controls/DIP switches, and a fully discrete
-  (non-sample-based) model of the sound board: noise generator, six sound
-  channels (ALARM, EXP, FIRE, HIT, REBOUND, SHIP) and the LA4460 output
-  stage, each modeled from the schematic as fixed-point DSP rather than
-  approximated with WAV playback.
+**Working:** Turbo and Buck Rogers (`buckrogn`), video, controls, DIP switches and sound.
 
-**Not yet implemented**
-- **`buckrog`** (the encrypted ROM set) — needs the `315-5014` CPU opcode
-  decryption; not started.
-- **Turbo** — road generator, collision detection, and its own bit-serial
-  mixer are a materially different video pipeline from Buck Rogers'; its
-  sound board is a separate discrete circuit. Neither is implemented yet.
-- **Subroc-3D** — out of scope for now; it's an active-shutter
-  stereoscopic game with no practical way to test it on real hardware.
+**Not implemented:** `buckrog` (the encrypted set needs the 315-5014 opcode decryption) and Subroc-3D (an
+active-shutter stereoscopic game with no practical way to test it).
 
-This project is still under active development — please report issues.
+This project is under active development; please report issues.
+
+## Building
+
+Quartus Prime 17.0.2 (Lite). Open `Arcade-SegaVCO.qpf` and compile; the framework in `sys/` is the unmodified
+MiSTer template. Lookup tables are committed in `rtl/tables/` (regenerate with `tools/gen_tables.py`) and
+the MRAs are generated by `tools/gen_mra.py`. See `tools/README.md` for the rest of the helper scripts.
 
 ## Credits
 
-- **[MAME](https://www.mamedev.org/)** — reference driver source
-  (`turbo.cpp`/`turbo_v.cpp`/`turbo_a.cpp`/`resnet.h`) used throughout for
-  memory maps, table derivations, and behavioral cross-checking against
-  real hardware.
-- **Sorgelig (Alexey Melnikov)** — the [MiSTer](https://github.com/MiSTer-devel)
-  framework this core is built on (`sys/`), and the broader MiSTer FPGA
-  project.
-- **Guy Hutchison / Daniel Wallner** — the TV80 Z80 core (`rtl/tv80/`),
-  ported from Daniel Wallner's original T80 VHDL core.
-- Additional `sys/` framework contributors credited in-file: Till Harbaum,
-  Ludvig Strigeus, bellwood420.
+- **[MAME](https://www.mamedev.org/)** - reference driver source (`turbo.cpp`, `turbo_v.cpp`, `turbo_a.cpp`,
+  `resnet.h`) for memory maps, table derivations and cross-checking.
+- **Sorgelig (Alexey Melnikov)** - the [MiSTer](https://github.com/MiSTer-devel) framework (`sys/`).
+- **Guy Hutchison / Daniel Wallner** - the TV80 Z80 core (`rtl/tv80/`), ported from the T80 VHDL core.
+- Additional `sys/` contributors are credited in-file: Till Harbaum, Ludvig Strigeus, bellwood420.
+- Motorola (MC3340) and National Semiconductor (MM5837) datasheets for the proxy and noise-source parts.
 
 ## License
 
-[GPL-3.0-or-later](LICENSE), matching the MiSTer framework (`sys/`) this
-core builds on.
+[GPL-3.0-or-later](LICENSE), matching the MiSTer framework this core builds on.

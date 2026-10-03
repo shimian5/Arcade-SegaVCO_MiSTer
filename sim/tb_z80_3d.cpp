@@ -93,6 +93,7 @@ int main(int argc, char **argv)
     // subcpu program-space read of the same addresses -- finds the earliest
     // frame/byte offset the two engines' sub-CPU state actually disagrees.
     bool dumpworkram = false;
+    bool dumpmainram = false;
     int workramframes = 250;
     // Now that cpu_z80.v drives TV80 with a real cen (see rtl/cpu_z80.v),
     // both CPUs run at the correct core_clk/8 rate in sim, same as real
@@ -128,6 +129,47 @@ int main(int argc, char **argv)
     // and made every sim-vs-MAME game-state comparison invalid.
     int dsw1v = 0xC0, dsw2v = 0x92;
     std::string wav_path;
+    std::string audio_trace_path;
+    // --turbo: docs/WORKPLAN_TURBO_GRAPHICS.md Step 7 visual sanity check.
+    // segavco.v takes mod_turbo as a plain wire (Arcade-SegaVCO.sv derives
+    // it from ioctl_index=1's mod byte, which this ROM-blob-only testbench
+    // has no equivalent of), so it's just driven directly here. Turbo DSW
+    // defaults below are turbo.cpp's factory PORT_DIPNAME sums (DSW1: lives
+    // 0x03 + difficulty 0x08 + collision 0x10 + initial-entry 0x20 + the two
+    // unknown bits 0x40+0x80 = 0xfb; DSW2: game-time 0x03 + coin B 0x1c +
+    // coin A 0xe0 = 0xff).
+    bool turbo_mode = false;
+    int rasterlag_arg = -1; // -1 = use the default (5, Buck Rogers' measured value)
+    int turbodump_frame = -1; // --turbodump N: CSV of road/mixer taps for frame N
+    int gearframe_arg = -1;   // --gearframe N: shift to HIGH gear from frame N onward (bit2 of
+                               // turbo_in0, active high). The tb previously pinned this low for
+                               // every run, which caps the game's speed accumulator near ACC=20
+                               // (low gear's top speed) and makes the upper half of the ACC range
+                               // -- and therefore of STEP_LUT -- unreachable. The MAME trigger
+                               // measurement that established "ACC caps at 42" was taken with the
+                               // gear pinned HIGH; this flag reproduces that.
+    int accelframe_arg = -1;  // --accelframe N: hold pedal near-full-throttle from frame N
+    int accelramp_arg = -1;   // --accelramp N: SIM-ONLY test stimulus (not a claim about real
+                               // hardware) -- instead of --accelframe's single static jump to
+                               // gray code 00, keep advancing through the 2-bit gray sequence
+                               // every N frames for as long as accel is held, so the pedal_r()
+                               // input keeps generating fresh edges instead of going static
+                               // after one. Compare against --accelframe's WAV to test whether
+                               // a continuously-toggling pedal input (vs. one that freezes)
+                               // changes how the game's own speed integrator behaves.
+    int accelcycle_arg = -1;  // --accelcycle N: SIM-ONLY test stimulus -- press/release the
+                               // pedal in repeating N-frame-on/N-frame-off cycles from
+                               // accelframe onward, instead of a single hold, to reproduce
+                               // real driving's repeated accel/release/re-accel pattern
+                               // (crashes, easing off, gear changes) rather than one monotonic
+                               // ramp to max. Combine with --accelramp to toggle gray-code
+                               // edges continuously during each "on" phase instead of a single
+                               // static jump.
+    int turbo_dsw1_arg = -1;  // --turbodsw1 N: override turbo_dsw1 (default 0xFB) for DIP-effect testing
+    int turbo_dsw2_arg = -1;  // --turbodsw2 N: override turbo_dsw2 (default 0xFF) for Game-Time DIP-effect testing
+    int turbo_dsw3_arg = -1;  // --turbodsw3 N: override Sound System bit (MRA default 0xB0 = Upright)
+    int midreset_frame = -1;  // --midreset N: assert reset for 10 frames starting at frame N (simulates pressing OSD Reset mid-session)
+    int midreset_dsw1 = -1;   // --midresetdsw1 N: change turbo_dsw1 to this value at the same time (simulates changing a DIP then resetting)
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -137,6 +179,7 @@ int main(int argc, char **argv)
         else if (a == "--dumpframe" && i + 1 < argc) dumpframe = atoi(argv[++i]);
         else if (a == "--dumpbitmap") dumpbitmap = true;
         else if (a == "--dumpworkram") dumpworkram = true;
+        else if (a == "--dumpmainram") dumpmainram = true;
         else if (a == "--workramframes" && i + 1 < argc) workramframes = atoi(argv[++i]);
         else if (a == "--hudtrace" && i + 1 < argc) hudtrace_path = argv[++i];
         else if (a == "--noppm") noppm = true;
@@ -146,6 +189,19 @@ int main(int argc, char **argv)
         else if (a == "--dsw1" && i + 1 < argc) dsw1v = (int)strtol(argv[++i], nullptr, 0);
         else if (a == "--dsw2" && i + 1 < argc) dsw2v = (int)strtol(argv[++i], nullptr, 0);
         else if (a == "--wav" && i + 1 < argc) wav_path = argv[++i];
+        else if (a == "--audiotrace" && i + 1 < argc) audio_trace_path = argv[++i];
+        else if (a == "--turbo") turbo_mode = true;
+        else if (a == "--rasterlag" && i + 1 < argc) rasterlag_arg = atoi(argv[++i]);
+        else if (a == "--turbodump" && i + 1 < argc) turbodump_frame = atoi(argv[++i]);
+        else if (a == "--gearframe" && i + 1 < argc) gearframe_arg = atoi(argv[++i]);
+        else if (a == "--accelframe" && i + 1 < argc) accelframe_arg = atoi(argv[++i]);
+        else if (a == "--accelramp" && i + 1 < argc) accelramp_arg = atoi(argv[++i]);
+        else if (a == "--accelcycle" && i + 1 < argc) accelcycle_arg = atoi(argv[++i]);
+        else if (a == "--turbodsw1" && i + 1 < argc) turbo_dsw1_arg = (int)strtol(argv[++i], nullptr, 0);
+        else if (a == "--turbodsw2" && i + 1 < argc) turbo_dsw2_arg = (int)strtol(argv[++i], nullptr, 0);
+        else if (a == "--turbodsw3" && i + 1 < argc) turbo_dsw3_arg = (int)strtol(argv[++i], nullptr, 0);
+        else if (a == "--midreset" && i + 1 < argc) midreset_frame = atoi(argv[++i]);
+        else if (a == "--midresetdsw1" && i + 1 < argc) midreset_dsw1 = (int)strtol(argv[++i], nullptr, 0);
     }
 
     FILE *hudf = nullptr;
@@ -191,10 +247,17 @@ int main(int argc, char **argv)
     top->in1 = 0xFF;
     top->dsw1 = (vluint8_t)dsw1v;
     top->dsw2 = (vluint8_t)dsw2v;
+    top->mod_turbo   = turbo_mode ? 1 : 0;
+    top->turbo_in0   = 0xFB; // idle: coin/service/start high, gear low, pedal-released gray=11
+    top->turbo_dsw1  = (turbo_dsw1_arg >= 0) ? (vluint8_t)turbo_dsw1_arg : 0xFB;
+    top->turbo_dsw2  = (turbo_dsw2_arg >= 0) ? (vluint8_t)turbo_dsw2_arg : 0xFF;
+    top->turbo_dsw3  = (turbo_dsw3_arg >= 0) ? (vluint8_t)turbo_dsw3_arg : 0x00;
+    top->turbo_dial  = 0;
     for (int i = 0; i < 32; i++) tick(top);
 
-    // Load ROM blob
+    // Load ROM blob (ioctl_index=0, the main ROM blob's MRA index)
     top->ioctl_download = 1;
+    top->ioctl_index = 0;
     for (long i = 0; i < rom_size; i++) {
         top->ioctl_addr = (vluint32_t)i;
         top->ioctl_dout = rom[i];
@@ -203,8 +266,31 @@ int main(int argc, char **argv)
     }
     top->ioctl_wr = 0;
     top->ioctl_download = 0;
-    top->reset = 0;
     printf("loaded %ld bytes from %s\n", rom_size, rom_path.c_str());
+
+    // Reproduce the real MRA's ioctl_index=1 mod-byte transfer
+    // (mra/*.mra's <rom index="1"><part>NN</part></rom>, addr=0, 1 byte)
+    // that this testbench never sent before. Confirmed root cause of the
+    // real-hardware Turbo hang (docs/WORKPLAN_TURBO_GRAPHICS.md Step 7):
+    // rtl/rom_download.v used to have no ioctl_index qualifier at all, so
+    // this exact transfer silently overwrote maincpu_rom[0] with the mod
+    // byte right after the real ROM had already loaded -- benign for Buck
+    // Rogers (0xF3 DI -> 0x00 NOP) but fatal for Turbo (0xC3 JP nnnn ->
+    // 0x01 LD BC,nnnn, falling through into dead ROM space). Sending it
+    // here now that rom_download.v is fixed (qualified on ioctl_index==0)
+    // is a regression test: if the fix ever regresses, this will corrupt
+    // maincpu_rom[0] again and the run should visibly hang/diverge.
+    top->ioctl_download = 1;
+    top->ioctl_index = 1;
+    top->ioctl_addr = 0;
+    top->ioctl_dout = turbo_mode ? 1 : 0;
+    top->ioctl_wr = 1;
+    tick(top);
+    top->ioctl_wr = 0;
+    top->ioctl_download = 0;
+    top->ioctl_index = 0;
+
+    top->reset = 0;
 
     std::vector<unsigned char> fb(ACTIVE_W * ACTIVE_H * 3, 0);
     int x = 0, y = 0, frame = 0;
@@ -253,9 +339,14 @@ int main(int argc, char **argv)
     // The check maintains a RASTER_LAG-deep history of (x,y) and compares
     // hpos/vpos against the entry from RASTER_LAG ce_pix ticks back; any
     // deviation once past the startup window means a real phase glitch.
-    static const int RASTER_LAG = 5;
+    // Default (5) is measured for Buck Rogers' VIDEO_PIPE_LATENCY=9 -- NOT
+    // valid for a --turbo run (VIDEO_PIPE_LATENCY=12), which must pass its
+    // own re-measured value via --rasterlag. Sized as a fixed-capacity
+    // array (not VLA) since RASTER_LAG is now a runtime CLI value.
+    int RASTER_LAG = (rasterlag_arg > 0) ? rasterlag_arg : 5;
+    static const int RASTER_LAG_MAX = 32;
     static const int RASTER_SKIP = 16; // past the startup transient, comfortably
-    int hist_x[RASTER_LAG] = {0}, hist_y[RASTER_LAG] = {0};
+    int hist_x[RASTER_LAG_MAX] = {0}, hist_y[RASTER_LAG_MAX] = {0};
     long align_checked = 0, align_bad = 0;
     int  first_bad_x = -1, first_bad_y = -1, first_bad_rx = -1, first_bad_ry = -1;
     long first_bad_tick = -1;
@@ -279,6 +370,14 @@ int main(int argc, char **argv)
     // (which is already 0..511/0..223 for the visible region, per
     // video_timing.v's HBSTART=512/VBSTART=224 -- no translation needed).
     int prev_dbg_hpos = -1, prev_dbg_vpos = -1;
+    int prev_cn1_acc = -1, prev_cn1_bsel = -1;
+
+    FILE *turbodump_f = nullptr;
+    if (turbodump_frame >= 0) {
+        turbodump_f = fopen("sim/out/turbo_dump.csv", "w");
+        if (turbodump_f) fprintf(turbodump_f, "hpos,vpos,babit,bacol,road,pen,fbpla,fbcol,opa,opb,opc,ipa,ipb,ipc\n");
+    }
+    int prev_td_hpos = -1, prev_td_vpos = -1;
 
     // Downsample audio_l by the same /832 ratio audio_top.sv's sample_ce
     // divider uses (clk_sys / 832 = 48 kHz) -- sample_ce itself isn't exposed
@@ -287,12 +386,39 @@ int main(int argc, char **argv)
     // desyncing the WAV's timeline. A free-running counter is exact instead.
     std::vector<int16_t> audio_samples;
     int audio_div = 0;
+    FILE *audio_trace_f = nullptr;
+    if (!audio_trace_path.empty()) {
+        audio_trace_f = fopen(audio_trace_path.c_str(), "w");
+        if (!audio_trace_f) {
+            fprintf(stderr, "cannot write %s\n", audio_trace_path.c_str());
+            top->final();
+            delete top;
+            return 1;
+        }
+        fprintf(audio_trace_f,
+                "sample,frame,time_s,osel,osel0,osel12,acc,bsel,"
+                "othercars_f,othercars_w,mixer_f,mixer_w,out_l,out_r,"
+                "amp_f_raw,amp_w_raw,amp_f_clip,amp_w_clip,audio_l,audio_r\n");
+    }
+    long audio_sample_index = 0;
 
     while (frame < frames && tick_count < max_ticks) {
         // Coin1 (IN1 bit 7) pulsed frames 90-99; Start1 (IN1 bit 3) pulsed
         // frames 150-159 -- matches tools/mame/dump_frames.lua's schedule
         // exactly, so sim and MAME reference frames are directly comparable
         // by frame index now that both CPUs run at real-hardware speed.
+        // --midreset N: simulates pressing the OSD "Reset" (or "Reset and
+        // close OSD") mid-session, as opposed to only ever resetting once at
+        // power-on the way every other test in this harness does. If
+        // --midresetdsw1 is also given, turbo_dsw1 changes at the same
+        // moment, simulating "change a DIP, then reset" -- the exact
+        // real-hardware sequence reported as not working.
+        if (midreset_frame >= 0) {
+            if (frame == midreset_frame) top->reset = 1;
+            if (frame == midreset_frame && midreset_dsw1 >= 0) top->turbo_dsw1 = (vluint8_t)midreset_dsw1;
+            if (frame == midreset_frame + 10) top->reset = 0;
+        }
+
         bool coin_active  = (frame >= coin_frame  && frame < coin_frame  + 10);
         bool start_active = (frame >= start_frame && frame < start_frame + 10);
         unsigned char in1v = 0xFF;
@@ -300,12 +426,93 @@ int main(int argc, char **argv)
         if (start_active) in1v &= ~(1 << 3);
         top->in1 = in1v;
 
+        // Turbo has its own coin/start/pedal/gear port (turbo_in0, sel_in0_t
+        // in segavco.v) entirely separate from Buck's in1 -- the coin/start
+        // pulses above land on the wrong port for --turbo runs, so drive
+        // turbo_in0 here instead. Bit layout (docs/reference/turbo.cpp:653-661,
+        // turbo_base_state::pedal_r): bits0-1 = pedal gray code (0x03 =
+        // released), bit2 = gear (active high, 0 = low gear), bit3 = start1
+        // (active low), bit4 = service, bit5 = service1, bit6 = coin2, bit7 =
+        // coin1 (both active low). --accelframe N holds the pedal at gray
+        // code 00 (~full throttle, pedal_r(0x80)) from frame N onward, so the
+        // road/mixer taps reflect real driving state, not just the idle/
+        // attract-demo condition.
+        if (turbo_mode) {
+            unsigned char t0 = 0xFB; // idle: 11 (pedal), gear 0, start/coin inactive
+            if (coin_active)  t0 &= ~(1 << 7);
+            if (start_active) t0 &= ~(1 << 3);
+            if (gearframe_arg >= 0 && frame >= gearframe_arg) t0 |= (1 << 2); // HIGH gear
+            bool accel_active = false;
+            if (accelframe_arg >= 0 && frame >= accelframe_arg) {
+                if (accelcycle_arg > 0) {
+                    int phase = (frame - accelframe_arg) % (2 * accelcycle_arg);
+                    accel_active = phase < accelcycle_arg; // on for first half, off for second
+                } else {
+                    accel_active = true;
+                }
+            }
+            if (accel_active && accelramp_arg > 0) {
+                // SIM-ONLY test stimulus: cycle the real 2-bit gray sequence
+                // (11->10->00->01->11->...) once every accelramp_arg frames,
+                // instead of a single static jump to 00, restarting the
+                // sequence from the top ("released") each time this "on"
+                // phase begins so repeated cycles look like repeated presses.
+                static const unsigned char gray_seq[4] = {3, 2, 0, 1};
+                int since_on = frame - accelframe_arg;
+                if (accelcycle_arg > 0) since_on %= (2 * accelcycle_arg);
+                int step = since_on / accelramp_arg;
+                t0 = (unsigned char)((t0 & ~0x03) | gray_seq[step & 3]);
+            } else if (accel_active) {
+                // FULL throttle is gray 01, NOT 00. Increasing pedal depth
+                // encodes 11 -> 10 -> 00 -> 01 (see gray_seq above and
+                // Arcade-SegaVCO.sv's pedal_gray), so 00 is only depth 2 of 3
+                // -- roughly two-thirds throttle. Holding 00 caps the game's
+                // speed accumulator near ACC=20 and made the upper half of
+                // STEP_LUT unreachable in every "floored pedal" render.
+                t0 = (unsigned char)((t0 & ~0x03) | 0x01);
+            }
+            top->turbo_in0 = t0;
+        }
+
         tick(top);
         tick_count++;
 
-        if (!wav_path.empty()) {
+        if (turbo_mode) {
+            int cur_acc = (int)top->dbg_cn1_acc;
+            int cur_bsel = (int)top->dbg_cn1_bsel;
+            if (cur_acc != prev_cn1_acc || cur_bsel != prev_cn1_bsel) {
+                fprintf(stderr, "frame %d t=%.3fs ACC=%d BSEL=%d\n",
+                        frame, frame / 60.0, cur_acc, cur_bsel);
+                prev_cn1_acc = cur_acc;
+                prev_cn1_bsel = cur_bsel;
+            }
+        }
+
+        if (!wav_path.empty() || audio_trace_f) {
             if (audio_div == 0) audio_samples.push_back((int16_t)top->audio_l);
             audio_div = (audio_div + 1) % 832;
+        }
+        if (audio_trace_f && audio_div == 0) {
+            int osel0 = (int)top->dbg_cn1_osel0;
+            int osel12 = (int)top->dbg_cn1_osel12;
+            int osel = osel0 | (osel12 << 1);
+            fprintf(audio_trace_f,
+                    "%ld,%d,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%lld,%lld,%d,%d,%d,%d\n",
+                    audio_sample_index++, frame, frame / 60.0,
+                    osel, osel0, osel12, (int)top->dbg_cn1_acc,
+                    (int)top->dbg_cn1_bsel,
+                    (int16_t)top->dbg_turbo_othercars_f,
+                    (int16_t)top->dbg_turbo_othercars_w,
+                    (int16_t)top->dbg_turbo_mixer_f,
+                    (int16_t)top->dbg_turbo_mixer_w,
+                    (int16_t)top->dbg_turbo_out_l,
+                    (int16_t)top->dbg_turbo_out_r,
+                    (long long)top->dbg_turbo_amp_f_raw,
+                    (long long)top->dbg_turbo_amp_w_raw,
+                    (int)top->dbg_turbo_amp_f_clip,
+                    (int)top->dbg_turbo_amp_w_clip,
+                    (int16_t)top->audio_l,
+                    (int16_t)top->audio_r);
         }
 
         {
@@ -326,6 +533,20 @@ int main(int argc, char **argv)
             }
             prev_dbg_hpos = rhp;
             prev_dbg_vpos = rvp;
+
+            if (turbodump_f && frame == turbodump_frame &&
+                (rhp != prev_td_hpos || rvp != prev_td_vpos) &&
+                rhp < ACTIVE_W && rvp < ACTIVE_H) {
+                fprintf(turbodump_f, "%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                        rhp, rvp,
+                        (unsigned)top->dbg_babit, (unsigned)top->dbg_bacol,
+                        (unsigned)top->dbg_road, (unsigned)top->dbg_pen,
+                        (unsigned)top->dbg_fbpla, (unsigned)top->dbg_fbcol,
+                        (unsigned)top->dbg_opa, (unsigned)top->dbg_opb, (unsigned)top->dbg_opc,
+                        (unsigned)top->dbg_ipa, (unsigned)top->dbg_ipb, (unsigned)top->dbg_ipc);
+            }
+            prev_td_hpos = rhp;
+            prev_td_vpos = rvp;
         }
 
         if (top->ce_pix) {
@@ -439,6 +660,22 @@ int main(int argc, char **argv)
                         }
                     }
 
+                    if (dumpmainram && frame >= 1 && frame <= workramframes) {
+                        std::vector<unsigned char> mr(2048);
+                        for (int a = 0; a < 2048; a++) {
+                            top->dbg_mainram_addr = (vluint32_t)a;
+                            top->eval();
+                            mr[a] = (unsigned char)top->dbg_mainram_data;
+                        }
+                        char mpath[512];
+                        snprintf(mpath, sizeof(mpath), "sim/out/rtl_mainram_%03d.bin", frame);
+                        FILE *mf = fopen(mpath, "wb");
+                        if (mf) {
+                            fwrite(mr.data(), 1, mr.size(), mf);
+                            fclose(mf);
+                        }
+                    }
+
                     if (dumpbitmap && frame >= 420 && frame <= 459) {
                         std::vector<unsigned char> bm(57344);
                         for (int a = 0; a < 57344; a++) {
@@ -461,6 +698,17 @@ int main(int argc, char **argv)
 
     if (frame < frames) fprintf(stderr, "WARNING: only produced %d/%d frames before tick cap\n", frame, frames);
 
+    if (turbo_mode) printf("TURBO COLLISION ACCUMULATOR at end of run: %u\n", (unsigned)top->dbg_collision);
+    if (turbo_mode) printf("TURBO i8279 DSW1 reads: count=%u last_rl=0x%02x wr_count=%u sel_count=%u\n",
+                            (unsigned)top->dbg_i8279_rd_count, (unsigned)top->dbg_i8279_last_rl,
+                            (unsigned)top->dbg_i8279_wr_count, (unsigned)top->dbg_i8279_sel_count);
+    if (turbo_mode) printf("TURBO PPI3 DSW2 reads: count=%u last_inb=0x%02x\n",
+                            (unsigned)top->dbg_ppi3_rd_count, (unsigned)top->dbg_ppi3_last_inb);
+    if (turbo_mode) printf("TURBO collision diag: sprbits_nz=%u addr_nz=%u addr_max=%u coll_max=%u clear_count=%u first_hit_frame=%u\n",
+                            (unsigned)top->dbg_coll_sprbits_nz_count, (unsigned)top->dbg_coll_addr_nz_count,
+                            (unsigned)top->dbg_coll_addr_max, (unsigned)top->dbg_coll_max,
+                            (unsigned)top->dbg_coll_clear_count, (unsigned)top->dbg_coll_first_hit_frame);
+
     printf("RASTER ALIGNMENT: %ld/%ld ce_pix ticks deviating from the expected\n"
            "  constant %d-tick RTL-lags-tb raster relationship\n",
            align_bad, align_checked, RASTER_LAG);
@@ -475,6 +723,10 @@ int main(int argc, char **argv)
         fclose(dbg_spr_f);
         printf("wrote sim/out/dbg_rtl_spr.bin (frame %d)\n", dumpframe);
     }
+    if (turbodump_f) {
+        fclose(turbodump_f);
+        printf("wrote sim/out/turbo_dump.csv (frame %d)\n", turbodump_frame);
+    }
 
     if (hudf) fclose(hudf);
 
@@ -482,6 +734,10 @@ int main(int argc, char **argv)
         write_wav(wav_path, audio_samples);
         printf("wrote %s (%zu samples, %.2fs)\n", wav_path.c_str(), audio_samples.size(),
                audio_samples.size() / 48000.0);
+    }
+    if (audio_trace_f) {
+        fclose(audio_trace_f);
+        printf("wrote %s (%ld audio samples)\n", audio_trace_path.c_str(), audio_sample_index);
     }
 
     top->final();

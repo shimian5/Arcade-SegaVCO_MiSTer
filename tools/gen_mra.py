@@ -11,6 +11,7 @@ Usage: python tools/gen_mra.py
 Writes mra/<game>.mra for every entry in GAMES.
 """
 import os
+import re
 
 # Fixed region offsets/sizes in the combined ROM blob, shared by every game.
 # MUST be perfectly contiguous (each BASE == previous BASE+SIZE): the MRA
@@ -91,22 +92,167 @@ def build_rom_xml(game):
     return "\n".join(lines)
 
 def build_dip_xml(game):
-    return game.get("dips", "")
+    dips = game.get("dips")
+    if not dips:
+        return ""
+    lines = [f'  <switches default="{dips["default"]}">']
+    for bits, name, ids in dips["dips"]:
+        lines.append(f'    <dip bits="{bits}" name="{name}" ids="{ids}"/>')
+    lines.append('  </switches>')
+    return "\n".join(lines)
+
+# DIP layouts transcribed from docs/reference/turbo.cpp's buckrog/turbo
+# INPUT_PORTS_START blocks (see Arcade-SegaVCO.sv's "sw[]" comment for the
+# byte->game-register mapping: sw[0]=DSW1, sw[1]=DSW2, sw[2]=DSW3). Each
+# <dip>'s "bits" is an ABSOLUTE bit position in the 64-bit ioctl_index==254
+# stream (byte N = bits [8N+7:8N]); "ids" are listed in ascending raw-value
+# order at that bit position, which is what lets the core read sw[] bytes
+# straight through with no inversion. "default" bytes reproduce turbo.cpp's
+# real PORT_DIPNAME factory defaults exactly (unlike the CONF_STR-era
+# encoding this replaced, MRA defaults do not need to land on OSD index 0).
+BUCKROG_DIPS = {
+    "default": "C0,92",
+    "dips": [
+        ("0,1,2", "Coin A", "1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C"),
+        ("3,4,5", "Coin B", "1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C"),
+        ("8", "Collisions", "On,Off (Cheat)"),
+        ("9", "Accel By", "Pedal,Button"),
+        ("10", "Best 5 Scores", "On,Off"),
+        ("11", "Score Display", "Off,On"),
+        ("12", "Difficulty", "Hard,Normal"),
+        ("13,14", "Lives", "3,4,5,6"),
+        ("15", "Cabinet", "Cockpit,Upright"),
+    ],
+}
+
+TURBO_DIPS = {
+    # EF, not FB: bits 2 and 4 were flipped from FB when the Game Time and
+    # Collisions ids lists were reordered to match confirmed real-hardware
+    # polarity (see the dips list below) -- the default byte has to track
+    # those same two bit flips, or it silently points at the OLD (wrong)
+    # state under the NEW (correct) label mapping. bit2: 0->1 (still means
+    # "Adjustable", now id[1] instead of id[0]). bit4: 1->0 (still means
+    # "On"/collisions-on, now id[0] instead of id[1]). All other bits
+    # unchanged from FB (turbo.cpp's real factory sum).
+    "default": "EF,FF,B0",  # bit 23 (Sound System) = Upright: the F/W output stage models the Upright 2-speaker cabinet; Cockpit steers Other Cars into R/L/M buses that are not routed
+    "dips": [
+        ("0,1", "Lives", "2,3,4,5"),
+        # Game Time bit polarity confirmed backwards on real hardware
+        # (the raw MAME DIPSETTING order this was originally transcribed
+        # from was never actually hardware-validated -- this is the fix).
+        ("2", "Game Time", "Fixed (55 sec),Adjustable"),
+        ("3", "Difficulty", "Hard,Easy"),
+        # Collisions polarity per an official Sega Service Note (Turbo
+        # #009, 1/26/82): physical switch OFF = normal play (collisions
+        # happen); ON = "car will not crash" (cheat). ids list ascending
+        # raw value, so raw0="On" (normal collisions) and raw1="Off
+        # (Cheat)" -- MAME's own DEF_STR(On)=0x10 label describes the
+        # SWITCH POSITION, not the gameplay effect, and is backwards if
+        # read naively. Do not "fix" this back to MAME's raw DIPSETTING
+        # string order.
+        ("4", "Collisions", "On,Off (Cheat)"),
+        ("5", "Initial Entry", "Off,On"),
+        ("8,9", "Game Time", "60s,70s,80s,90s"),
+        ("10,11,12", "Coin B", "1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,1C_1C"),
+        ("13,14,15", "Coin A", "1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,1C_1C"),
+        ("22", "Tachometer", "Digital (LED),Analog (Meter)"),
+        ("23", "Sound System", "Cockpit,Upright"),
+    ],
+}
+
+def build_buttons_xml(game):
+    names = game.get("buttons")
+    if not names:
+        return ""
+    default = game.get("buttons_default")
+    if default:
+        return f'  <buttons names="{names}" default="{default}"></buttons>'
+    return f'  <buttons names="{names}"></buttons>'
+
+def build_mod_xml(game):
+    # One-RBF game strap (docs/WORKPLAN_TURBO_GRAPHICS.md Step 1): a single
+    # byte at ioctl_index 1, latched into mod_game in Arcade-SegaVCO.sv.
+    # 00 = Buck Rogers, 01 = Turbo.
+    return f'  <rom index="1"><part>{game["mod"]:02X}</part></rom>'
+
+# Descriptive MRA fields (MkDocs_MiSTer developer/mra). Names/descriptions are
+# MAME's (mame0288 -listxml). The one RBF carries both games, selected by the
+# <rom index="1"> strap byte below.
+MAME_VERSION = "0288"
+MRA_TIMESTAMP = "20261002000000"
+MRA_META = {
+    "turbo": {
+        "name": "Turbo", "region": "World", "version": "Program 1513-1515", "series": "Turbo",
+        "category": "Driving - Race", "parent": "turbo", "rotation": "vertical (cw)",  # MAME ROT270, the label Arcade-DonkeyKong uses for its ROT270 set
+        "players": "1", "joystick": "analog", "special_controls": "steering wheel (dial), accelerator pedal, gear shift",
+        "num_buttons": "2", "button_names": "Gear Shift,Pedal",
+    },
+    "buckrogn": {
+        "name": "Buck Rogers: Planet of Zoom (not encrypted, set 1)", "region": "World", "version": "Not encrypted, set 1",
+        "series": "Buck Rogers", "category": "Shooter - Flying", "parent": "buckrog", "rotation": "horizontal",
+        "players": "2 (alternating)", "joystick": "8-way", "special_controls": "accelerator pedal",
+        "num_buttons": "3", "button_names": "Fire,Accel Fast,Accel Slow",
+    },
+}
 
 def build_mra(game):
     rom_xml = build_rom_xml(game)
+    mod_xml = build_mod_xml(game)
     dip_xml = build_dip_xml(game)
+    buttons_xml = build_buttons_xml(game)
+    # Real-world MRAs (e.g. MiSTer-devel/Arcade-LadyBug_MiSTer's Snap
+    # Jack.mra) put <buttons> and <switches> BEFORE the <rom> blocks, not
+    # after. MiSTer's MRA reader is a sequential/streaming parser (it has
+    # to be, for <rom>'s part-by-part ioctl download), so an element
+    # encountered only after a large <rom index="0"> block may already be
+    # too late for the OSD to have picked up the DIP-switches page --
+    # matches the reported symptom (DIP switches menu absent). Order
+    # here now mirrors that reference layout: buttons, switches, then the
+    # mod-byte rom, then the main rom.
+    parts = []
+    if buttons_xml:
+        parts.append(buttons_xml)
+    if dip_xml:
+        parts.append(dip_xml)
+    parts.append(mod_xml)
+    parts.append(rom_xml)
+    body = "\n".join(parts)
+    meta = MRA_META[game["setname"]]
     xml = f'''<misterromdescription>
-  <name>{game["name"]}</name>
-  <setname>{game["setname"]}</setname>
-  <year>{game["year"]}</year>
-  <manufacturer>{game["manufacturer"]}</manufacturer>
-  <rbf>Arcade-SegaVCO</rbf>
-{rom_xml}
-{dip_xml}
+	<name>{meta["name"]}</name>
+	<region>{meta["region"]}</region>
+	<homebrew>no</homebrew>
+	<bootleg>no</bootleg>
+	<version>{meta["version"]}</version>
+	<alternative></alternative>
+	<platform></platform>
+	<series>{meta["series"]}</series>
+	<year>{game["year"]}</year>
+	<manufacturer>{game["manufacturer"]}</manufacturer>
+	<category>{meta["category"]}</category>
+
+	<setname>{game["setname"]}</setname>
+	<parent>{meta["parent"]}</parent>
+	<mameversion>{MAME_VERSION}</mameversion>
+	<rbf>segavco</rbf>
+	<mratimestamp>{MRA_TIMESTAMP}</mratimestamp>
+	<about></about>
+
+	<resolution>15kHz</resolution>
+	<rotation>{meta["rotation"]}</rotation>
+	<flip>no</flip>
+
+	<players>{meta["players"]}</players>
+	<joystick>{meta["joystick"]}</joystick>
+	<special_controls>{meta["special_controls"]}</special_controls>
+	<num_buttons>{meta["num_buttons"]}</num_buttons>
+	<button_names>{meta["button_names"]}</button_names>
+
+{body}
 </misterromdescription>
 '''
-    return xml
+    # MiSTer convention: tab indentation
+    return "\n".join(re.sub(r"^((?:  )+)", lambda m: "\t" * (len(m.group(1)) // 2), l) for l in xml.split("\n"))
 
 GAMES = {
     "buckrogn": {
@@ -115,6 +261,8 @@ GAMES = {
         "zip": "buckrogn.zip|buckrog.zip",
         "year": 1982,
         "manufacturer": "Sega",
+        "mod": 0,
+        "dips": BUCKROG_DIPS,
         "regions": {
             "maincpu": [
                 ("epr-5257.cpu-ic3", 0x0000, 0x4000, "7f1910af"),
@@ -159,6 +307,8 @@ GAMES = {
         "zip": "buckrog.zip",
         "year": 1982,
         "manufacturer": "Sega",
+        "mod": 0,
+        "dips": BUCKROG_DIPS,
         "regions": {
             "maincpu": [
                 ("epr-5265.cpu-ic3", 0x0000, 0x4000, "f0055e97"),
@@ -203,6 +353,29 @@ GAMES = {
         "zip": "turbo.zip",
         "year": 1981,
         "manufacturer": "Sega",
+        "mod": 1,
+        "dips": TURBO_DIPS,
+        # <buttons names="..."> is positional against CONF_STR's J1 list
+        # (Arcade-SegaVCO.sv: "Fire,Accel Fast,Accel Slow,Start,Coin,Gear
+        # Shift,Pedal", 7 entries) -- a 4-entry list here previously bound
+        # Turbo's "Start" to J1's Fire position, "Coin" to Accel Fast, etc.
+        # Padding fields keep Turbo's actual buttons (Start/Coin/Gear
+        # Shift/Pedal) at J1's real indices 3-6; the first three (Fire/Accel
+        # Fast/Accel Slow, which Turbo doesn't have) are left unlabeled.
+        #
+        # MUST use "-" for the padding slots, not empty strings between
+        # commas: the MRA <buttons> spec (mister-devel MkDocs_MiSTer,
+        # developer/mra) requires "-" to pad unused bits. Empty tokens
+        # (",,,Start,...") are not documented/supported padding and, on
+        # real hardware, both broke the OSD button-name display (showed
+        # generic "Button A/B/X/Y" instead of the real names) AND
+        # misaligned the name-to-bit mapping so Gear Shift/Pedal/Start/
+        # Coin didn't actually reach the core.
+        "buttons": "-,-,-,Start,Coin,Gear Shift,Pedal",
+        # default="..." maps each named button to a virtual-gamepad input
+        # (A/B/X/Y/L/R/Start/Select/...) so a freshly-plugged pad gets a
+        # sane default instead of landing fully unassigned.
+        "buttons_default": "-,-,-,Start,Select,Y,A",
         "regions": {
             "maincpu": [
                 ("epr-1513.cpu-ic76",  0x0000, 0x2000, "0326adfc"),
@@ -237,31 +410,70 @@ GAMES = {
                 ("pr-1123.prom-ic12",  0x0c00, 0x0400, "02d2cb52"),
                 ("pr-1279.sound-ic40", 0x1000, 0x0020, "b369a6ae"),
             ],
+            # Each of Turbo's 8 sprite levels is real MAME ROM_START(turbo)
+            # data padded out to a 32KB slot (16KB real + 16KB explicit 0xFF
+            # filler), NOT MAME's native tightly-packed 16KB/level layout.
+            # This is deliberate, not a mistake: rtl/video/sprite_engine.v's
+            # sprite-ROM DOWNLOAD (write-time) decode must be identical for
+            # both games, because mod_turbo (the runtime game strap, latched
+            # from a SEPARATE ioctl_index=1 transfer) is not valid yet while
+            # this ioctl_index=0 blob streams in -- so it can no longer select
+            # between Buck's 32KB/level and Turbo's native 16KB/level write
+            # addressing the way earlier code did. Padding to Buck's own
+            # 32KB/level stride lets the write decode be the same fixed
+            # scheme unconditionally for both games; Turbo's real data always
+            # lands in the low 16KB half of its bank, which is exactly where
+            # sprite_engine.v's read-side (correctly mod_turbo-gated, but
+            # only exercised post-boot once the strap IS valid) already
+            # expects it. See docs/WORKPLAN_TURBO_GRAPHICS.md's Step 4/7 work
+            # log for the fuller writeup of why the download-time strap
+            # dependency was the actual bug.
+            #
+            # Also restores three ROM_RELOADs (turbo.cpp/MAME's
+            # ROM_START(turbo): epr-1246/1247/1248 are each loaded twice --
+            # once as the primary chip, once again as its own RELOAD, so each
+            # of levels 0-2 is one physical 8KB chip's data duplicated across
+            # its full 16KB) that an earlier version of this table silently
+            # dropped, leaving those levels' upper 8KB as 0xFF filler instead
+            # of real (repeated) chip data -- 0xFF decodes as pixdata=0xF,
+            # which never satisfies Turbo's self-termination test
+            # (pixdata[3:2]==2'b01), so any sprite fetch that walked into that
+            # filler would never terminate for the rest of the scanline.
             "sprites": [
-                ("epr-1246.prom-ic84",  0x00000, 0x2000, "555bfe9a"),
-                ("epr-1247.prom-ic86",  0x04000, 0x2000, "c8c5e4d5"),
-                ("epr-1248.prom-ic88",  0x08000, 0x2000, "82fe5b94"),
-                ("epr-1249.prom-ic90",  0x0c000, 0x2000, "e258e009"),
-                ("epr-1250.prom-ic108", 0x0e000, 0x2000, "aee6e05e"),
-                ("epr-1251.prom-ic92",  0x10000, 0x2000, "292573de"),
-                ("epr-1252.prom-ic110", 0x12000, 0x2000, "aee6e05e"),
-                ("epr-1253.prom-ic94",  0x14000, 0x2000, "92783626"),
-                ("epr-1254.prom-ic112", 0x16000, 0x2000, "aee6e05e"),
-                ("epr-1255.prom-ic32",  0x18000, 0x2000, "485dcef9"),
-                ("epr-1256.prom-ic47",  0x1a000, 0x2000, "aee6e05e"),
-                ("epr-1257.prom-ic34",  0x1c000, 0x2000, "4ca984ce"),
-                ("epr-1258.prom-ic49",  0x1e000, 0x2000, "aee6e05e"),
+                ("epr-1246.prom-ic84",  0x00000, 0x2000, "555bfe9a"),  # level 0
+                ("epr-1246.prom-ic84",  0x02000, 0x2000, "555bfe9a"),  # level 0 reload
+                ("epr-1247.prom-ic86",  0x08000, 0x2000, "c8c5e4d5"),  # level 1
+                ("epr-1247.prom-ic86",  0x0a000, 0x2000, "c8c5e4d5"),  # level 1 reload
+                ("epr-1248.prom-ic88",  0x10000, 0x2000, "82fe5b94"),  # level 2
+                ("epr-1248.prom-ic88",  0x12000, 0x2000, "82fe5b94"),  # level 2 reload
+                ("epr-1249.prom-ic90",  0x18000, 0x2000, "e258e009"),  # level 3
+                ("epr-1250.prom-ic108", 0x1a000, 0x2000, "aee6e05e"),  # level 3
+                ("epr-1251.prom-ic92",  0x20000, 0x2000, "292573de"),  # level 4
+                ("epr-1252.prom-ic110", 0x22000, 0x2000, "aee6e05e"),  # level 4
+                ("epr-1253.prom-ic94",  0x28000, 0x2000, "92783626"),  # level 5
+                ("epr-1254.prom-ic112", 0x2a000, 0x2000, "aee6e05e"),  # level 5
+                ("epr-1255.prom-ic32",  0x30000, 0x2000, "485dcef9"),  # level 6
+                ("epr-1256.prom-ic47",  0x32000, 0x2000, "aee6e05e"),  # level 6
+                ("epr-1257.prom-ic34",  0x38000, 0x2000, "4ca984ce"),  # level 7
+                ("epr-1258.prom-ic49",  0x3a000, 0x2000, "aee6e05e"),  # level 7
             ],
         },
     },
 }
 
+# Only games the core runs completely ship in releases/ (buckrog, the
+# encrypted set, needs the 315-5014 opcode decryption and is not implemented).
+RELEASE_FILES = {
+    "turbo":    "Turbo (program 1513-1515).mra",
+    "buckrogn": "Buck Rogers Planet of Zoom (not encrypted, set 1).mra",
+}
+
 def main():
-    out_dir = os.path.join(os.path.dirname(__file__), "..", "mra")
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "releases")
     os.makedirs(out_dir, exist_ok=True)
-    for setname, game in GAMES.items():
-        xml = build_mra(game)
-        path = os.path.join(out_dir, f"{setname}.mra")
+    for setname, fname in RELEASE_FILES.items():
+        xml = build_mra(GAMES[setname])
+        path = os.path.join(out_dir, fname)
         with open(path, "w", newline="\n") as f:
             f.write(xml)
         print(f"wrote {path}")
