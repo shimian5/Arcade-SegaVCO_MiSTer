@@ -1,3 +1,5 @@
+> **This repository has moved and is now read-only.** Development continues at https://github.com/MiSTer-devel/Arcade-SegaVCO_MiSTer. Please file issues and pull requests there.
+
 # Arcade-SegaVCO
 
 A MiSTer FPGA core for Sega's VCO arcade board family. It plays two games today:
