@@ -1,6 +1,6 @@
 # Arcade-SegaVCO
 
-A MiSTer FPGA core for Sega's Z80-3D arcade board family. It plays two games today:
+A MiSTer FPGA core for Sega's VCO arcade board family. It plays two games today:
 
 - **Turbo** (Sega, 1981) - `turbo`
 - **Buck Rogers: Planet of Zoom** (Sega, 1982) - `buckrogn`, the unencrypted ROM set
