@@ -28,6 +28,7 @@
 	<num_buttons>3</num_buttons>
 	<button_names>Fire,Accel Fast,Accel Slow</button_names>
 
+	<buttons names="Fire,Accel Fast,Accel Slow,Start,Coin" default="A,B,X,Start,Select"></buttons>
 	<switches default="C0,92">
 		<dip bits="0,1,2" name="Coin A" ids="1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C"/>
 		<dip bits="3,4,5" name="Coin B" ids="1C_1C,1C_2C,1C_3C,1C_6C,2C_1C,3C_1C,4C_1C,5C_1C"/>

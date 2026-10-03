@@ -259,6 +259,9 @@ GAMES = {
         "name": "Buck Rogers: Planet of Zoom (not encrypted)",
         "setname": "buckrogn",
         "zip": "buckrogn.zip|buckrog.zip",
+        # Names follow the J1 list in Arcade-SegaVCO.sv (bits 4-8); defaults skip placeholders.
+        "buttons": "Fire,Accel Fast,Accel Slow,Start,Coin",
+        "buttons_default": "A,B,X,Start,Select",
         "year": 1982,
         "manufacturer": "Sega",
         "mod": 0,

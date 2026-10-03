@@ -106,7 +106,6 @@ localparam CONF_STR = {
 	"V,v",`BUILD_DATE
 };
 
-wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
@@ -128,7 +127,6 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.EXT_BUS(),
 	.gamma_bus(),
 
-	.forced_scandoubler(forced_scandoubler),
 
 	.joystick_0(joystick_0),
 	.joystick_1(joystick_1),
